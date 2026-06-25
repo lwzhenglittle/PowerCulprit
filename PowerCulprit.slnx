@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/PowerCulprit.Cli/PowerCulprit.Cli.csproj" />
+    <Project Path="src/PowerCulprit.Collectors/PowerCulprit.Collectors.csproj" />
+    <Project Path="src/PowerCulprit.Core/PowerCulprit.Core.csproj" />
+    <Project Path="src/PowerCulprit.Desktop/PowerCulprit.Desktop.csproj" />
+    <Project Path="src/PowerCulprit.Storage/PowerCulprit.Storage.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/PowerCulprit.Tests/PowerCulprit.Tests.csproj" />
+  </Folder>
+</Solution>

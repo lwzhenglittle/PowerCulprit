@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "PowerCulprit.Desktop (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "PowerCulprit.Desktop (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}
