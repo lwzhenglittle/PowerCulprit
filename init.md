@@ -9,7 +9,7 @@
 以下决策已经固定，开发时不要重新发散：
 
 * 语言：C#。
-* 目标框架：.NET 8。
+* 目标框架：.NET 10。
 * 系统：Windows 10/11。
 * UI：WinUI 3 / Windows App SDK。
 * 图表：LiveCharts2 WinUI 适配包。
@@ -81,7 +81,7 @@ WinUI 3 没有 WPF 那种直接托盘能力。
 2. 再用 Win32 `Shell_NotifyIcon` 或 WinForms `NotifyIcon` 互操作实现托盘。
 3. 不要为了托盘把 UI 框架换成 WPF。
 
-如果 MVP 时间不足，允许把托盘标为 TODO，但 GUI、采样、曲线、排行必须可用。
+必须实现托盘功能。
 
 ## 3. 项目结构
 
@@ -191,7 +191,7 @@ dotnet run --project src\PowerCulprit.Desktop
 
 如果 WinUI 3 模板不可用：
 
-* 先确认 .NET 8 SDK、Windows App SDK 模板、Windows desktop build tooling 是否安装。
+* 先确认 .NET 10 SDK、Windows App SDK 模板、Windows desktop build tooling 是否安装。
 * 不要改回 WPF 或 Avalonia。
 * 可以手工创建 WinUI 3 项目文件，但必须保留 `PowerCulprit.Desktop` 作为 WinUI 3 桌面项目。
 
@@ -890,9 +890,11 @@ powerculprit --diagnose
 * 有电池。
 * `GPU Engine` performance counter 存在。
 * 当前沙箱命令不是管理员。
-* 当前机器之前检查到只有 .NET runtime，没有 .NET SDK。
+* 当前机器已安装 .NET SDK，当前默认 SDK 为 10.0.301。
+* 项目根目录使用 `global.json` 固定 .NET SDK 版本为 10.0.301。
+* 之前检查到 .NET workload 查询仍有异常；WinUI 3 项目如无法通过 `dotnet new` 创建，可以先手工创建项目文件或从 Visual Studio 模板创建后纳入当前 solution。
 
-如果开始开发时仍然没有 .NET SDK，需要先安装 .NET 8 SDK；否则无法 `dotnet new` / `dotnet build` / `dotnet test`。
+如果开始开发时仍然没有 .NET SDK，需要先安装 .NET 10 SDK；否则无法 `dotnet new` / `dotnet build` / `dotnet test`。
 
 ## 17. 开发注意事项
 
