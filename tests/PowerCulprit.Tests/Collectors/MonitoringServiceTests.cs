@@ -26,6 +26,7 @@ public class MonitoringServiceTests
                 lhmCollector,
                 new IntelCpuPowerCollector(NullLogger<IntelCpuPowerCollector>.Instance),
                 new IntelGpuPowerCollector(NullLogger<IntelGpuPowerCollector>.Instance),
+                new NoOpWindowsEtwActivityCollector(),
                 db,
                 NullLogger<MonitoringService>.Instance);
 

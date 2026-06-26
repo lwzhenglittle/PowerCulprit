@@ -50,6 +50,15 @@ public record ProcessSample
     /// <summary>Network send rate in bytes per second (may be null).</summary>
     public double? NetworkSendBytesPerSecond { get; init; }
 
+    /// <summary>ETW-observed process starts in this sampling window, or null if unavailable.</summary>
+    public int? ProcessStartCount { get; init; }
+
+    /// <summary>ETW-observed process stops in this sampling window, or null if unavailable.</summary>
+    public int? ProcessStopCount { get; init; }
+
+    /// <summary>ETW-observed processes that started and stopped between polling samples.</summary>
+    public int? ShortLivedProcessCount { get; init; }
+
     /// <summary>Whether this process owns the foreground window.</summary>
     public bool IsForegroundProcess { get; init; }
 

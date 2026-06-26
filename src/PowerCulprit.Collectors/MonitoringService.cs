@@ -19,6 +19,7 @@ public class MonitoringService : IMonitoringService
     private readonly LibreHardwareMonitorCollector _lhmCollector;
     private readonly IntelCpuPowerCollector _cpuPowerCollector;
     private readonly IntelGpuPowerCollector _gpuPowerCollector;
+    private readonly IWindowsEtwActivityCollector _etwCollector;
     private readonly DatabaseManager _databaseManager;
     private readonly ILogger<MonitoringService> _logger;
 
@@ -56,6 +57,7 @@ public class MonitoringService : IMonitoringService
         LibreHardwareMonitorCollector lhmCollector,
         IntelCpuPowerCollector cpuPowerCollector,
         IntelGpuPowerCollector gpuPowerCollector,
+        IWindowsEtwActivityCollector etwCollector,
         DatabaseManager databaseManager,
         ILogger<MonitoringService> logger)
     {
@@ -65,6 +67,7 @@ public class MonitoringService : IMonitoringService
         _lhmCollector = lhmCollector;
         _cpuPowerCollector = cpuPowerCollector;
         _gpuPowerCollector = gpuPowerCollector;
+        _etwCollector = etwCollector;
         _databaseManager = databaseManager;
         _logger = logger;
     }
@@ -140,6 +143,9 @@ public class MonitoringService : IMonitoringService
             }
         }
 
+        try { await _etwCollector.StopAsync(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Windows ETW activity collector failed to stop"); }
+
         lock (_lock)
         {
             _loopTask = null;
@@ -206,7 +212,22 @@ public class MonitoringService : IMonitoringService
     private async Task RunLoopAsync(CancellationToken cancellationToken)
     {
         await _databaseManager.InitializeAsync();
+        try
+        {
+            var deduplicated = await _databaseManager.DeduplicateSourceStatusTimestampTiesAsync();
+            if (deduplicated > 0)
+                _logger.LogInformation("Removed {Count} duplicate source status rows", deduplicated);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Source status deduplication failed — continuing");
+        }
+
         await CleanupOldDataIfDueAsync(force: true);
+
+        // Optional ETW collection starts a background consumer and degrades on failure.
+        try { await _etwCollector.StartAsync(cancellationToken); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Windows ETW activity collector failed to start"); }
 
         // One-time hardware init (must be done on startup)
         _lhmCollector.Initialize();
@@ -304,6 +325,16 @@ public class MonitoringService : IMonitoringService
         // ── Collect processes ─────────────────────
         try { processSamples = _processCollector.Collect(); }
         catch (Exception ex) { _logger.LogError(ex, "ProcessResourceCollector threw"); }
+
+        // ── Snapshot and merge ETW activity ─────────
+        try
+        {
+            foreach (var sample in processSamples)
+                _etwCollector.RecordPolledProcess(sample.Pid);
+            var etwSnapshot = _etwCollector.SnapshotAndReset(now);
+            processSamples = ProcessEtwMerger.Merge(processSamples, etwSnapshot);
+        }
+        catch (Exception ex) { _logger.LogError(ex, "WindowsEtwActivityCollector snapshot/merge threw"); }
 
         // ── Collect GPU Engine ────────────────────
         if (gpuSamplingEnabled && now - _lastGpuEngineCollectUtc >= GpuEngineCollectInterval)
@@ -405,11 +436,11 @@ public class MonitoringService : IMonitoringService
     {
         var statuses = new List<SourceStatus>();
 
-        TryAddStatus(() => _batteryCollector.GetStatus(), statuses);
-        TryAddStatus(() => _processCollector.GetStatus(), statuses);
+        TryAddStatus(() => _batteryCollector.GetStatus(), statuses, now);
+        TryAddStatus(() => _processCollector.GetStatus(), statuses, now);
         if (gpuSamplingEnabled)
         {
-            TryAddStatus(() => _gpuEngineCollector.GetStatus(), statuses);
+            TryAddStatus(() => _gpuEngineCollector.GetStatus(), statuses, now);
         }
         else
         {
@@ -423,16 +454,17 @@ public class MonitoringService : IMonitoringService
                 RequiresAdmin = false
             });
         }
-        TryAddStatus(() => _lhmCollector.GetStatus(), statuses);
-        TryAddStatus(() => _cpuPowerCollector.GetStatus(hwSamples), statuses);
-        TryAddStatus(() => _gpuPowerCollector.GetStatus(hwSamples, gpuSamples), statuses);
+        TryAddStatus(() => _lhmCollector.GetStatus(), statuses, now);
+        TryAddStatus(() => _cpuPowerCollector.GetStatus(hwSamples), statuses, now);
+        TryAddStatus(() => _gpuPowerCollector.GetStatus(hwSamples, gpuSamples), statuses, now);
+        TryAddStatus(() => _etwCollector.GetStatus(), statuses, now);
 
         return statuses;
     }
 
-    private void TryAddStatus(Func<SourceStatus> getStatus, List<SourceStatus> statuses)
+    private void TryAddStatus(Func<SourceStatus> getStatus, List<SourceStatus> statuses, DateTime now)
     {
-        try { statuses.Add(getStatus()); }
+        try { statuses.Add(getStatus() with { TimestampUtc = now }); }
         catch (Exception ex) { _logger.LogError(ex, "Failed to get source status"); }
     }
 

@@ -21,6 +21,31 @@ public class PowerCulpritAnalyzerTests
     }
 
     [Fact]
+    public void LifecycleCounts_AppearInReasonAndScore()
+    {
+        var withLifecycle = new List<ProcessSample>
+        {
+            new() { TimestampUtc = _baseTime, Pid = 100, ProcessName = "helper.exe", CpuPercent = 0.2, ProcessStartCount = 15, ShortLivedProcessCount = 3 }
+        };
+        var withoutLifecycle = new List<ProcessSample>
+        {
+            new() { TimestampUtc = _baseTime, Pid = 200, ProcessName = "quiet.exe", CpuPercent = 0.2 }
+        };
+
+        var withResult = _analyzer.Analyze(TimeSpan.FromMinutes(30), 1,
+            Array.Empty<SystemPowerSample>(), withLifecycle, Array.Empty<GpuProcessSample>());
+        var withoutResult = _analyzer.Analyze(TimeSpan.FromMinutes(30), 1,
+            Array.Empty<SystemPowerSample>(), withoutLifecycle, Array.Empty<GpuProcessSample>());
+
+        var item = Assert.Single(withResult);
+        Assert.True(item.Score > withoutResult[0].Score);
+        Assert.Equal(15, item.ProcessStartCount);
+        Assert.Equal(3, item.ShortLivedProcessCount);
+        Assert.Contains("process starts", item.Reason);
+        Assert.Contains("short-lived", item.Reason);
+    }
+
+    [Fact]
     public void CpuScoring_RanksHighCpuProcessFirst()
     {
         var processes = new List<ProcessSample>();

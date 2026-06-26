@@ -149,6 +149,9 @@ public class DatabaseManagerTests : IDisposable
                 HandleCount = 340,
                 DiskReadBytesPerSecond = 1024.0,
                 DiskWriteBytesPerSecond = 512.0,
+                ProcessStartCount = 3,
+                ProcessStopCount = 2,
+                ShortLivedProcessCount = 1,
                 IsForegroundProcess = true
             },
             new ProcessSample
@@ -171,10 +174,16 @@ public class DatabaseManagerTests : IDisposable
         Assert.True(fg.IsForegroundProcess);
         Assert.Equal(5.5, fg.CpuPercent);
         Assert.Equal(@"C:\test\test.exe", fg.ExecutablePath);
+        Assert.Equal(3, fg.ProcessStartCount);
+        Assert.Equal(2, fg.ProcessStopCount);
+        Assert.Equal(1, fg.ShortLivedProcessCount);
 
         var bg = result.First(s => s.Pid == 5678);
         Assert.False(bg.IsForegroundProcess);
         Assert.Null(bg.ExecutablePath);
+        Assert.Null(bg.ProcessStartCount);
+        Assert.Null(bg.ProcessStopCount);
+        Assert.Null(bg.ShortLivedProcessCount);
     }
 
     [Fact]
@@ -392,7 +401,106 @@ public class DatabaseManagerTests : IDisposable
         Assert.Equal("Available", battery.Status);
     }
 
-    // ── AnalysisReport round-trip ───────────────
+    [Fact]
+    public async Task GetLatestSourceStatuses_ReturnsSingleRowWhenLatestTimestampTies()
+    {
+        var ts = DateTime.UtcNow;
+        await _db.InsertSourceStatusAsync(new SourceStatus
+        {
+            TimestampUtc = ts,
+            SourceName = "WindowsETW",
+            IsAvailable = false,
+            Status = "Unavailable",
+            Details = "first"
+        });
+        await _db.InsertSourceStatusAsync(new SourceStatus
+        {
+            TimestampUtc = ts,
+            SourceName = "WindowsETW",
+            IsAvailable = true,
+            Status = "Available",
+            Details = "last"
+        });
+
+        var result = await _db.GetLatestSourceStatusesAsync();
+        var etw = Assert.Single(result, s => s.SourceName == "WindowsETW");
+        Assert.True(etw.IsAvailable);
+        Assert.Equal("Available", etw.Status);
+        Assert.Equal("last", etw.Details);
+    }
+
+    [Fact]
+    public async Task DeduplicateSourceStatusTimestampTies_RemovesOnlyExactTimestampDuplicates()
+    {
+        var duplicateTs = DateTime.UtcNow;
+        var laterTs = duplicateTs.AddMinutes(1);
+
+        await _db.InsertSourceStatusAsync(new SourceStatus
+        {
+            TimestampUtc = duplicateTs,
+            SourceName = "WindowsETW",
+            IsAvailable = false,
+            Status = "Unavailable",
+            Details = "duplicate-old"
+        });
+        await _db.InsertSourceStatusAsync(new SourceStatus
+        {
+            TimestampUtc = duplicateTs,
+            SourceName = "WindowsETW",
+            IsAvailable = true,
+            Status = "Available",
+            Details = "duplicate-new"
+        });
+        await _db.InsertSourceStatusAsync(new SourceStatus
+        {
+            TimestampUtc = laterTs,
+            SourceName = "WindowsETW",
+            IsAvailable = true,
+            Status = "Available",
+            Details = "normal-history"
+        });
+        await _db.InsertSourceStatusAsync(new SourceStatus
+        {
+            TimestampUtc = duplicateTs,
+            SourceName = "BatteryAPI",
+            IsAvailable = true,
+            Status = "Available",
+            Details = "other-source"
+        });
+
+        var deleted = await _db.DeduplicateSourceStatusTimestampTiesAsync();
+
+        Assert.Equal(1, deleted);
+        var result = await _db.GetLatestSourceStatusesAsync();
+        Assert.Equal(2, result.Count);
+        var etw = Assert.Single(result, s => s.SourceName == "WindowsETW");
+        Assert.Equal("normal-history", etw.Details);
+        Assert.Contains(result, s => s.SourceName == "BatteryAPI" && s.Details == "other-source");
+    }
+
+    [Fact]
+    public async Task DeduplicateSourceStatusTimestampTies_IsIdempotent()
+    {
+        var ts = DateTime.UtcNow;
+        await _db.InsertSourceStatusAsync(new SourceStatus
+        {
+            TimestampUtc = ts,
+            SourceName = "WindowsETW",
+            IsAvailable = false,
+            Status = "Unavailable"
+        });
+        await _db.InsertSourceStatusAsync(new SourceStatus
+        {
+            TimestampUtc = ts,
+            SourceName = "WindowsETW",
+            IsAvailable = true,
+            Status = "Available"
+        });
+
+        Assert.Equal(1, await _db.DeduplicateSourceStatusTimestampTiesAsync());
+        Assert.Equal(0, await _db.DeduplicateSourceStatusTimestampTiesAsync());
+    }
+
 
     [Fact]
     public async Task InsertAnalysisReport_WritesItems()

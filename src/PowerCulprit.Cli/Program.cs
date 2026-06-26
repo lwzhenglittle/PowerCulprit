@@ -174,7 +174,7 @@ internal class Program
     //  Diagnose mode
     // ──────────────────────────────────────────────
 
-    private static Task<int> RunDiagnoseAsync()
+    private static async Task<int> RunDiagnoseAsync()
     {
         Console.WriteLine("=== PowerCulprit Diagnose ===");
         Console.WriteLine();
@@ -277,6 +277,21 @@ internal class Program
         var levelZero = File.Exists(@"C:\Windows\System32\ze_loader.dll");
         Console.WriteLine($"Level Zero Sysman: {(levelZero ? "ze_loader.dll found" : "Not found")}");
 
+        // ETW status
+        try
+        {
+            var statuses = await WindowsEtwActivityProbe.ProbeAsync(TimeSpan.FromSeconds(2));
+            foreach (var status in statuses)
+            {
+                var suffix = string.IsNullOrWhiteSpace(status.Details) ? string.Empty : $" ({status.Details})";
+                Console.WriteLine($"{status.SourceName}: {status.Status}{suffix}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"ETW Kernel Session: Error — {ex.Message}");
+        }
+
         // Admin status
         var isAdmin = System.Security.Principal.WindowsIdentity.GetCurrent()
             .Owner?.IsWellKnown(System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid) ?? false;
@@ -288,7 +303,7 @@ internal class Program
 
         Console.WriteLine();
         Console.WriteLine("Diagnose complete.");
-        return Task.FromResult(0);
+        return 0;
     }
 
     // ──────────────────────────────────────────────
@@ -330,6 +345,8 @@ internal class Program
         services.AddSingleton<LibreHardwareMonitorCollector>();
         services.AddSingleton<IntelCpuPowerCollector>();
         services.AddSingleton<IntelGpuPowerCollector>();
+        services.AddSingleton<WindowsEtwActivityCollector>();
+        services.AddSingleton<IWindowsEtwActivityCollector>(sp => sp.GetRequiredService<WindowsEtwActivityCollector>());
         services.AddSingleton<MonitoringService>();
 
         var provider = services.BuildServiceProvider();

@@ -47,6 +47,21 @@ public partial class App : Application
 
     private void ShowWindow()
     {
+        var dispatcher = _window?.DispatcherQueue;
+        if (dispatcher is null)
+        {
+            DoShowWindow();
+            return;
+        }
+
+        if (dispatcher.HasThreadAccess)
+            DoShowWindow();
+        else
+            dispatcher.TryEnqueue(DoShowWindow);
+    }
+
+    private void DoShowWindow()
+    {
         if (_window is MainWindow mw)
         {
             mw.ShowFromTray();
@@ -102,13 +117,42 @@ public partial class App : Application
     {
         try
         {
-            var viewModel = _serviceProvider?.GetService<MainViewModel>();
-            if (viewModel is not null)
+            var dispatcher = _window?.DispatcherQueue;
+            if (dispatcher is null || dispatcher.HasThreadAccess)
             {
-                await viewModel.ExportCsvCommand.ExecuteAsync(null);
+                await DoExportDataAsync();
+                return;
             }
+
+            var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (!dispatcher.TryEnqueue(async () =>
+            {
+                try
+                {
+                    await DoExportDataAsync();
+                    tcs.TrySetResult();
+                }
+                catch (Exception ex)
+                {
+                    tcs.TrySetException(ex);
+                }
+            }))
+            {
+                tcs.TrySetException(new InvalidOperationException("Failed to enqueue CSV export on the UI thread."));
+            }
+
+            await tcs.Task;
         }
         catch { /* logged inside the command */ }
+    }
+
+    private async Task DoExportDataAsync()
+    {
+        var viewModel = _serviceProvider?.GetService<MainViewModel>();
+        if (viewModel is not null)
+        {
+            await viewModel.ExportCsvCommand.ExecuteAsync(null);
+        }
     }
 
     private static ServiceProvider BuildServiceProvider()
@@ -132,6 +176,8 @@ public partial class App : Application
         services.AddSingleton<LibreHardwareMonitorCollector>();
         services.AddSingleton<IntelCpuPowerCollector>();
         services.AddSingleton<IntelGpuPowerCollector>();
+        services.AddSingleton<WindowsEtwActivityCollector>();
+        services.AddSingleton<IWindowsEtwActivityCollector>(sp => sp.GetRequiredService<WindowsEtwActivityCollector>());
 
         services.AddSingleton<MonitoringService>();
         services.AddSingleton<IMonitoringService>(sp => sp.GetRequiredService<MonitoringService>());

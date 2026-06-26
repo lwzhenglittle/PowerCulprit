@@ -90,6 +90,10 @@ public class PowerCulpritAnalyzer
                 ? Math.Round(totalNetBytes / (1024.0 * 1024.0), 2)
                 : (double?)null;
 
+            var totalProcessStarts = SumNullableInt(samples.Select(s => s.ProcessStartCount));
+            var totalProcessStops = SumNullableInt(samples.Select(s => s.ProcessStopCount));
+            var totalShortLived = SumNullableInt(samples.Select(s => s.ShortLivedProcessCount));
+
             var bgSamples = samples.Count(s => !s.IsForegroundProcess);
             var fgSamples = samples.Count - bgSamples;
             var bgSeconds = bgSamples * effectiveIntervalSeconds;
@@ -154,6 +158,18 @@ public class PowerCulpritAnalyzer
             if (totalNetMb.HasValue && totalNetMb.Value > 0)
                 score += totalNetMb.Value * 0.005;
 
+            if (totalShortLived.HasValue && totalShortLived.Value > 0)
+            {
+                score += totalShortLived.Value * 2.0;
+                reasons.Add($"{totalShortLived.Value} short-lived instance{(totalShortLived.Value == 1 ? "" : "s")}");
+            }
+
+            if (totalProcessStarts.HasValue && totalProcessStarts.Value > 10)
+            {
+                score += (totalProcessStarts.Value - 10) * 0.5;
+                reasons.Add($"{totalProcessStarts.Value} process starts");
+            }
+
             double? powerCorr = null;
             double? cpuPowerCorr = null;
 
@@ -179,6 +195,9 @@ public class PowerCulpritAnalyzer
                 MaxGpuPercent = maxGpu.HasValue ? Math.Round(maxGpu.Value, 2) : null,
                 DiskMb = totalDiskMb,
                 NetworkMb = totalNetMb,
+                ProcessStartCount = totalProcessStarts,
+                ProcessStopCount = totalProcessStops,
+                ShortLivedProcessCount = totalShortLived,
                 BackgroundActiveSeconds = bgSeconds > 0 ? Math.Round(bgSeconds, 1) : null,
                 ForegroundActiveSeconds = fgSeconds > 0 ? Math.Round(fgSeconds, 1) : null,
                 PowerCorrelation = powerCorr,
@@ -259,6 +278,9 @@ public class PowerCulpritAnalyzer
                 DiskWriteBytesPerSecond = SumNullable(g.Select(s => s.DiskWriteBytesPerSecond)),
                 NetworkReceiveBytesPerSecond = SumNullable(g.Select(s => s.NetworkReceiveBytesPerSecond)),
                 NetworkSendBytesPerSecond = SumNullable(g.Select(s => s.NetworkSendBytesPerSecond)),
+                ProcessStartCount = SumNullableInt(g.Select(s => s.ProcessStartCount)),
+                ProcessStopCount = SumNullableInt(g.Select(s => s.ProcessStopCount)),
+                ShortLivedProcessCount = SumNullableInt(g.Select(s => s.ShortLivedProcessCount)),
                 IsForegroundProcess = g.Any(s => s.IsForegroundProcess)
             })
             .ToList();
@@ -406,6 +428,19 @@ public class PowerCulpritAnalyzer
         }
 
         return timeline;
+    }
+
+    private static int? SumNullableInt(IEnumerable<int?> values)
+    {
+        var hasValue = false;
+        var sum = 0;
+        foreach (var value in values)
+        {
+            if (!value.HasValue) continue;
+            hasValue = true;
+            sum += value.Value;
+        }
+        return hasValue ? sum : null;
     }
 
     private static double? ComputeProcessPowerCorrelation(

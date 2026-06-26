@@ -8,9 +8,14 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="PowerCulprit.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="LibreHardwareMonitorLib" Version="*" />
     <PackageReference Include="System.Management" Version="*" />
     <PackageReference Include="System.Diagnostics.PerformanceCounter" Version="*" />
+    <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="3.2.4" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="*" />
   </ItemGroup>
 

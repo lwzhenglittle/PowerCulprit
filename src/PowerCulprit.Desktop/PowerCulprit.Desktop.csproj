@@ -56,7 +56,28 @@
   <PropertyGroup>
     <PublishReadyToRun Condition="'$(Configuration)' == 'Debug'">False</PublishReadyToRun>
     <PublishReadyToRun Condition="'$(Configuration)' != 'Debug'">True</PublishReadyToRun>
-    <PublishTrimmed Condition="'$(Configuration)' == 'Debug'">False</PublishTrimmed>
-    <PublishTrimmed Condition="'$(Configuration)' != 'Debug'">True</PublishTrimmed>
+    <!-- WinUI/WinRT and LibreHardwareMonitor use activation/reflection paths that
+         are not trim-safe in this unpackaged desktop app. Release trimming caused
+         startup crashes in Microsoft.UI.Xaml.dll (0xc000027b), so keep publish
+         output untrimmed even for Release. -->
+    <PublishTrimmed>False</PublishTrimmed>
   </PropertyGroup>
+
+  <!--
+    dotnet publish for this unpackaged WinUI app can omit the generated XAML resource
+    files even though dotnet build places them in bin\...\win-x64. Without App.xbf,
+    MainPage.xbf, MainWindow.xbf, and the app PRI, the published exe crashes during
+    WinUI startup in Microsoft.UI.Xaml.dll (0xc000027b). Copy those generated
+    resources from OutDir into PublishDir after publish. The Content-based app
+    assets are already copied by the SDK.
+  -->
+  <Target Name="CopyWinUIXamlResourcesToPublishDirectory" AfterTargets="Publish" Condition="'$(PublishDir)' != ''">
+    <ItemGroup>
+      <PowerCulpritWinUIResource Include="$(OutDir)*.xbf" />
+      <PowerCulpritWinUIResource Include="$(OutDir)$(AssemblyName).pri" />
+    </ItemGroup>
+    <Copy SourceFiles="@(PowerCulpritWinUIResource)"
+          DestinationFiles="@(PowerCulpritWinUIResource->'$(PublishDir)%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
 </Project>

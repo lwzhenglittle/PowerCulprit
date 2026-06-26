@@ -235,13 +235,26 @@ public class DatabaseManager : IDisposable
         // Backfill the column on older DBs created before svchost-service attribution.
         // CREATE TABLE IF NOT EXISTS won't add columns to an existing table, so we
         // probe via PRAGMA table_info and ALTER TABLE ADD COLUMN when needed.
-        if (!await ColumnExistsAsync(connection, transaction, "process_samples", "service_name"))
-        {
-            await using var alter = new SqliteCommand(
-                "ALTER TABLE process_samples ADD COLUMN service_name TEXT;",
-                connection, transaction);
-            await alter.ExecuteNonQueryAsync();
-        }
+        await AddColumnIfMissingAsync(connection, transaction, "process_samples", "service_name", "TEXT");
+        await AddColumnIfMissingAsync(connection, transaction, "process_samples", "process_start_count", "INTEGER");
+        await AddColumnIfMissingAsync(connection, transaction, "process_samples", "process_stop_count", "INTEGER");
+        await AddColumnIfMissingAsync(connection, transaction, "process_samples", "process_short_lived_count", "INTEGER");
+    }
+
+    private static async Task AddColumnIfMissingAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string table,
+        string column,
+        string type)
+    {
+        if (await ColumnExistsAsync(connection, transaction, table, column))
+            return;
+
+        await using var alter = new SqliteCommand(
+            $"ALTER TABLE {table} ADD COLUMN {column} {type};",
+            connection, transaction);
+        await alter.ExecuteNonQueryAsync();
     }
 
     private static async Task<bool> ColumnExistsAsync(
@@ -496,10 +509,11 @@ public class DatabaseManager : IDisposable
                      parent_pid, cpu_percent, working_set_mb, private_memory_mb,
                      thread_count, handle_count, disk_read_bytes_per_second,
                      disk_write_bytes_per_second, network_receive_bytes_per_second,
-                     network_send_bytes_per_second, is_foreground_process, service_name)
+                     network_send_bytes_per_second, is_foreground_process, service_name,
+                     process_start_count, process_stop_count, process_short_lived_count)
                 VALUES
                     ($ts, $pid, $pn, $ep, $cl, $pp, $cpu, $ws, $pmem,
-                     $tc, $hc, $dr, $dw, $nr, $ns, $fg, $sn);
+                     $tc, $hc, $dr, $dw, $nr, $ns, $fg, $sn, $psc, $pstc, $slc);
                 """;
 
             await using var cmd = new SqliteCommand(sql, connection, transaction);
@@ -522,6 +536,9 @@ public class DatabaseManager : IDisposable
             var p_ns  = cmd.Parameters.Add("$ns",   SqliteType.Real);
             var p_fg  = cmd.Parameters.Add("$fg",   SqliteType.Integer);
             var p_sn  = cmd.Parameters.Add("$sn",   SqliteType.Text);
+            var p_psc = cmd.Parameters.Add("$psc",  SqliteType.Integer);
+            var p_pstc = cmd.Parameters.Add("$pstc", SqliteType.Integer);
+            var p_slc = cmd.Parameters.Add("$slc",  SqliteType.Integer);
 
             foreach (var sample in samples)
             {
@@ -542,6 +559,9 @@ public class DatabaseManager : IDisposable
                 p_ns.Value  = (object?)sample.NetworkSendBytesPerSecond ?? DBNull.Value;
                 p_fg.Value  = sample.IsForegroundProcess ? 1L : 0L;
                 p_sn.Value  = (object?)sample.ServiceName ?? DBNull.Value;
+                p_psc.Value = (object?)sample.ProcessStartCount ?? DBNull.Value;
+                p_pstc.Value = (object?)sample.ProcessStopCount ?? DBNull.Value;
+                p_slc.Value = (object?)sample.ShortLivedProcessCount ?? DBNull.Value;
 
                 await cmd.ExecuteNonQueryAsync();
             }
@@ -1072,7 +1092,8 @@ public class DatabaseManager : IDisposable
                    parent_pid, cpu_percent, working_set_mb, private_memory_mb,
                    thread_count, handle_count, disk_read_bytes_per_second,
                    disk_write_bytes_per_second, network_receive_bytes_per_second,
-                   network_send_bytes_per_second, is_foreground_process, service_name
+                   network_send_bytes_per_second, is_foreground_process, service_name,
+                   process_start_count, process_stop_count, process_short_lived_count
             FROM process_samples
             WHERE timestamp_utc >= $from AND timestamp_utc <= $to
             ORDER BY timestamp_utc;
@@ -1104,7 +1125,10 @@ public class DatabaseManager : IDisposable
                 NetworkReceiveBytesPerSecond = reader.IsDBNull(13) ? null : reader.GetDouble(13),
                 NetworkSendBytesPerSecond    = reader.IsDBNull(14) ? null : reader.GetDouble(14),
                 IsForegroundProcess          = reader.GetInt64(15) != 0,
-                ServiceName                  = reader.IsDBNull(16) ? null : reader.GetString(16)
+                ServiceName                  = reader.IsDBNull(16) ? null : reader.GetString(16),
+                ProcessStartCount            = reader.IsDBNull(17) ? null : reader.GetInt32(17),
+                ProcessStopCount             = reader.IsDBNull(18) ? null : reader.GetInt32(18),
+                ShortLivedProcessCount       = reader.IsDBNull(19) ? null : reader.GetInt32(19)
             });
         }
 
@@ -1125,7 +1149,8 @@ public class DatabaseManager : IDisposable
             SELECT timestamp_utc, pid, process_name, cpu_percent, working_set_mb,
                    disk_read_bytes_per_second, disk_write_bytes_per_second,
                    network_receive_bytes_per_second, network_send_bytes_per_second,
-                   is_foreground_process, service_name
+                   is_foreground_process, service_name, process_start_count,
+                   process_stop_count, process_short_lived_count
             FROM process_samples
             WHERE timestamp_utc >= $from AND timestamp_utc <= $to
             ORDER BY timestamp_utc;
@@ -1151,7 +1176,10 @@ public class DatabaseManager : IDisposable
                 NetworkReceiveBytesPerSecond = reader.IsDBNull(7) ? null : reader.GetDouble(7),
                 NetworkSendBytesPerSecond = reader.IsDBNull(8) ? null : reader.GetDouble(8),
                 IsForegroundProcess = reader.GetInt64(9) != 0,
-                ServiceName = reader.IsDBNull(10) ? null : reader.GetString(10)
+                ServiceName = reader.IsDBNull(10) ? null : reader.GetString(10),
+                ProcessStartCount = reader.IsDBNull(11) ? null : reader.GetInt32(11),
+                ProcessStopCount = reader.IsDBNull(12) ? null : reader.GetInt32(12),
+                ShortLivedProcessCount = reader.IsDBNull(13) ? null : reader.GetInt32(13)
             });
         }
 
@@ -1211,11 +1239,13 @@ public class DatabaseManager : IDisposable
         const string sql = """
             SELECT s.timestamp_utc, s.source_name, s.is_available, s.status, s.details, s.requires_admin
             FROM source_status s
-            INNER JOIN (
-                SELECT source_name, MAX(timestamp_utc) AS max_ts
-                FROM source_status
-                GROUP BY source_name
-            ) latest ON s.source_name = latest.source_name AND s.timestamp_utc = latest.max_ts
+            WHERE s.id = (
+                SELECT s2.id
+                FROM source_status s2
+                WHERE s2.source_name = s.source_name
+                ORDER BY s2.timestamp_utc DESC, s2.id DESC
+                LIMIT 1
+            )
             ORDER BY s.source_name;
             """;
 
@@ -1242,6 +1272,40 @@ public class DatabaseManager : IDisposable
     // ──────────────────────────────────────────────
     //  Maintenance
     // ──────────────────────────────────────────────
+
+    /// <summary>
+    /// Removes duplicate source status rows that share the same source name and timestamp,
+    /// keeping the most recently inserted row for each exact timestamp.
+    /// </summary>
+    public async Task<int> DeduplicateSourceStatusTimestampTiesAsync()
+    {
+        await EnsureInitializedAsync();
+
+        await _writeLock.WaitAsync();
+        try
+        {
+            var connection = await GetOrOpenWriteConnectionAsync();
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync();
+
+            const string sql = """
+                DELETE FROM source_status
+                WHERE id NOT IN (
+                    SELECT MAX(id)
+                    FROM source_status
+                    GROUP BY source_name, timestamp_utc
+                );
+                """;
+
+            await using var cmd = new SqliteCommand(sql, connection, transaction);
+            var deleted = await cmd.ExecuteNonQueryAsync();
+            await transaction.CommitAsync();
+            return deleted;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
 
     /// <summary>
     /// Rebuilds persisted battery cycle caches from retained system power samples.

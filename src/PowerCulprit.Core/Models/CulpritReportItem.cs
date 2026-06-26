@@ -43,6 +43,15 @@ public record CulpritReportItem
     /// <summary>Total network I/O in megabytes over the window.</summary>
     public double? NetworkMb { get; init; }
 
+    /// <summary>Total ETW-observed process starts over the window.</summary>
+    public int? ProcessStartCount { get; init; }
+
+    /// <summary>Total ETW-observed process stops over the window.</summary>
+    public int? ProcessStopCount { get; init; }
+
+    /// <summary>Total ETW-observed short-lived process instances over the window.</summary>
+    public int? ShortLivedProcessCount { get; init; }
+
     /// <summary>
     /// Seconds the process spent in foreground (owning the focused window) over the window.
     /// Counted as (number of samples where the process owned the foreground window at the

@@ -74,6 +74,7 @@ Package.StoreAssociation.xml
 # Local agent/tooling state
 .agents/
 .codex/
+.claude/
 
 # Screenshots
 QQ*.png
