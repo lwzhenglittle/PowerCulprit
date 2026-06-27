@@ -8,6 +8,9 @@
         <ResourceDictionary>
             <ResourceDictionary.MergedDictionaries>
                 <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
+                <ResourceDictionary Source="/Styles/Spacing.xaml" />
+                <ResourceDictionary Source="/Styles/Typography.xaml" />
+                <ResourceDictionary Source="/Styles/Layout.xaml" />
             </ResourceDictionary.MergedDictionaries>
         </ResourceDictionary>
     </Application.Resources>

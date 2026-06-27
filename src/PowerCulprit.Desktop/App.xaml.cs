@@ -14,6 +14,7 @@ public partial class App : Application
     private Window? _window;
     private ServiceProvider? _serviceProvider;
     private TrayManager? _trayManager;
+    private SingleInstanceGuard? _singleInstanceGuard;
 
     public App()
     {
@@ -22,6 +23,15 @@ public partial class App : Application
 
     protected override void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs args)
     {
+        _singleInstanceGuard = new SingleInstanceGuard();
+        if (!_singleInstanceGuard.TryAcquire())
+        {
+            _singleInstanceGuard.Dispose();
+            _singleInstanceGuard = null;
+            Exit();
+            return;
+        }
+
         _serviceProvider = BuildServiceProvider();
 
         var mainViewModel = _serviceProvider.GetRequiredService<MainViewModel>();
@@ -105,6 +115,9 @@ public partial class App : Application
         // singletons get a chance to release native handles (LHM, PDH, etc.).
         _serviceProvider?.Dispose();
         _serviceProvider = null;
+
+        _singleInstanceGuard?.Dispose();
+        _singleInstanceGuard = null;
 
         // Actually close the window
         if (_window is MainWindow mw)

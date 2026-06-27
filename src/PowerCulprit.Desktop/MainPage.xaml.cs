@@ -1,6 +1,7 @@
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Navigation;
+using PowerCulprit.Desktop.Controls;
 using PowerCulprit.Desktop.ViewModels;
 
 namespace PowerCulprit.Desktop;
@@ -58,6 +59,11 @@ public sealed partial class MainPage : Page
     private void HistoryChart_Unloaded(object sender, Microsoft.UI.Xaml.RoutedEventArgs e)
     {
         RestorePageScrolling();
+    }
+
+    private void HistoryChart_VisibleRangeChanged(object sender, VisibleRangeChangedEventArgs e)
+    {
+        ViewModel?.SetChartVisibleRangeFromUserInteraction(e.FromUtc, e.ToUtc);
     }
 
     private void RestorePageScrolling()

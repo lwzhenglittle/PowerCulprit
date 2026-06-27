@@ -212,6 +212,7 @@ public class MonitoringService : IMonitoringService
     private async Task RunLoopAsync(CancellationToken cancellationToken)
     {
         await _databaseManager.InitializeAsync();
+        await _databaseManager.InsertSessionStartMarkerAsync(DateTime.UtcNow);
         try
         {
             var deduplicated = await _databaseManager.DeduplicateSourceStatusTimestampTiesAsync();

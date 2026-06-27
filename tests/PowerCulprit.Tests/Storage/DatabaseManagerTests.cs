@@ -679,6 +679,51 @@ public class DatabaseManagerTests : IDisposable
     }
 
     [Fact]
+    public async Task RebuildBatteryCycles_RespectsSessionStartMarkers()
+    {
+        var start = DateTime.UtcNow.AddHours(-2);
+        await _db.InsertSystemPowerSamplesAsync(new[]
+        {
+            Power(start, ac: true, percent: 90),
+            Power(start.AddMinutes(1), ac: false, percent: 90),
+            Power(start.AddMinutes(2), ac: false, percent: 85),
+            Power(start.AddMinutes(3), ac: false, percent: 80),
+            Power(start.AddMinutes(4), ac: false, percent: 75)
+        });
+        await _db.InsertSessionStartMarkerAsync(start.AddMinutes(2).AddSeconds(30));
+
+        await _db.RebuildBatteryCyclesAsync();
+
+        var displayCycles = await _db.GetLatestBatteryDisplayCyclesAsync(10);
+        Assert.Equal(2, displayCycles.Count);
+
+        var allRawCycles = new List<BatteryCycle>();
+        foreach (var display in displayCycles)
+            allRawCycles.AddRange(await _db.GetBatteryCyclesForDisplayCycleAsync(display.Id));
+
+        var rawCycles = allRawCycles.OrderBy(c => c.StartUtc).ToList();
+        Assert.Equal(2, rawCycles.Count);
+        Assert.Equal(start.AddMinutes(1), rawCycles[0].StartUtc, TimeSpan.FromSeconds(1));
+        Assert.Equal(start.AddMinutes(2), rawCycles[0].EndUtc!.Value, TimeSpan.FromSeconds(1));
+        Assert.Equal(start.AddMinutes(3), rawCycles[1].StartUtc, TimeSpan.FromSeconds(1));
+        Assert.True(rawCycles[1].StartedAtSessionBoundary);
+    }
+
+    [Fact]
+    public async Task ClearHistoricalData_RemovesSessionStartMarkers()
+    {
+        var ts = DateTime.UtcNow;
+        await _db.InsertSessionStartMarkerAsync(ts);
+
+        Assert.Single(await _db.GetSessionStartMarkersAsync(ts.AddSeconds(-1), ts.AddSeconds(1)));
+
+        await _db.ClearHistoricalDataAsync();
+
+        Assert.Empty(await _db.GetSessionStartMarkersAsync(ts.AddSeconds(-1), ts.AddSeconds(1)));
+    }
+
+
+    [Fact]
     public async Task GetLatestBatteryDisplayCycles_ReturnsOpenCycleFirst()
     {
         var start = DateTime.UtcNow.AddHours(-1);

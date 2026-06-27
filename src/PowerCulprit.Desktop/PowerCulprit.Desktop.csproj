@@ -4,6 +4,7 @@
     <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
     <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
     <RootNamespace>PowerCulprit.Desktop</RootNamespace>
+    <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <Platforms>x86;x64;ARM64</Platforms>
     <RuntimeIdentifiers>win-x86;win-x64;win-arm64</RuntimeIdentifiers>
@@ -25,6 +26,7 @@
     <Content Include="Assets\Square44x44Logo.targetsize-24_altform-unplated.png" />
     <Content Include="Assets\Square44x44Logo.targetsize-48_altform-lightunplated.png" />
     <Content Include="Assets\StoreLogo.png" />
+    <Content Include="Assets\AppIcon.svg" />
     <Content Include="Assets\AppIcon.ico" />
     <Content Include="Assets\Wide310x150Logo.scale-200.png" />
   </ItemGroup>
@@ -39,7 +41,7 @@
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools.WinApp" Version="0.3.2">
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="LiveChartsCore.SkiaSharpView.WinUI" Version="*" />
+    <PackageReference Include="Microsoft.Graphics.Win2D" Version="*" />
     <PackageReference Include="CommunityToolkit.Mvvm" Version="*" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="*" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="*" />

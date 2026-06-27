@@ -1,20 +1,12 @@
 using System.Collections.ObjectModel;
-using System.ComponentModel;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
-using LiveChartsCore;
-using LiveChartsCore.Defaults;
-using LiveChartsCore.Kernel.Sketches;
-using LiveChartsCore.Measure;
-using LiveChartsCore.SkiaSharpView;
-using LiveChartsCore.SkiaSharpView.Painting;
 using Microsoft.Extensions.Logging;
 using Microsoft.UI.Dispatching;
 using PowerCulprit.Core.Analysis;
 using PowerCulprit.Core.Models;
 using PowerCulprit.Core.Services;
 using PowerCulprit.Storage;
-using SkiaSharp;
 
 namespace PowerCulprit.Desktop.ViewModels;
 
@@ -22,16 +14,15 @@ public partial class MainViewModel : ObservableObject
 {
     private const int DisplayProcessLimit = 20;
     private const int DisplayCycleListLimit = 20;
+    private const double DefaultDischargeAxisMax = 10;
     private static readonly TimeSpan DefaultHistoryWindow = TimeSpan.FromHours(6);
     private static readonly TimeSpan SelectionDebounce = TimeSpan.FromMilliseconds(400);
-    private static readonly double TenMinutesInTicks = TimeSpan.FromMinutes(10).Ticks;
 
     private readonly IMonitoringService _monitor;
     private readonly ILogger<MainViewModel> _logger;
     private readonly DispatcherQueue _dispatcher;
     private readonly DatabaseManager _database;
     private readonly PowerCulpritAnalyzer _analyzer = new();
-    private readonly Axis _timeAxis;
 
     private IReadOnlyList<SystemPowerSample> _loadedPowerSamples = Array.Empty<SystemPowerSample>();
     private IReadOnlyList<BatteryCycle> _selectedCycleSegments = Array.Empty<BatteryCycle>();
@@ -41,7 +32,6 @@ public partial class MainViewModel : ObservableObject
     private DateTime _selectedFromUtc = DateTime.MinValue;
     private DateTime _selectedToUtc = DateTime.MinValue;
     private bool _isCycleMode;
-    private bool _suppressAxisSelection;
     private bool _suppressCycleSelection;
     private CancellationTokenSource? _refreshCts;
     private CancellationTokenSource? _analysisCts;
@@ -59,12 +49,6 @@ public partial class MainViewModel : ObservableObject
         _database = database;
 
         IsGpuSamplingEnabled = _monitor.IsGpuSamplingEnabled;
-
-        _timeAxis = BuildTimeAxis();
-        _timeAxis.PropertyChanged += OnTimeAxisPropertyChanged;
-        TimeAxes = new ICartesianAxis[] { _timeAxis };
-        PowerYAxes = BuildPowerYAxes();
-        MainChartSeries = BuildMainChartSeries();
 
         _monitor.RunningChanged += OnMonitorRunningChanged;
     }
@@ -124,85 +108,27 @@ public partial class MainViewModel : ObservableObject
         _ = LoadSelectedCycleAsync(value.Cycle, resetRange: true);
     }
 
-    public ObservableCollection<DateTimePoint> BatteryPercentSeries { get; } = new();
-    public ObservableCollection<DateTimePoint> DischargeRateSeries { get; } = new();
     public ObservableCollection<BatteryDisplayCycleRow> CycleRows { get; } = new();
     public ObservableCollection<HistoricalProcessRow> ProcessRows { get; } = new();
     public ObservableCollection<SourceStatusRow> SourceStatusRows { get; } = new();
 
-    public ISeries[] MainChartSeries { get; }
-    public ICartesianAxis[] TimeAxes { get; }
-    public ICartesianAxis[] PowerYAxes { get; }
+    [ObservableProperty]
+    public partial IReadOnlyList<PowerChartSample> ChartSamples { get; set; } = Array.Empty<PowerChartSample>();
 
-    private ISeries[] BuildMainChartSeries()
-    {
-        return new ISeries[]
-        {
-            new LineSeries<DateTimePoint>
-            {
-                Values = BatteryPercentSeries,
-                Name = "Battery %",
-                Stroke = new SolidColorPaint(SKColors.DodgerBlue) { StrokeThickness = 2 },
-                GeometrySize = 0,
-                Fill = null,
-                ScalesYAt = 0
-            },
-            new LineSeries<DateTimePoint>
-            {
-                Values = DischargeRateSeries,
-                Name = "Discharge W",
-                Stroke = new SolidColorPaint(SKColors.OrangeRed) { StrokeThickness = 2 },
-                GeometrySize = 0,
-                Fill = null,
-                ScalesYAt = 1
-            }
-        };
-    }
+    [ObservableProperty]
+    public partial DateTime ChartHistoryFromUtc { get; set; } = DateTime.MinValue;
 
-    private static Axis BuildTimeAxis()
-    {
-        return new Axis
-        {
-            Labeler = value =>
-            {
-                try
-                {
-                    var ticks = (long)value;
-                    if (ticks < DateTime.MinValue.Ticks || ticks > DateTime.MaxValue.Ticks)
-                        return string.Empty;
-                    return new DateTime(ticks).ToString("HH:mm");
-                }
-                catch
-                {
-                    return string.Empty;
-                }
-            },
-            LabelsRotation = 20,
-            MinStep = TenMinutesInTicks,
-            UnitWidth = TenMinutesInTicks,
-            TextSize = 11
-        };
-    }
+    [ObservableProperty]
+    public partial DateTime ChartHistoryToUtc { get; set; } = DateTime.MinValue;
 
-    private static ICartesianAxis[] BuildPowerYAxes()
-    {
-        return new ICartesianAxis[]
-        {
-            new Axis
-            {
-                Name = "Battery %",
-                MinLimit = 0,
-                MaxLimit = 100,
-                TextSize = 11
-            },
-            new Axis
-            {
-                Name = "Discharge W",
-                Position = AxisPosition.End,
-                TextSize = 11
-            }
-        };
-    }
+    [ObservableProperty]
+    public partial DateTime ChartVisibleFromUtc { get; set; } = DateTime.MinValue;
+
+    [ObservableProperty]
+    public partial DateTime ChartVisibleToUtc { get; set; } = DateTime.MinValue;
+
+    [ObservableProperty]
+    public partial double ChartDischargeAxisMax { get; set; } = DefaultDischargeAxisMax;
 
     [RelayCommand]
     private async Task StartMonitoring()
@@ -629,28 +555,6 @@ public partial class MainViewModel : ObservableObject
         });
     }
 
-    private void OnTimeAxisPropertyChanged(object? sender, PropertyChangedEventArgs e)
-    {
-        if (_suppressAxisSelection)
-            return;
-
-        if (e.PropertyName != nameof(Axis.MinLimit) && e.PropertyName != nameof(Axis.MaxLimit))
-            return;
-
-        if (!_timeAxis.MinLimit.HasValue || !_timeAxis.MaxLimit.HasValue)
-            return;
-
-        var fromUtc = ChartTicksToUtc(_timeAxis.MinLimit.Value);
-        var toUtc = ChartTicksToUtc(_timeAxis.MaxLimit.Value);
-        if (toUtc <= fromUtc)
-            return;
-
-        var clamped = ClampRange(fromUtc, toUtc);
-        var updateAxis = clamped.FromUtc != fromUtc || clamped.ToUtc != toUtc;
-        SetSelectedRange(clamped.FromUtc, clamped.ToUtc, updateAxis);
-        ScheduleAnalyzeSelectedRange();
-    }
-
     private void ScheduleAnalyzeSelectedRange()
     {
         _selectionDebounceCts?.Cancel();
@@ -678,19 +582,39 @@ public partial class MainViewModel : ObservableObject
 
     private void ReplaceChartData(IReadOnlyList<SystemPowerSample> powerSamples)
     {
-        BatteryPercentSeries.Clear();
-        DischargeRateSeries.Clear();
+        ChartSamples = powerSamples
+            .Select(sample => new PowerChartSample(
+                sample.TimestampUtc,
+                sample.BatteryPercent,
+                GetDischargeWatts(sample)))
+            .ToList();
 
-        foreach (var sample in powerSamples)
-        {
-            var localTime = sample.TimestampUtc.ToLocalTime();
-            if (sample.BatteryPercent.HasValue)
-                BatteryPercentSeries.Add(new DateTimePoint(localTime, sample.BatteryPercent.Value));
+        ChartHistoryFromUtc = _historyFromUtc;
+        ChartHistoryToUtc = _historyToUtc;
+        ChartDischargeAxisMax = CalculateDischargeAxisMax(powerSamples);
+    }
 
-            var dischargeW = GetDischargeWatts(sample);
-            if (dischargeW.HasValue)
-                DischargeRateSeries.Add(new DateTimePoint(localTime, dischargeW.Value));
-        }
+    private void ClearChartSeries()
+    {
+        ChartSamples = Array.Empty<PowerChartSample>();
+        ChartHistoryFromUtc = DateTime.MinValue;
+        ChartHistoryToUtc = DateTime.MinValue;
+        ChartVisibleFromUtc = DateTime.MinValue;
+        ChartVisibleToUtc = DateTime.MinValue;
+        ChartDischargeAxisMax = DefaultDischargeAxisMax;
+    }
+
+    private static double CalculateDischargeAxisMax(IReadOnlyList<SystemPowerSample> powerSamples)
+    {
+        var max = powerSamples
+            .Select(GetDischargeWatts)
+            .Where(value => value.HasValue)
+            .Select(value => value!.Value)
+            .DefaultIfEmpty(0)
+            .Max();
+
+        var padded = max <= 0 ? DefaultDischargeAxisMax : Math.Ceiling(max * 1.15);
+        return Math.Max(DefaultDischargeAxisMax, padded);
     }
 
     private void ClearHistoricalView()
@@ -704,8 +628,7 @@ public partial class MainViewModel : ObservableObject
         _selectedToUtc = DateTime.MinValue;
         _isCycleMode = false;
 
-        BatteryPercentSeries.Clear();
-        DischargeRateSeries.Clear();
+        ClearChartSeries();
         CycleRows.Clear();
         ProcessRows.Clear();
         SourceStatusRows.Clear();
@@ -726,34 +649,94 @@ public partial class MainViewModel : ObservableObject
             _suppressCycleSelection = false;
         }
 
-        _suppressAxisSelection = true;
-        try
-        {
-            _timeAxis.MinLimit = null;
-            _timeAxis.MaxLimit = null;
-        }
-        finally
-        {
-            _suppressAxisSelection = false;
-        }
     }
 
     private void UpdateStatusBar(SystemPowerSample? latest)
     {
         AcStatusText = "--";
-        BatteryPercentText = "--";
-        DischargeRateText = "--";
 
         if (latest is null)
             return;
 
         AcStatusText = latest.IsAcOnline ? "AC" : "Battery";
-        if (latest.BatteryPercent.HasValue)
-            BatteryPercentText = $"{latest.BatteryPercent.Value:F1}%";
+    }
 
-        var dischargeW = GetDischargeWatts(latest);
-        if (dischargeW.HasValue)
-            DischargeRateText = $"{dischargeW.Value:F1} W";
+    private void UpdateRangeMetrics(DateTime fromUtc, DateTime toUtc)
+    {
+        var rangeSamples = _loadedPowerSamples
+            .Where(sample => sample.TimestampUtc >= fromUtc && sample.TimestampUtc <= toUtc)
+            .OrderBy(sample => sample.TimestampUtc)
+            .ToList();
+
+        BatteryPercentText = FormatBatteryDrop(rangeSamples);
+        DischargeRateText = FormatEnergyUsed(rangeSamples);
+    }
+
+    private static string FormatBatteryDrop(IReadOnlyList<SystemPowerSample> samples)
+    {
+        var first = samples.FirstOrDefault(sample => sample.BatteryPercent.HasValue);
+        var last = samples.LastOrDefault(sample => sample.BatteryPercent.HasValue);
+        if (first?.BatteryPercent is null || last?.BatteryPercent is null)
+            return "--";
+
+        var from = first.BatteryPercent.Value;
+        var to = last.BatteryPercent.Value;
+        var drop = Math.Max(0, from - to);
+        return $"{drop:F1}% ({from:F1}% -> {to:F1}%)";
+    }
+
+    private static string FormatEnergyUsed(IReadOnlyList<SystemPowerSample> samples)
+    {
+        var wh = CalculateEnergyUsedWh(samples);
+        if (!wh.HasValue)
+            return "--";
+
+        var firstCapacity = samples.FirstOrDefault(sample => sample.RemainingCapacityMWh.HasValue)?.RemainingCapacityMWh;
+        var lastCapacity = samples.LastOrDefault(sample => sample.RemainingCapacityMWh.HasValue)?.RemainingCapacityMWh;
+        if (firstCapacity.HasValue && lastCapacity.HasValue)
+        {
+            var fromWh = firstCapacity.Value / 1000.0;
+            var toWh = lastCapacity.Value / 1000.0;
+            return $"{wh.Value:F1} Wh ({fromWh:F1} -> {toWh:F1} Wh)";
+        }
+
+        var watts = samples
+            .Select(GetDischargeWatts)
+            .Where(value => value.HasValue)
+            .Select(value => value!.Value)
+            .ToList();
+
+        return watts.Count == 0
+            ? $"{wh.Value:F1} Wh"
+            : $"{wh.Value:F1} Wh ({watts.Min():F1}-{watts.Max():F1} W)";
+    }
+
+    private static double? CalculateEnergyUsedWh(IReadOnlyList<SystemPowerSample> samples)
+    {
+        if (samples.Count < 2)
+            return null;
+
+        double totalWh = 0;
+        var hasPower = false;
+        for (var i = 1; i < samples.Count; i++)
+        {
+            var previous = samples[i - 1];
+            var current = samples[i];
+            var elapsedHours = (current.TimestampUtc - previous.TimestampUtc).TotalHours;
+            if (elapsedHours <= 0)
+                continue;
+
+            var previousWatts = GetDischargeWatts(previous);
+            var currentWatts = GetDischargeWatts(current);
+            if (!previousWatts.HasValue && !currentWatts.HasValue)
+                continue;
+
+            var watts = (Math.Max(0, previousWatts ?? currentWatts!.Value) + Math.Max(0, currentWatts ?? previousWatts!.Value)) / 2.0;
+            totalWh += watts * elapsedHours;
+            hasPower = true;
+        }
+
+        return hasPower ? totalWh : null;
     }
 
     private void ApplySourceStatuses(IReadOnlyList<SourceStatus> statuses)
@@ -881,21 +864,20 @@ public partial class MainViewModel : ObservableObject
 
         _selectedFromUtc = fromUtc;
         _selectedToUtc = toUtc;
-        SelectedRangeText = FormatRange(fromUtc, toUtc);
+        SelectedRangeText = FormatRangeWithDuration(fromUtc, toUtc);
+        UpdateRangeMetrics(fromUtc, toUtc);
+        ChartVisibleFromUtc = fromUtc;
+        ChartVisibleToUtc = toUtc;
+    }
 
-        if (!updateAxis)
+    public void SetChartVisibleRangeFromUserInteraction(DateTime fromUtc, DateTime toUtc)
+    {
+        if (toUtc <= fromUtc)
             return;
 
-        _suppressAxisSelection = true;
-        try
-        {
-            _timeAxis.MinLimit = UtcToChartTicks(fromUtc);
-            _timeAxis.MaxLimit = UtcToChartTicks(toUtc);
-        }
-        finally
-        {
-            _suppressAxisSelection = false;
-        }
+        var clamped = ClampRange(fromUtc, toUtc);
+        SetSelectedRange(clamped.FromUtc, clamped.ToUtc, updateAxis: false);
+        ScheduleAnalyzeSelectedRange();
     }
 
     private (DateTime FromUtc, DateTime ToUtc) ClampRange(DateTime fromUtc, DateTime toUtc)
@@ -937,16 +919,6 @@ public partial class MainViewModel : ObservableObject
         return sample.EstimatedDischargeWatts;
     }
 
-    private static double UtcToChartTicks(DateTime utc)
-        => utc.ToLocalTime().Ticks;
-
-    private static DateTime ChartTicksToUtc(double value)
-    {
-        var ticks = (long)Math.Clamp(value, DateTime.MinValue.Ticks, DateTime.MaxValue.Ticks);
-        var local = DateTime.SpecifyKind(new DateTime(ticks), DateTimeKind.Local);
-        return local.ToUniversalTime();
-    }
-
     private static string FormatCycleLabel(BatteryDisplayCycle cycle)
     {
         var state = cycle.IsOpen ? "Open" : "Closed";
@@ -972,6 +944,12 @@ public partial class MainViewModel : ObservableObject
 
     private static string FormatRange(DateTime fromUtc, DateTime toUtc)
         => $"{fromUtc.ToLocalTime():yyyy-MM-dd HH:mm} - {toUtc.ToLocalTime():HH:mm}";
+
+    private static string FormatRangeWithDuration(DateTime fromUtc, DateTime toUtc)
+    {
+        var minutes = Math.Max(0, (toUtc - fromUtc).TotalMinutes);
+        return $"{FormatRange(fromUtc, toUtc)} ({minutes:F0} min)";
+    }
 
     private static string FormatPercent(double? value)
         => value.HasValue ? value.Value.ToString("F1") : "--";

@@ -127,6 +127,83 @@ public class BatteryCycleBuilderTests
         Assert.Equal(1, result.DisplayCycles[1].RawCycleCount);
     }
 
+    [Fact]
+    public void SessionBoundaryInOfflineStretch_StartsNewDisplayCycle()
+    {
+        var start = new DateTime(2026, 6, 24, 8, 0, 0, DateTimeKind.Utc);
+        var result = BatteryCycleBuilder.Build(
+            new[]
+            {
+                Power(start, ac: true, percent: 90),
+                Power(start.AddMinutes(1), ac: false, percent: 90),
+                Power(start.AddMinutes(2), ac: false, percent: 85),
+                Power(start.AddMinutes(3), ac: false, percent: 80),
+                Power(start.AddMinutes(4), ac: false, percent: 75)
+            },
+            new[] { start.AddMinutes(2).AddSeconds(30) });
+
+        Assert.Equal(2, result.RawCycles.Count);
+        Assert.Equal(2, result.DisplayCycles.Count);
+
+        Assert.Equal(start.AddMinutes(1), result.RawCycles[0].StartUtc);
+        Assert.Equal(start.AddMinutes(2), result.RawCycles[0].EndUtc);
+        Assert.False(result.RawCycles[0].IsOpen);
+
+        Assert.Equal(start.AddMinutes(3), result.RawCycles[1].StartUtc);
+        Assert.True(result.RawCycles[1].IsOpen);
+        Assert.True(result.RawCycles[1].StartedAtSessionBoundary);
+        Assert.Equal(BatteryCycleConfidence.High, result.RawCycles[1].Confidence);
+    }
+
+    [Fact]
+    public void MultipleSessionBoundaries_SplitContinuousOfflineStretch()
+    {
+        var start = new DateTime(2026, 6, 24, 8, 0, 0, DateTimeKind.Utc);
+        var result = BatteryCycleBuilder.Build(
+            new[]
+            {
+                Power(start, ac: true, percent: 90),
+                Power(start.AddMinutes(1), ac: false, percent: 90),
+                Power(start.AddMinutes(2), ac: false, percent: 85),
+                Power(start.AddMinutes(3), ac: false, percent: 80),
+                Power(start.AddMinutes(4), ac: false, percent: 75),
+                Power(start.AddMinutes(5), ac: false, percent: 70)
+            },
+            new[]
+            {
+                start.AddMinutes(2).AddSeconds(30),
+                start.AddMinutes(4).AddSeconds(30)
+            });
+
+        Assert.Equal(3, result.RawCycles.Count);
+        Assert.Equal(3, result.DisplayCycles.Count);
+        Assert.True(result.RawCycles[1].StartedAtSessionBoundary);
+        Assert.True(result.RawCycles[2].StartedAtSessionBoundary);
+        Assert.All(result.RawCycles, c => Assert.Equal(BatteryCycleConfidence.High, c.Confidence));
+    }
+
+    [Fact]
+    public void EmptySessionBoundaries_MatchesOriginalBuildOverload()
+    {
+        var start = new DateTime(2026, 6, 24, 8, 0, 0, DateTimeKind.Utc);
+        var samples = new[]
+        {
+            Power(start, ac: true, percent: 90),
+            Power(start.AddMinutes(1), ac: false, percent: 90),
+            Power(start.AddMinutes(2), ac: false, percent: 80),
+            Power(start.AddMinutes(3), ac: true, percent: 80)
+        };
+
+        var original = BatteryCycleBuilder.Build(samples);
+        var withEmptyBoundaries = BatteryCycleBuilder.Build(samples, Array.Empty<DateTime>());
+
+        Assert.Equal(original.RawCycles.Count, withEmptyBoundaries.RawCycles.Count);
+        Assert.Equal(original.DisplayCycles.Count, withEmptyBoundaries.DisplayCycles.Count);
+        Assert.Equal(original.RawCycles[0].StartUtc, withEmptyBoundaries.RawCycles[0].StartUtc);
+        Assert.Equal(original.RawCycles[0].EndUtc, withEmptyBoundaries.RawCycles[0].EndUtc);
+        Assert.Equal(original.RawCycles[0].Confidence, withEmptyBoundaries.RawCycles[0].Confidence);
+    }
+
     private static SystemPowerSample Power(DateTime timestampUtc, bool ac, double percent)
     {
         return new SystemPowerSample

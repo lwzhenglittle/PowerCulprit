@@ -2,6 +2,7 @@ using System.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using PowerCulprit.Collectors;
+using PowerCulprit.Core.Services;
 using PowerCulprit.Storage;
 
 namespace PowerCulprit.Cli;
@@ -64,6 +65,12 @@ internal class Program
     private static int RunGui()
     {
         Console.WriteLine("Starting PowerCulprit Desktop (GUI)...");
+
+        if (SingleInstanceGuard.IsAnotherInstanceRunning())
+        {
+            Console.Error.WriteLine("PowerCulprit is already running.");
+            return 1;
+        }
 
         try
         {
@@ -330,6 +337,13 @@ internal class Program
         Console.WriteLine($"DB path:   {(dbPath ?? DatabaseManager.GetDefaultDatabasePath())}");
         Console.WriteLine("Press Ctrl+C to stop early.");
         Console.WriteLine();
+
+        using var singleInstanceGuard = new SingleInstanceGuard();
+        if (!singleInstanceGuard.TryAcquire())
+        {
+            Console.Error.WriteLine("PowerCulprit is already running.");
+            return 1;
+        }
 
         // Build DI container
         var services = new ServiceCollection();

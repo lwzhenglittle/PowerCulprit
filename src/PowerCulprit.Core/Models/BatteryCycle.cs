@@ -28,6 +28,8 @@ public record BatteryCycle
 
     public bool StartedAtFullCharge { get; init; }
 
+    public bool StartedAtSessionBoundary { get; init; }
+
     public bool IsOpen { get; init; }
 
     public BatteryCycleConfidence Confidence { get; init; } = BatteryCycleConfidence.High;

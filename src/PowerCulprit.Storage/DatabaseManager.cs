@@ -416,6 +416,7 @@ public class DatabaseManager : IDisposable
                 discharge_wh            REAL,
                 sample_count            INTEGER NOT NULL,
                 started_at_full_charge  INTEGER NOT NULL,
+                started_at_session_boundary INTEGER NOT NULL DEFAULT 0,
                 is_open                 INTEGER NOT NULL,
                 confidence              TEXT    NOT NULL
             );
@@ -425,10 +426,22 @@ public class DatabaseManager : IDisposable
                 ON battery_cycles(start_utc, end_utc);
             CREATE INDEX IF NOT EXISTS idx_battery_display_cycles_start_end
                 ON battery_display_cycles(start_utc, end_utc);
+            CREATE TABLE IF NOT EXISTS session_start_markers (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_utc TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_start_markers_ts
+                ON session_start_markers(timestamp_utc);
             """;
 
         await using var cmd = new SqliteCommand(sql, connection, transaction);
         await cmd.ExecuteNonQueryAsync();
+        await AddColumnIfMissingAsync(
+            connection,
+            transaction,
+            "battery_cycles",
+            "started_at_session_boundary",
+            "INTEGER NOT NULL DEFAULT 0");
     }
 
     /// <summary>
@@ -1307,6 +1320,53 @@ public class DatabaseManager : IDisposable
         }
     }
 
+    public async Task InsertSessionStartMarkerAsync(DateTime timestampUtc)
+    {
+        await EnsureInitializedAsync();
+
+        await _writeLock.WaitAsync();
+        try
+        {
+            var connection = await GetOrOpenWriteConnectionAsync();
+            const string sql = """
+                INSERT INTO session_start_markers (timestamp_utc)
+                VALUES ($ts);
+                """;
+
+            await using var cmd = new SqliteCommand(sql, connection);
+            cmd.Parameters.AddWithValue("$ts", SerializeTimestamp(timestampUtc));
+            await cmd.ExecuteNonQueryAsync();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<IReadOnlyList<DateTime>> GetSessionStartMarkersAsync(DateTime fromUtc, DateTime toUtc)
+    {
+        await EnsureInitializedAsync();
+
+        await using var connection = await OpenConnectionAsync();
+        const string sql = """
+            SELECT timestamp_utc
+            FROM session_start_markers
+            WHERE timestamp_utc >= $from AND timestamp_utc <= $to
+            ORDER BY timestamp_utc;
+            """;
+
+        await using var cmd = new SqliteCommand(sql, connection);
+        cmd.Parameters.AddWithValue("$from", SerializeTimestamp(fromUtc));
+        cmd.Parameters.AddWithValue("$to", SerializeTimestamp(toUtc));
+
+        var results = new List<DateTime>();
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+            results.Add(DeserializeTimestamp(reader.GetString(0)));
+
+        return results;
+    }
+
     /// <summary>
     /// Rebuilds persisted battery cycle caches from retained system power samples.
     /// </summary>
@@ -1317,7 +1377,8 @@ public class DatabaseManager : IDisposable
         var toUtc = DateTime.UtcNow;
         var fromUtc = toUtc.AddDays(-retentionDays);
         var powerSamples = await GetSystemPowerSamplesAsync(fromUtc, toUtc);
-        var result = BatteryCycleBuilder.Build(powerSamples);
+        var sessionStarts = await GetSessionStartMarkersAsync(fromUtc, toUtc);
+        var result = BatteryCycleBuilder.Build(powerSamples, sessionStarts);
 
         await _writeLock.WaitAsync();
         try
@@ -1404,7 +1465,8 @@ public class DatabaseManager : IDisposable
             SELECT id, display_cycle_id, start_utc, end_utc, last_sample_utc,
                    start_battery_percent, end_battery_percent, discharge_percent,
                    start_remaining_mwh, end_remaining_mwh, discharge_wh,
-                   sample_count, started_at_full_charge, is_open, confidence
+                   sample_count, started_at_full_charge, started_at_session_boundary,
+                   is_open, confidence
             FROM battery_cycles
             WHERE display_cycle_id = $displayCycleId
             ORDER BY start_utc;
@@ -1462,7 +1524,8 @@ public class DatabaseManager : IDisposable
                 "gpu_process_samples",
                 "hardware_sensor_samples",
                 "analysis_reports",
-                "source_status"
+                "source_status",
+                "session_start_markers"
             };
 
             foreach (var table in tables)
@@ -1507,7 +1570,8 @@ public class DatabaseManager : IDisposable
                 "gpu_process_samples",
                 "hardware_sensor_samples",
                 "analysis_reports",
-                "source_status"
+                "source_status",
+                "session_start_markers"
             };
 
             foreach (var table in tables)
@@ -1588,11 +1652,12 @@ public class DatabaseManager : IDisposable
                 (display_cycle_id, start_utc, end_utc, last_sample_utc,
                  start_battery_percent, end_battery_percent, discharge_percent,
                  start_remaining_mwh, end_remaining_mwh, discharge_wh,
-                 sample_count, started_at_full_charge, is_open, confidence)
+                 sample_count, started_at_full_charge, started_at_session_boundary,
+                 is_open, confidence)
             VALUES
                 ($displayId, $start, $end, $last, $startPercent, $endPercent,
                  $dischargePercent, $startMwh, $endMwh, $dischargeWh,
-                 $sampleCount, $fullStart, $isOpen, $confidence);
+                 $sampleCount, $fullStart, $sessionStart, $isOpen, $confidence);
             """;
 
         await using var cmd = new SqliteCommand(sql, connection, transaction);
@@ -1608,6 +1673,7 @@ public class DatabaseManager : IDisposable
         cmd.Parameters.AddWithValue("$dischargeWh", (object?)cycle.DischargeWh ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$sampleCount", cycle.SampleCount);
         cmd.Parameters.AddWithValue("$fullStart", cycle.StartedAtFullCharge ? 1L : 0L);
+        cmd.Parameters.AddWithValue("$sessionStart", cycle.StartedAtSessionBoundary ? 1L : 0L);
         cmd.Parameters.AddWithValue("$isOpen", cycle.IsOpen ? 1L : 0L);
         cmd.Parameters.AddWithValue("$confidence", cycle.Confidence.ToString());
 
@@ -1650,8 +1716,9 @@ public class DatabaseManager : IDisposable
             DischargeWh = reader.IsDBNull(10) ? null : reader.GetDouble(10),
             SampleCount = reader.GetInt32(11),
             StartedAtFullCharge = reader.GetInt64(12) != 0,
-            IsOpen = reader.GetInt64(13) != 0,
-            Confidence = ParseConfidence(reader.GetString(14))
+            StartedAtSessionBoundary = reader.GetInt64(13) != 0,
+            IsOpen = reader.GetInt64(14) != 0,
+            Confidence = ParseConfidence(reader.GetString(15))
         };
     }
 

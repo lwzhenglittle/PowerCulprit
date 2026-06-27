@@ -11,28 +11,52 @@ public static class BatteryCycleBuilder
     public static readonly TimeSpan MaxSampleGap = TimeSpan.FromMinutes(10);
 
     public static BatteryCycleBuildResult Build(IReadOnlyList<SystemPowerSample> samples)
+        => Build(samples, Array.Empty<DateTime>());
+
+    public static BatteryCycleBuildResult Build(
+        IReadOnlyList<SystemPowerSample> samples,
+        IReadOnlyList<DateTime> sessionStarts)
     {
         var ordered = samples
             .Where(s => s.TimestampUtc != default)
             .OrderBy(s => s.TimestampUtc)
             .ToList();
 
-        var rawCycles = BuildRawCycles(ordered);
+        var orderedSessionStarts = sessionStarts
+            .Where(t => t != default)
+            .OrderBy(t => t)
+            .ToList();
+
+        var rawCycles = BuildRawCycles(ordered, orderedSessionStarts);
         var (assignedRawCycles, displayCycles) = BuildDisplayCycles(rawCycles);
         return new BatteryCycleBuildResult(assignedRawCycles, displayCycles);
     }
 
-    private static List<BatteryCycle> BuildRawCycles(IReadOnlyList<SystemPowerSample> samples)
+    private static List<BatteryCycle> BuildRawCycles(
+        IReadOnlyList<SystemPowerSample> samples,
+        IReadOnlyList<DateTime> sessionStarts)
     {
         var cycles = new List<BatteryCycle>();
         CycleDraft? current = null;
         SystemPowerSample? previous = null;
         var acSessionReachedFull = false;
+        var nextSessionStartIndex = 0;
 
         foreach (var sample in samples)
         {
             var largeGap = previous is not null &&
                 sample.TimestampUtc - previous.TimestampUtc > MaxSampleGap;
+            var sessionBoundary = ConsumeSessionBoundary(
+                sessionStarts,
+                ref nextSessionStartIndex,
+                previous?.TimestampUtc,
+                sample.TimestampUtc);
+
+            if (sessionBoundary && current is not null)
+            {
+                cycles.Add(current.Finish(previous?.TimestampUtc ?? sample.TimestampUtc, isOpen: false));
+                current = null;
+            }
 
             if (sample.IsAcOnline)
             {
@@ -52,13 +76,13 @@ public static class BatteryCycleBuilder
 
             if (current is null)
             {
-                var partialStart = previous is null || !previous.IsAcOnline;
-                var lowConfidence = partialStart || largeGap;
+                var partialStart = !sessionBoundary && (previous is null || !previous.IsAcOnline);
+                var lowConfidence = !sessionBoundary && (partialStart || largeGap);
                 var startedAtFullCharge = IsFullCharge(sample) ||
                     (previous?.IsAcOnline == true && IsFullCharge(previous)) ||
                     acSessionReachedFull;
 
-                current = CycleDraft.Start(sample, startedAtFullCharge, lowConfidence);
+                current = CycleDraft.Start(sample, startedAtFullCharge, lowConfidence, sessionBoundary);
                 acSessionReachedFull = false;
             }
             else
@@ -75,6 +99,25 @@ public static class BatteryCycleBuilder
         return cycles;
     }
 
+    private static bool ConsumeSessionBoundary(
+        IReadOnlyList<DateTime> sessionStarts,
+        ref int nextSessionStartIndex,
+        DateTime? previousUtc,
+        DateTime currentUtc)
+    {
+        var crossedBoundary = false;
+        while (nextSessionStartIndex < sessionStarts.Count &&
+               sessionStarts[nextSessionStartIndex] <= currentUtc)
+        {
+            if (!previousUtc.HasValue || sessionStarts[nextSessionStartIndex] > previousUtc.Value)
+                crossedBoundary = true;
+
+            nextSessionStartIndex++;
+        }
+
+        return crossedBoundary;
+    }
+
     private static (List<BatteryCycle> RawCycles, List<BatteryDisplayCycle> DisplayCycles)
         BuildDisplayCycles(IReadOnlyList<BatteryCycle> rawCycles)
     {
@@ -89,8 +132,12 @@ public static class BatteryCycleBuilder
 
             group.Add(cycle);
 
-            if (cycle.Confidence == BatteryCycleConfidence.Low || MeetsDisplayThreshold(group))
+            if (cycle.Confidence == BatteryCycleConfidence.Low ||
+                cycle.StartedAtSessionBoundary ||
+                MeetsDisplayThreshold(group))
+            {
                 FlushGroup(group, assignedRawCycles, displayCycles);
+            }
         }
 
         FlushGroup(group, assignedRawCycles, displayCycles);
@@ -103,6 +150,9 @@ public static class BatteryCycleBuilder
     {
         if (currentGroup.Count == 0)
             return false;
+
+        if (nextCycle.StartedAtSessionBoundary)
+            return true;
 
         if (nextCycle.StartedAtFullCharge)
             return true;
@@ -200,12 +250,17 @@ public static class BatteryCycleBuilder
 
     private sealed class CycleDraft
     {
-        private CycleDraft(SystemPowerSample firstSample, bool startedAtFullCharge, bool lowConfidence)
+        private CycleDraft(
+            SystemPowerSample firstSample,
+            bool startedAtFullCharge,
+            bool lowConfidence,
+            bool startedAtSessionBoundary)
         {
             StartUtc = firstSample.TimestampUtc;
             StartBatteryPercent = firstSample.BatteryPercent;
             StartRemainingMWh = firstSample.RemainingCapacityMWh;
             StartedAtFullCharge = startedAtFullCharge;
+            StartedAtSessionBoundary = startedAtSessionBoundary;
             LowConfidence = lowConfidence;
             AddOfflineSample(firstSample, largeGap: false);
         }
@@ -217,6 +272,8 @@ public static class BatteryCycleBuilder
         private double? StartRemainingMWh { get; }
 
         private bool StartedAtFullCharge { get; }
+
+        private bool StartedAtSessionBoundary { get; }
 
         private bool LowConfidence { get; set; }
 
@@ -231,8 +288,9 @@ public static class BatteryCycleBuilder
         public static CycleDraft Start(
             SystemPowerSample firstSample,
             bool startedAtFullCharge,
-            bool lowConfidence)
-            => new(firstSample, startedAtFullCharge, lowConfidence);
+            bool lowConfidence,
+            bool startedAtSessionBoundary)
+            => new(firstSample, startedAtFullCharge, lowConfidence, startedAtSessionBoundary);
 
         public void AddOfflineSample(SystemPowerSample sample, bool largeGap)
         {
@@ -265,6 +323,7 @@ public static class BatteryCycleBuilder
                     : null,
                 SampleCount = SampleCount,
                 StartedAtFullCharge = StartedAtFullCharge,
+                StartedAtSessionBoundary = StartedAtSessionBoundary,
                 IsOpen = isOpen,
                 Confidence = LowConfidence
                     ? BatteryCycleConfidence.Low

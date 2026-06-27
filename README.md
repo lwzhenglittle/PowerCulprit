@@ -1,5 +1,9 @@
 # PowerCulprit
 
+<p align="center">
+  <img src="src/PowerCulprit.Desktop/Assets/AppIcon.svg" alt="PowerCulprit app icon" width="128" height="128">
+</p>
+
 PowerCulprit 是一个面向 Windows 的电池耗电分析工具。它会持续采样整机电池状态、硬件传感器、进程 CPU、内存、磁盘、网络、前台窗口状态以及可用的 GPU 活动数据，把数据写入本地 SQLite 数据库，并根据进程活动与整机放电曲线之间的相关性生成耗电嫌疑排行。
 
 请注意：PowerCulprit 是一个“相关性与归因”工具，不是每进程真实功耗计量器。它不会承诺某个进程真实消耗了多少瓦，而是帮助你判断最近一段时间哪些进程、硬件活动或前后台行为最可能与电池加速下降有关。

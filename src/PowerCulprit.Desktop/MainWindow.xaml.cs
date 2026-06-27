@@ -1,3 +1,5 @@
+using System.IO;
+using Microsoft.UI;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -13,6 +15,9 @@ public sealed partial class MainWindow : Window
     public MainWindow(MainViewModel viewModel)
     {
         InitializeComponent();
+        ConfigureTitleBar();
+        SetWindowIcon();
+
         _viewModel = viewModel;
 
         RootFrame.Navigate(typeof(MainPage), viewModel);
@@ -20,6 +25,27 @@ public sealed partial class MainWindow : Window
         AppWindow.Resize(new Windows.Graphics.SizeInt32(1200, 800));
 
         AppWindow.Closing += OnWindowClosing;
+    }
+
+    private void ConfigureTitleBar()
+    {
+        ExtendsContentIntoTitleBar = true;
+        SetTitleBar(AppTitleBar);
+
+        if (!AppWindowTitleBar.IsCustomizationSupported()) return;
+
+        AppWindow.TitleBar.ExtendsContentIntoTitleBar = true;
+        AppWindow.TitleBar.ButtonBackgroundColor = Colors.Transparent;
+        AppWindow.TitleBar.ButtonInactiveBackgroundColor = Colors.Transparent;
+    }
+
+    private void SetWindowIcon()
+    {
+        var iconPath = Path.Combine(AppContext.BaseDirectory, "Assets", "AppIcon.ico");
+        if (File.Exists(iconPath))
+        {
+            AppWindow.SetIcon(iconPath);
+        }
     }
 
     private void OnWindowClosing(AppWindow sender, AppWindowClosingEventArgs args)
