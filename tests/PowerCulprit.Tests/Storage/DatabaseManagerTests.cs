@@ -1,4 +1,5 @@
 using PowerCulprit.Core.Models;
+using Microsoft.Data.Sqlite;
 
 namespace PowerCulprit.Tests.Storage;
 
@@ -49,7 +50,54 @@ public class DatabaseManagerTests : IDisposable
         Assert.True(File.Exists(_testDbPath));
     }
 
-    // ── SystemPowerSample round-trip ────────────
+    [Fact]
+    public async Task InitializeAsync_CreatesAggregateTablesAndMetadata()
+    {
+        await _db.InitializeAsync();
+
+        Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='metadata';"));
+        Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_analysis_aggregates';"));
+        Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='gpu_analysis_aggregates';"));
+        Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='hardware_sensor_aggregates';"));
+        Assert.Equal(3, await ScalarLongAsync("PRAGMA user_version;"));
+    }
+
+    [Fact]
+    public async Task InitializeAsync_UpgradesSchemaV2WithoutClearingHistory()
+    {
+        var ts = new DateTime(2026, 6, 23, 12, 0, 0, DateTimeKind.Utc);
+        await using (var connection = new SqliteConnection($"Data Source={_testDbPath}"))
+        {
+            await connection.OpenAsync();
+            await using var cmd = new SqliteCommand("""
+                PRAGMA user_version=2;
+                CREATE TABLE system_power_samples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp_utc TEXT NOT NULL,
+                    is_ac_online INTEGER NOT NULL,
+                    battery_percent REAL,
+                    charge_rate_milliwatts REAL,
+                    remaining_capacity_mwh REAL,
+                    full_charge_capacity_mwh REAL,
+                    estimated_discharge_watts REAL,
+                    power_mode TEXT
+                );
+                INSERT INTO system_power_samples(timestamp_utc, is_ac_online, battery_percent)
+                VALUES ('2026-06-23T12:00:00.0000000Z', 0, 88.0);
+                """, connection);
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        await _db.InitializeAsync();
+
+        Assert.Equal(3, await ScalarLongAsync("PRAGMA user_version;"));
+        Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM system_power_samples;"));
+        Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_analysis_aggregates';"));
+        var samples = await _db.GetSystemPowerSamplesAsync(ts.AddSeconds(-1), ts.AddSeconds(1));
+        var sample = Assert.Single(samples);
+        Assert.Equal(88.0, sample.BatteryPercent);
+    }
+
 
     [Fact]
     public async Task InsertAndQuery_SystemPowerSamples_RoundTrip()
@@ -339,9 +387,53 @@ public class DatabaseManagerTests : IDisposable
     }
 
     [Fact]
-    public async Task InsertHardwareSensorSamples_EmptyList_DoesNotCrash()
+    public async Task GetHardwareSensorSamplesAsync_ReturnsSamplesInTimeRange()
     {
-        await _db.InsertHardwareSensorSamplesAsync(Array.Empty<HardwareSensorSample>());
+        var oldTs = new DateTime(2026, 6, 23, 11, 59, 0, DateTimeKind.Utc);
+        var ts = new DateTime(2026, 6, 23, 12, 0, 0, DateTimeKind.Utc);
+        var newTs = ts.AddSeconds(2);
+
+        await _db.InsertHardwareSensorSamplesAsync(new[]
+        {
+            new HardwareSensorSample
+            {
+                TimestampUtc = oldTs,
+                Source = "LibreHardwareMonitor",
+                DeviceName = "Intel Core Ultra X7 358H",
+                SensorName = "CPU Package",
+                MetricName = "Power",
+                Value = 99,
+                Unit = "W"
+            },
+            new HardwareSensorSample
+            {
+                TimestampUtc = ts,
+                Source = "LibreHardwareMonitor",
+                DeviceName = "Intel Core Ultra X7 358H",
+                SensorName = "CPU Package",
+                MetricName = "Power",
+                Value = 12.3,
+                Unit = "W"
+            },
+            new HardwareSensorSample
+            {
+                TimestampUtc = newTs,
+                Source = "LibreHardwareMonitor",
+                DeviceName = "Intel Core Ultra X7 358H",
+                SensorName = "CPU Total",
+                MetricName = "Load",
+                Value = 42.5,
+                Unit = "%"
+            }
+        });
+
+        var result = await _db.GetHardwareSensorSamplesAsync(ts.AddMilliseconds(-1), newTs.AddMilliseconds(1));
+
+        Assert.Equal(2, result.Count);
+        Assert.Equal("CPU Package", result[0].SensorName);
+        Assert.Equal(12.3, result[0].Value);
+        Assert.Equal("CPU Total", result[1].SensorName);
+        Assert.Equal(42.5, result[1].Value);
     }
 
     // ── SourceStatus round-trip ─────────────────
@@ -849,5 +941,125 @@ public class DatabaseManagerTests : IDisposable
             ts.AddSeconds(-1), ts.AddSeconds(1));
         Assert.Equal("Dnscache, NlaSvc", analysis.First(p => p.Pid == 1001).ServiceName);
         Assert.Null(analysis.First(p => p.Pid == 1002).ServiceName);
+    }
+
+    [Fact]
+    public async Task ProcessSamples_ReusesProcessIdentityForRepeatedStaticMetadata()
+    {
+        var start = DateTime.UtcNow;
+
+        await _db.InsertProcessSamplesAsync(new[]
+        {
+            new ProcessSample
+            {
+                TimestampUtc = start,
+                Pid = 123,
+                ProcessName = "app",
+                ExecutablePath = @"C:\app.exe",
+                CommandLine = "app --flag",
+                ParentPid = 1,
+                CpuPercent = 1
+            },
+            new ProcessSample
+            {
+                TimestampUtc = start.AddSeconds(2),
+                Pid = 123,
+                ProcessName = "app",
+                ExecutablePath = @"C:\app.exe",
+                CommandLine = "app --flag",
+                ParentPid = 1,
+                CpuPercent = 2
+            }
+        });
+
+        Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM process_identities;"));
+        Assert.Equal(2, await ScalarLongAsync("SELECT COUNT(*) FROM process_sample_facts;"));
+        Assert.Equal(2, await ScalarLongAsync("SELECT COUNT(*) FROM sample_timestamps;"));
+    }
+
+    [Fact]
+    public async Task ProcessSamples_NormalizesServiceGroupMembers()
+    {
+        var ts = DateTime.UtcNow;
+
+        await _db.InsertProcessSamplesAsync(new[]
+        {
+            new ProcessSample
+            {
+                TimestampUtc = ts,
+                Pid = 1001,
+                ProcessName = "svchost",
+                ServiceName = "NlaSvc, Dnscache, Dnscache",
+                CpuPercent = 1
+            }
+        });
+
+        var sample = Assert.Single(await _db.GetProcessSamplesAsync(ts.AddSeconds(-1), ts.AddSeconds(1)));
+        Assert.Equal("Dnscache, NlaSvc", sample.ServiceName);
+        Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM service_groups;"));
+        Assert.Equal(2, await ScalarLongAsync("SELECT COUNT(*) FROM service_group_members;"));
+    }
+
+    [Fact]
+    public async Task InitializeAsync_MigratesLegacyWideProcessTableByClearingHistory()
+    {
+        var legacyPath = Path.Combine(Path.GetTempPath(), $"powerculprit_legacy_{Guid.NewGuid():N}.db");
+        try
+        {
+            await using (var connection = new SqliteConnection($"Data Source={legacyPath}"))
+            {
+                await connection.OpenAsync();
+                await using var cmd = new SqliteCommand("""
+                    PRAGMA user_version=1;
+                    CREATE TABLE process_samples (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp_utc TEXT NOT NULL,
+                        pid INTEGER NOT NULL,
+                        process_name TEXT NOT NULL
+                    );
+                    CREATE INDEX idx_process_samples_ts ON process_samples(timestamp_utc);
+                    INSERT INTO process_samples(timestamp_utc, pid, process_name)
+                    VALUES ('2026-06-23T10:00:00.0000000Z', 10, 'legacy.exe');
+                    CREATE TABLE system_power_samples (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp_utc TEXT NOT NULL,
+                        is_ac_online INTEGER NOT NULL
+                    );
+                    INSERT INTO system_power_samples(timestamp_utc, is_ac_online)
+                    VALUES ('2026-06-23T10:00:00.0000000Z', 0);
+                    """, connection);
+                await cmd.ExecuteNonQueryAsync();
+            }
+
+            using var legacyDb = new PowerCulprit.Storage.DatabaseManager(legacyPath);
+            await legacyDb.InitializeAsync();
+
+            Assert.Equal(3, await ScalarLongAsync(legacyPath, "PRAGMA user_version;"));
+            Assert.Equal(0, await ScalarLongAsync(
+                legacyPath,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_samples';"));
+            Assert.Equal(1, await ScalarLongAsync(
+                legacyPath,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_sample_facts';"));
+            Assert.Equal(0, await ScalarLongAsync(legacyPath, "SELECT COUNT(*) FROM system_power_samples;"));
+        }
+        finally
+        {
+            if (File.Exists(legacyPath))
+            {
+                try { File.Delete(legacyPath); } catch { /* best effort */ }
+            }
+        }
+    }
+
+    private async Task<long> ScalarLongAsync(string sql)
+        => await ScalarLongAsync(_testDbPath, sql);
+
+    private static async Task<long> ScalarLongAsync(string dbPath, string sql)
+    {
+        await using var connection = new SqliteConnection($"Data Source={dbPath}");
+        await connection.OpenAsync();
+        await using var cmd = new SqliteCommand(sql, connection);
+        return Convert.ToInt64(await cmd.ExecuteScalarAsync());
     }
 }

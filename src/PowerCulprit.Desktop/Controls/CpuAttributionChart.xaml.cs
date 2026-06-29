@@ -6,18 +6,19 @@ using Microsoft.UI;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
-using PowerCulprit.Desktop.ViewModels;
+using PowerCulprit.Core.Models;
 using Windows.Foundation;
 using Windows.UI;
 
 namespace PowerCulprit.Desktop.Controls;
 
-public sealed partial class PowerHistoryChart : UserControl
+public sealed partial class CpuAttributionChart : UserControl
 {
     private const float PlotLeft = 54;
     private const float PlotTop = 18;
-    private const float PlotRight = 64;
+    private const float PlotRight = 80;
     private const float PlotBottom = 34;
+    private const float BandGap = 12;
     private const double MinVisibleSeconds = 60;
 
     private static readonly CanvasTextFormat AxisTextFormat = new() { FontSize = 11 };
@@ -33,7 +34,7 @@ public sealed partial class PowerHistoryChart : UserControl
     private DateTime? _previewToUtc;
     private Point? _hoverPosition;
 
-    public PowerHistoryChart()
+    public CpuAttributionChart()
     {
         InitializeComponent();
     }
@@ -43,22 +44,18 @@ public sealed partial class PowerHistoryChart : UserControl
     public static readonly DependencyProperty SamplesProperty =
         DependencyProperty.Register(
             nameof(Samples),
-            typeof(IReadOnlyList<PowerChartSample>),
-            typeof(PowerHistoryChart),
-            new PropertyMetadata(Array.Empty<PowerChartSample>(), OnChartPropertyChanged));
+            typeof(IReadOnlyList<CpuTimelineSample>),
+            typeof(CpuAttributionChart),
+            new PropertyMetadata(Array.Empty<CpuTimelineSample>(), OnChartPropertyChanged));
 
-    public IReadOnlyList<PowerChartSample> Samples
+    public IReadOnlyList<CpuTimelineSample> Samples
     {
-        get => (IReadOnlyList<PowerChartSample>)GetValue(SamplesProperty);
+        get => (IReadOnlyList<CpuTimelineSample>)GetValue(SamplesProperty);
         set => SetValue(SamplesProperty, value);
     }
 
     public static readonly DependencyProperty HistoryFromUtcProperty =
-        DependencyProperty.Register(
-            nameof(HistoryFromUtc),
-            typeof(DateTime),
-            typeof(PowerHistoryChart),
-            new PropertyMetadata(DateTime.MinValue, OnChartPropertyChanged));
+        DependencyProperty.Register(nameof(HistoryFromUtc), typeof(DateTime), typeof(CpuAttributionChart), new PropertyMetadata(DateTime.MinValue, OnChartPropertyChanged));
 
     public DateTime HistoryFromUtc
     {
@@ -67,11 +64,7 @@ public sealed partial class PowerHistoryChart : UserControl
     }
 
     public static readonly DependencyProperty HistoryToUtcProperty =
-        DependencyProperty.Register(
-            nameof(HistoryToUtc),
-            typeof(DateTime),
-            typeof(PowerHistoryChart),
-            new PropertyMetadata(DateTime.MinValue, OnChartPropertyChanged));
+        DependencyProperty.Register(nameof(HistoryToUtc), typeof(DateTime), typeof(CpuAttributionChart), new PropertyMetadata(DateTime.MinValue, OnChartPropertyChanged));
 
     public DateTime HistoryToUtc
     {
@@ -80,11 +73,7 @@ public sealed partial class PowerHistoryChart : UserControl
     }
 
     public static readonly DependencyProperty VisibleFromUtcProperty =
-        DependencyProperty.Register(
-            nameof(VisibleFromUtc),
-            typeof(DateTime),
-            typeof(PowerHistoryChart),
-            new PropertyMetadata(DateTime.MinValue, OnChartPropertyChanged));
+        DependencyProperty.Register(nameof(VisibleFromUtc), typeof(DateTime), typeof(CpuAttributionChart), new PropertyMetadata(DateTime.MinValue, OnChartPropertyChanged));
 
     public DateTime VisibleFromUtc
     {
@@ -93,11 +82,7 @@ public sealed partial class PowerHistoryChart : UserControl
     }
 
     public static readonly DependencyProperty VisibleToUtcProperty =
-        DependencyProperty.Register(
-            nameof(VisibleToUtc),
-            typeof(DateTime),
-            typeof(PowerHistoryChart),
-            new PropertyMetadata(DateTime.MinValue, OnChartPropertyChanged));
+        DependencyProperty.Register(nameof(VisibleToUtc), typeof(DateTime), typeof(CpuAttributionChart), new PropertyMetadata(DateTime.MinValue, OnChartPropertyChanged));
 
     public DateTime VisibleToUtc
     {
@@ -105,28 +90,39 @@ public sealed partial class PowerHistoryChart : UserControl
         set => SetValue(VisibleToUtcProperty, value);
     }
 
-    public static readonly DependencyProperty DischargeAxisMaxProperty =
-        DependencyProperty.Register(
-            nameof(DischargeAxisMax),
-            typeof(double),
-            typeof(PowerHistoryChart),
-            new PropertyMetadata(10.0, OnChartPropertyChanged));
+    public static readonly DependencyProperty CpuPowerAxisMaxProperty =
+        DependencyProperty.Register(nameof(CpuPowerAxisMax), typeof(double), typeof(CpuAttributionChart), new PropertyMetadata(30.0, OnChartPropertyChanged));
 
-    public double DischargeAxisMax
+    public double CpuPowerAxisMax
     {
-        get => (double)GetValue(DischargeAxisMaxProperty);
-        set => SetValue(DischargeAxisMaxProperty, value);
+        get => (double)GetValue(CpuPowerAxisMaxProperty);
+        set => SetValue(CpuPowerAxisMaxProperty, value);
+    }
+
+    public static readonly DependencyProperty CpuClockAxisMaxProperty =
+        DependencyProperty.Register(nameof(CpuClockAxisMax), typeof(double), typeof(CpuAttributionChart), new PropertyMetadata(5000.0, OnChartPropertyChanged));
+
+    public double CpuClockAxisMax
+    {
+        get => (double)GetValue(CpuClockAxisMaxProperty);
+        set => SetValue(CpuClockAxisMaxProperty, value);
+    }
+
+    public static readonly DependencyProperty EnergyAxisMaxProperty =
+        DependencyProperty.Register(nameof(EnergyAxisMax), typeof(double), typeof(CpuAttributionChart), new PropertyMetadata(5.0, OnChartPropertyChanged));
+
+    public double EnergyAxisMax
+    {
+        get => (double)GetValue(EnergyAxisMaxProperty);
+        set => SetValue(EnergyAxisMaxProperty, value);
     }
 
     private static void OnChartPropertyChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
     {
-        if (d is PowerHistoryChart chart)
+        if (d is CpuAttributionChart chart)
         {
-            if (e.Property == SamplesProperty ||
-                e.Property == HistoryFromUtcProperty ||
-                e.Property == HistoryToUtcProperty ||
-                e.Property == VisibleFromUtcProperty ||
-                e.Property == VisibleToUtcProperty)
+            if (e.Property == SamplesProperty || e.Property == HistoryFromUtcProperty || e.Property == HistoryToUtcProperty ||
+                e.Property == VisibleFromUtcProperty || e.Property == VisibleToUtcProperty)
             {
                 chart.ClearPreviewRange();
             }
@@ -164,39 +160,46 @@ public sealed partial class PowerHistoryChart : UserControl
         var ds = args.DrawingSession;
         var width = (float)sender.ActualWidth;
         var height = (float)sender.ActualHeight;
-        if (width <= PlotLeft + PlotRight || height <= PlotTop + PlotBottom)
+        if (width <= PlotLeft + PlotRight || height <= PlotTop + PlotBottom + BandGap * 3)
             return;
 
         var colors = GetPalette();
         ds.Clear(colors.Background);
 
-        var plot = new Rect(PlotLeft, PlotTop, width - PlotLeft - PlotRight, height - PlotTop - PlotBottom);
-        DrawFrame(ds, plot, colors);
-
-        var samples = Samples ?? Array.Empty<PowerChartSample>();
-        if (samples.Count == 0)
-        {
-            DrawEmptyState(ds, plot, colors);
-            return;
-        }
-
+        var samples = Samples ?? Array.Empty<CpuTimelineSample>();
         var (fromUtc, toUtc) = GetEffectiveVisibleRange(samples);
-        if (toUtc <= fromUtc)
+        var plot = new Rect(PlotLeft, PlotTop, width - PlotLeft - PlotRight, height - PlotTop - PlotBottom);
+        var bands = GetBands(plot);
+
+        foreach (var band in bands)
+            DrawFrame(ds, band, colors);
+
+        if (samples.Count == 0 || toUtc <= fromUtc)
         {
             DrawEmptyState(ds, plot, colors);
             return;
         }
 
-        DrawAxes(ds, plot, fromUtc, toUtc, colors);
+        DrawAxes(ds, bands, fromUtc, toUtc, colors);
+        DrawLegends(ds, bands, colors);
 
-        var batteryPoints = BuildDisplayPoints(samples, fromUtc, toUtc, plot, (sample) => sample.BatteryPercent, MapBatteryY);
-        var dischargePoints = BuildDisplayPoints(samples, fromUtc, toUtc, plot, (sample) => sample.DischargeWatts, MapDischargeY);
-
-        DrawPolyline(ds, batteryPoints, colors.BatteryLine, 2);
-        DrawPolyline(ds, dischargePoints, colors.DischargeLine, 2);
+        DrawPolyline(ds, BuildDisplayPoints(samples, fromUtc, toUtc, bands[0], s => s.BatteryPercent, v => MapRangeY(v, 0, 100, bands[0])), colors.BatteryLine, 2);
+        DrawPolyline(ds, BuildDisplayPoints(samples, fromUtc, toUtc, bands[0], s => s.CumulativeEnergyWh, v => MapRangeY(v, 0, Math.Max(1, EnergyAxisMax), bands[0])), colors.EnergyLine, 2);
+        DrawPolyline(ds, BuildDisplayPoints(samples, fromUtc, toUtc, bands[1], s => s.CpuPackagePowerWatts, v => MapRangeY(v, 0, Math.Max(1, CpuPowerAxisMax), bands[1])), colors.PowerLine, 2);
+        DrawPolyline(ds, BuildDisplayPoints(samples, fromUtc, toUtc, bands[2], s => s.CpuLoadPercent, v => MapRangeY(v, 0, 100, bands[2])), colors.LoadLine, 2);
+        DrawPolyline(ds, BuildDisplayPoints(samples, fromUtc, toUtc, bands[3], s => s.CpuAverageClockMhz, v => MapRangeY(v, 0, Math.Max(1000, CpuClockAxisMax), bands[3])), colors.ClockLine, 2);
 
         if (_isPointerOver && _hoverPosition.HasValue)
-            DrawTooltip(ds, plot, fromUtc, toUtc, samples, _hoverPosition.Value, colors);
+            DrawTooltip(ds, plot, bands, fromUtc, toUtc, samples, _hoverPosition.Value, colors);
+    }
+
+    private static Rect[] GetBands(Rect plot)
+    {
+        var bandHeight = (plot.Height - BandGap * 3) / 4.0;
+        var result = new Rect[4];
+        for (var i = 0; i < result.Length; i++)
+            result[i] = new Rect(plot.Left, plot.Top + i * (bandHeight + BandGap), plot.Width, bandHeight);
+        return result;
     }
 
     private void DrawFrame(CanvasDrawingSession ds, Rect plot, ChartPalette colors)
@@ -207,47 +210,54 @@ public sealed partial class PowerHistoryChart : UserControl
 
     private void DrawEmptyState(CanvasDrawingSession ds, Rect plot, ChartPalette colors)
     {
-        ds.DrawText("No chart data", (float)plot.Left + 16, (float)plot.Top + 16, colors.SecondaryText, AxisTextFormat);
+        ds.DrawText("No CPU chart data", (float)plot.Left + 16, (float)plot.Top + 16, colors.SecondaryText, AxisTextFormat);
     }
 
-    private void DrawAxes(CanvasDrawingSession ds, Rect plot, DateTime fromUtc, DateTime toUtc, ChartPalette colors)
+    private void DrawAxes(CanvasDrawingSession ds, Rect[] bands, DateTime fromUtc, DateTime toUtc, ChartPalette colors)
     {
-        for (var i = 0; i <= 4; i++)
+        foreach (var band in bands)
         {
-            var y = (float)(plot.Bottom - plot.Height * i / 4.0);
-            ds.DrawLine((float)plot.Left, y, (float)plot.Right, y, colors.Grid, 1);
-
-            var battery = i * 25;
-            ds.DrawText($"{battery}%", 6, y - 8, colors.SecondaryText, AxisTextFormat);
-
-            var watts = DischargeAxisMax * i / 4.0;
-            ds.DrawText($"{watts:F0}W", (float)plot.Right + 8, y - 8, colors.SecondaryText, AxisTextFormat);
+            for (var i = 0; i <= 2; i++)
+            {
+                var y = (float)(band.Bottom - band.Height * i / 2.0);
+                ds.DrawLine((float)band.Left, y, (float)band.Right, y, colors.Grid, 1);
+            }
         }
 
+        var bottom = bands[^1];
         for (var i = 0; i <= 4; i++)
         {
-            var x = (float)(plot.Left + plot.Width * i / 4.0);
-            ds.DrawLine(x, (float)plot.Top, x, (float)plot.Bottom, colors.Grid, 1);
+            var x = (float)(bottom.Left + bottom.Width * i / 4.0);
+            foreach (var band in bands)
+                ds.DrawLine(x, (float)band.Top, x, (float)band.Bottom, colors.Grid, 1);
 
             var timestamp = fromUtc + TimeSpan.FromTicks((long)((toUtc - fromUtc).Ticks * i / 4.0));
-            ds.DrawText(timestamp.ToLocalTime().ToString("HH:mm"), x - 18, (float)plot.Bottom + 8, colors.SecondaryText, AxisTextFormat);
+            ds.DrawText(timestamp.ToLocalTime().ToString("HH:mm"), x - 18, (float)bottom.Bottom + 8, colors.SecondaryText, AxisTextFormat);
         }
+    }
 
-        var legendY = (float)plot.Top + 8;
-        ds.FillCircle(new Vector2((float)plot.Left + 12, legendY + 6), 4, colors.BatteryLine);
-        ds.DrawText("Battery %", (float)plot.Left + 22, legendY, colors.BatteryLine, AxisTextFormat);
+    private void DrawLegends(CanvasDrawingSession ds, Rect[] bands, ChartPalette colors)
+    {
+        DrawLegend(ds, bands[0], "Battery % / Energy Wh", colors.BatteryLine, colors);
+        DrawLegend(ds, bands[1], $"CPU Package W (0-{CpuPowerAxisMax:F0})", colors.PowerLine, colors);
+        DrawLegend(ds, bands[2], "CPU Load %", colors.LoadLine, colors);
+        DrawLegend(ds, bands[3], $"CPU Clock MHz (0-{CpuClockAxisMax:F0})", colors.ClockLine, colors);
+    }
 
-        ds.FillCircle(new Vector2((float)plot.Left + 102, legendY + 6), 4, colors.DischargeLine);
-        ds.DrawText("Discharge W", (float)plot.Left + 112, legendY, colors.DischargeLine, AxisTextFormat);
+    private static void DrawLegend(CanvasDrawingSession ds, Rect band, string text, Color color, ChartPalette colors)
+    {
+        var y = (float)band.Top + 6;
+        ds.FillCircle(new Vector2((float)band.Left + 12, y + 6), 4, color);
+        ds.DrawText(text, (float)band.Left + 22, y, color, AxisTextFormat);
     }
 
     private IReadOnlyList<Vector2> BuildDisplayPoints(
-        IReadOnlyList<PowerChartSample> samples,
+        IReadOnlyList<CpuTimelineSample> samples,
         DateTime fromUtc,
         DateTime toUtc,
         Rect plot,
-        Func<PowerChartSample, double?> getValue,
-        Func<double, Rect, float> mapY)
+        Func<CpuTimelineSample, double?> getValue,
+        Func<double, float> mapY)
     {
         var targetBuckets = Math.Max(1, (int)plot.Width);
         var bucketTicks = Math.Max(1, (toUtc - fromUtc).Ticks / targetBuckets);
@@ -300,7 +310,7 @@ public sealed partial class PowerHistoryChart : UserControl
 
         var points = new List<Vector2>(reduced.Count);
         foreach (var point in reduced)
-            points.Add(new Vector2(MapX(point.TimestampUtc, fromUtc, toUtc, plot), mapY(point.Value, plot)));
+            points.Add(new Vector2(MapX(point.TimestampUtc, fromUtc, toUtc, plot), mapY(point.Value)));
 
         return points;
     }
@@ -324,7 +334,7 @@ public sealed partial class PowerHistoryChart : UserControl
             ds.DrawLine(points[i - 1], points[i], color, thickness);
     }
 
-    private void DrawTooltip(CanvasDrawingSession ds, Rect plot, DateTime fromUtc, DateTime toUtc, IReadOnlyList<PowerChartSample> samples, Point pointer, ChartPalette colors)
+    private void DrawTooltip(CanvasDrawingSession ds, Rect plot, Rect[] bands, DateTime fromUtc, DateTime toUtc, IReadOnlyList<CpuTimelineSample> samples, Point pointer, ChartPalette colors)
     {
         if (pointer.X < plot.Left || pointer.X > plot.Right || pointer.Y < plot.Top || pointer.Y > plot.Bottom)
             return;
@@ -336,18 +346,19 @@ public sealed partial class PowerHistoryChart : UserControl
             return;
 
         var x = MapX(nearest.TimestampUtc, fromUtc, toUtc, plot);
-        ds.DrawLine(x, (float)plot.Top, x, (float)plot.Bottom, colors.HoverLine, 1);
+        foreach (var band in bands)
+            ds.DrawLine(x, (float)band.Top, x, (float)band.Bottom, colors.HoverLine, 1);
 
-        var text = $"{nearest.TimestampUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}\nBattery: {FormatOptional(nearest.BatteryPercent, "%")}\nDischarge: {FormatOptional(nearest.DischargeWatts, " W")}";
-        var boxX = Math.Min((float)plot.Right - 180, Math.Max((float)plot.Left + 8, x + 10));
+        var text = $"{nearest.TimestampUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}\nBattery: {FormatOptional(nearest.BatteryPercent, "%")}\nEnergy: {FormatOptional(nearest.CumulativeEnergyWh, " Wh")}\nCPU W: {FormatOptional(nearest.CpuPackagePowerWatts, " W")}\nCPU load: {FormatOptional(nearest.CpuLoadPercent, "%")}\nClock: {FormatOptional(nearest.CpuAverageClockMhz, " MHz")}";
+        var boxX = Math.Min((float)plot.Right - 220, Math.Max((float)plot.Left + 8, x + 10));
         var boxY = (float)plot.Top + 10;
-        ds.FillRoundedRectangle(boxX, boxY, 170, 64, 6, 6, colors.TooltipBackground);
-        ds.DrawRoundedRectangle(boxX, boxY, 170, 64, 6, 6, colors.Axis, 1);
+        ds.FillRoundedRectangle(boxX, boxY, 210, 112, 6, 6, colors.TooltipBackground);
+        ds.DrawRoundedRectangle(boxX, boxY, 210, 112, 6, 6, colors.Axis, 1);
         ds.DrawText(text, boxX + 8, boxY + 7, colors.PrimaryText, TooltipTextFormat);
     }
 
-    private static PowerChartSample? FindNearestSample(
-        IReadOnlyList<PowerChartSample> samples,
+    private static CpuTimelineSample? FindNearestSample(
+        IReadOnlyList<CpuTimelineSample> samples,
         DateTime fromUtc,
         DateTime toUtc,
         DateTime targetUtc)
@@ -375,7 +386,7 @@ public sealed partial class PowerHistoryChart : UserControl
         return beforeDelta <= afterDelta ? before : after;
     }
 
-    private static int LowerBound(IReadOnlyList<PowerChartSample> samples, DateTime timestampUtc)
+    private static int LowerBound(IReadOnlyList<CpuTimelineSample> samples, DateTime timestampUtc)
     {
         var low = 0;
         var high = samples.Count;
@@ -391,7 +402,7 @@ public sealed partial class PowerHistoryChart : UserControl
         return low;
     }
 
-    private static int UpperBound(IReadOnlyList<PowerChartSample> samples, DateTime timestampUtc)
+    private static int UpperBound(IReadOnlyList<CpuTimelineSample> samples, DateTime timestampUtc)
     {
         var low = 0;
         var high = samples.Count;
@@ -410,7 +421,7 @@ public sealed partial class PowerHistoryChart : UserControl
     private static string FormatOptional(double? value, string suffix)
         => value.HasValue ? $"{value.Value:F1}{suffix}" : "--";
 
-    private (DateTime FromUtc, DateTime ToUtc) GetEffectiveVisibleRange(IReadOnlyList<PowerChartSample> samples)
+    private (DateTime FromUtc, DateTime ToUtc) GetEffectiveVisibleRange(IReadOnlyList<CpuTimelineSample> samples)
     {
         var historyFrom = HistoryFromUtc;
         var historyTo = HistoryToUtc;
@@ -418,7 +429,6 @@ public sealed partial class PowerHistoryChart : UserControl
         {
             if (samples.Count == 0)
                 return (DateTime.MinValue, DateTime.MinValue);
-
             historyFrom = samples.Min(s => s.TimestampUtc);
             historyTo = samples.Max(s => s.TimestampUtc);
         }
@@ -478,22 +488,15 @@ public sealed partial class PowerHistoryChart : UserControl
         return fromUtc + TimeSpan.FromTicks((long)((toUtc - fromUtc).Ticks * ratio));
     }
 
-    private static float MapBatteryY(double value, Rect plot)
+    private static float MapRangeY(double value, double min, double max, Rect plot)
     {
-        var ratio = Math.Clamp(value, 0, 100) / 100.0;
-        return (float)(plot.Bottom - plot.Height * ratio);
-    }
-
-    private float MapDischargeY(double value, Rect plot)
-    {
-        var max = Math.Max(1, DischargeAxisMax);
-        var ratio = Math.Clamp(value, 0, max) / max;
+        var ratio = Math.Clamp((value - min) / Math.Max(1e-9, max - min), 0, 1);
         return (float)(plot.Bottom - plot.Height * ratio);
     }
 
     private void ChartCanvas_PointerWheelChanged(object sender, PointerRoutedEventArgs e)
     {
-        var samples = Samples ?? Array.Empty<PowerChartSample>();
+        var samples = Samples ?? Array.Empty<CpuTimelineSample>();
         if (samples.Count == 0)
             return;
 
@@ -504,15 +507,15 @@ public sealed partial class PowerHistoryChart : UserControl
         var scale = point.Properties.MouseWheelDelta > 0 ? 0.8 : 1.25;
         var before = center - fromUtc;
         var after = toUtc - center;
-        var nextFrom = center - TimeSpan.FromTicks((long)(before.Ticks * scale));
-        var nextTo = center + TimeSpan.FromTicks((long)(after.Ticks * scale));
-        SetVisibleRangeFromInteraction(nextFrom, nextTo);
+        SetVisibleRangeFromInteraction(
+            center - TimeSpan.FromTicks((long)(before.Ticks * scale)),
+            center + TimeSpan.FromTicks((long)(after.Ticks * scale)));
         e.Handled = true;
     }
 
     private void ChartCanvas_PointerPressed(object sender, PointerRoutedEventArgs e)
     {
-        var samples = Samples ?? Array.Empty<PowerChartSample>();
+        var samples = Samples ?? Array.Empty<CpuTimelineSample>();
         if (samples.Count == 0)
             return;
 
@@ -660,27 +663,15 @@ public sealed partial class PowerHistoryChart : UserControl
         var dark = ActualTheme == ElementTheme.Dark;
         return dark
             ? new ChartPalette(
-                Color.FromArgb(0, 0, 0, 0),
-                Color.FromArgb(255, 30, 30, 30),
-                Color.FromArgb(255, 56, 56, 56),
-                Color.FromArgb(255, 92, 92, 92),
-                Color.FromArgb(255, 242, 242, 242),
-                Color.FromArgb(255, 180, 180, 180),
-                Color.FromArgb(255, 80, 170, 255),
-                Color.FromArgb(255, 255, 128, 82),
-                Color.FromArgb(180, 35, 35, 35),
-                Color.FromArgb(150, 180, 180, 180))
+                Color.FromArgb(0, 0, 0, 0), Color.FromArgb(255, 30, 30, 30), Color.FromArgb(255, 56, 56, 56), Color.FromArgb(255, 92, 92, 92),
+                Color.FromArgb(255, 242, 242, 242), Color.FromArgb(255, 180, 180, 180),
+                Color.FromArgb(255, 80, 170, 255), Color.FromArgb(255, 180, 220, 120), Color.FromArgb(255, 255, 128, 82), Color.FromArgb(255, 95, 210, 135), Color.FromArgb(255, 200, 140, 255),
+                Color.FromArgb(180, 35, 35, 35), Color.FromArgb(150, 180, 180, 180))
             : new ChartPalette(
-                Color.FromArgb(0, 0, 0, 0),
-                Colors.White,
-                Color.FromArgb(255, 232, 232, 232),
-                Color.FromArgb(255, 190, 190, 190),
-                Color.FromArgb(255, 32, 32, 32),
-                Color.FromArgb(255, 110, 110, 110),
-                Color.FromArgb(255, 0, 103, 192),
-                Color.FromArgb(255, 216, 79, 32),
-                Color.FromArgb(235, 255, 255, 255),
-                Color.FromArgb(130, 80, 80, 80));
+                Color.FromArgb(0, 0, 0, 0), Colors.White, Color.FromArgb(255, 232, 232, 232), Color.FromArgb(255, 190, 190, 190),
+                Color.FromArgb(255, 32, 32, 32), Color.FromArgb(255, 110, 110, 110),
+                Color.FromArgb(255, 0, 103, 192), Color.FromArgb(255, 80, 130, 0), Color.FromArgb(255, 216, 79, 32), Color.FromArgb(255, 0, 130, 70), Color.FromArgb(255, 120, 70, 190),
+                Color.FromArgb(235, 255, 255, 255), Color.FromArgb(130, 60, 60, 60));
     }
 
     private sealed record ChartPalette(
@@ -691,19 +682,10 @@ public sealed partial class PowerHistoryChart : UserControl
         Color PrimaryText,
         Color SecondaryText,
         Color BatteryLine,
-        Color DischargeLine,
+        Color EnergyLine,
+        Color PowerLine,
+        Color LoadLine,
+        Color ClockLine,
         Color TooltipBackground,
         Color HoverLine);
-}
-
-public sealed class VisibleRangeChangedEventArgs : EventArgs
-{
-    public VisibleRangeChangedEventArgs(DateTime fromUtc, DateTime toUtc)
-    {
-        FromUtc = fromUtc;
-        ToUtc = toUtc;
-    }
-
-    public DateTime FromUtc { get; }
-    public DateTime ToUtc { get; }
 }

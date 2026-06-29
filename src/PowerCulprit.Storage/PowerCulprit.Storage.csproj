@@ -21,10 +21,10 @@
       recommended replacement and ships the patched native amalgamation. Because we're not
       using a bundle, DatabaseManager's static ctor must call SQLitePCL.raw.SetProvider().
     -->
-    <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="*" />
-    <PackageReference Include="SQLitePCLRaw.core" Version="*" />
-    <PackageReference Include="SQLitePCLRaw.provider.e_sqlite3" Version="*" />
-    <PackageReference Include="SourceGear.sqlite3" Version="*" />
+    <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="10.0.9" />
+    <PackageReference Include="SQLitePCLRaw.core" Version="3.0.3" />
+    <PackageReference Include="SQLitePCLRaw.provider.e_sqlite3" Version="3.0.3" />
+    <PackageReference Include="SourceGear.sqlite3" Version="3.50.4.5" />
   </ItemGroup>
 
   <ItemGroup>

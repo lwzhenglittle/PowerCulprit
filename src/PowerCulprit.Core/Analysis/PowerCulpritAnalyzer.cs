@@ -10,6 +10,156 @@ public class PowerCulpritAnalyzer
 {
     private static readonly HashSet<int> KernelPseudoPids = new() { 0, 4 };
 
+    public IReadOnlyList<CulpritReportItem> AnalyzeAggregates(
+        TimeSpan window,
+        int topN,
+        IReadOnlyList<SystemPowerSample> powerSamples,
+        IReadOnlyList<ProcessAnalysisAggregate> processAggregates,
+        IReadOnlyList<GpuProcessAnalysisAggregate> gpuAggregates)
+    {
+        if (processAggregates.Count == 0)
+            return Array.Empty<CulpritReportItem>();
+
+        var powerInWindow = powerSamples
+            .OrderBy(s => s.TimestampUtc)
+            .ToList();
+        var dischargeTimeline = BuildDischargeTimeline(powerInWindow);
+        var effectiveIntervalSeconds = ComputeMedianIntervalSeconds(powerInWindow);
+
+        var gpuByName = gpuAggregates
+            .Where(g => !string.IsNullOrWhiteSpace(g.ProcessName))
+            .GroupBy(g => g.ProcessName, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                g => g.Key,
+                g => new GpuAggregate(
+                    g.Average(x => x.AvgUtilizationPercent),
+                    g.Max(x => x.MaxUtilizationPercent),
+                    g.Sum(x => x.VideoActivityPercent)),
+                StringComparer.OrdinalIgnoreCase);
+
+        var scored = new List<CulpritReportItem>();
+        foreach (var aggregate in processAggregates)
+        {
+            var name = aggregate.ProcessName;
+            var serviceName = NormalizeService(aggregate.ServiceName);
+            var avgCpu = aggregate.AvgCpuPercent;
+            var maxCpu = aggregate.MaxCpuPercent;
+            var avgMem = aggregate.AvgWorkingSetMb ?? 0;
+            var totalDiskMb = aggregate.TotalDiskBytesPerSecond > 0
+                ? Math.Round(aggregate.TotalDiskBytesPerSecond / (1024.0 * 1024.0), 2)
+                : (double?)null;
+            var totalNetMb = aggregate.TotalNetworkBytesPerSecond > 0
+                ? Math.Round(aggregate.TotalNetworkBytesPerSecond / (1024.0 * 1024.0), 2)
+                : (double?)null;
+            var fgSeconds = aggregate.ForegroundSampleCount * effectiveIntervalSeconds;
+            var bgSeconds = aggregate.BackgroundSampleCount * effectiveIntervalSeconds;
+
+            double? avgGpu = null;
+            double? maxGpu = null;
+            double videoDecodeActivity = 0;
+            if (gpuByName.TryGetValue(name, out var gpuAgg))
+            {
+                avgGpu = gpuAgg.AvgUtil;
+                maxGpu = gpuAgg.MaxUtil;
+                videoDecodeActivity = gpuAgg.VideoDecodeUtil;
+            }
+
+            var score = 0.0;
+            var reasons = new List<string>();
+
+            if (avgCpu.HasValue)
+            {
+                var cpuScore = avgCpu.Value * 1.5 + (maxCpu ?? 0) * 0.3;
+                score += cpuScore;
+                if (avgCpu.Value >= 1.0)
+                    reasons.Add($"avg CPU {avgCpu.Value:F1}%");
+            }
+
+            if (avgGpu.HasValue)
+            {
+                var gpuScore = avgGpu.Value * 2.0 + (maxGpu ?? 0) * 0.4;
+                score += gpuScore;
+                if (avgGpu.Value >= 0.5)
+                    reasons.Add($"GPU {avgGpu.Value:F1}%");
+            }
+
+            if (videoDecodeActivity > 0)
+            {
+                score += videoDecodeActivity * 1.5;
+                reasons.Add($"GPU Video {videoDecodeActivity:F1}% active");
+            }
+
+            if (bgSeconds > 60)
+            {
+                score += (bgSeconds / 3600.0) * 5.0;
+                var bgMin = (int)(bgSeconds / 60);
+                reasons.Add($"background {bgMin} min");
+            }
+
+            if (totalDiskMb.HasValue && totalDiskMb.Value > 0)
+            {
+                score += totalDiskMb.Value * 0.01;
+                if (totalDiskMb.Value > 1.0)
+                    reasons.Add($"disk {totalDiskMb.Value:F0} MB");
+            }
+
+            if (totalNetMb.HasValue && totalNetMb.Value > 0)
+                score += totalNetMb.Value * 0.005;
+
+            if (aggregate.ShortLivedProcessCount.HasValue && aggregate.ShortLivedProcessCount.Value > 0)
+            {
+                score += aggregate.ShortLivedProcessCount.Value * 2.0;
+                reasons.Add($"{aggregate.ShortLivedProcessCount.Value} short-lived instance{(aggregate.ShortLivedProcessCount.Value == 1 ? "" : "s")}");
+            }
+
+            if (aggregate.ProcessStartCount.HasValue && aggregate.ProcessStartCount.Value > 10)
+            {
+                score += (aggregate.ProcessStartCount.Value - 10) * 0.5;
+                reasons.Add($"{aggregate.ProcessStartCount.Value} process starts");
+            }
+
+            double? powerCorr = null;
+            var reason = BuildReason(name, reasons, avgCpu, avgGpu, bgSeconds, powerCorr, avgMem);
+
+            scored.Add(new CulpritReportItem
+            {
+                ProcessName = name,
+                ServiceName = serviceName,
+                Pid = null,
+                Score = Math.Round(score, 2),
+                Rank = 0,
+                AvgCpuPercent = avgCpu.HasValue ? Math.Round(avgCpu.Value, 2) : null,
+                MaxCpuPercent = maxCpu.HasValue ? Math.Round(maxCpu.Value, 2) : null,
+                AvgGpuPercent = avgGpu.HasValue ? Math.Round(avgGpu.Value, 2) : null,
+                MaxGpuPercent = maxGpu.HasValue ? Math.Round(maxGpu.Value, 2) : null,
+                DiskMb = totalDiskMb,
+                NetworkMb = totalNetMb,
+                ProcessStartCount = aggregate.ProcessStartCount,
+                ProcessStopCount = aggregate.ProcessStopCount,
+                ShortLivedProcessCount = aggregate.ShortLivedProcessCount,
+                BackgroundActiveSeconds = bgSeconds > 0 ? Math.Round(bgSeconds, 1) : null,
+                ForegroundActiveSeconds = fgSeconds > 0 ? Math.Round(fgSeconds, 1) : null,
+                PowerCorrelation = dischargeTimeline.Count >= 3 ? powerCorr : null,
+                CpuPowerCorrelation = null,
+                GpuActivityCorrelation = avgGpu.HasValue ? avgGpu.Value / 100.0 : null,
+                Reason = reason
+            });
+        }
+
+        var ranked = scored
+            .OrderByDescending(s => s.Score)
+            .ThenByDescending(s => s.AvgCpuPercent ?? 0.0)
+            .ThenByDescending(s => s.MaxGpuPercent ?? 0.0)
+            .ThenBy(s => s.ProcessName, StringComparer.OrdinalIgnoreCase)
+            .Take(Math.Max(1, topN))
+            .ToList();
+
+        for (int i = 0; i < ranked.Count; i++)
+            ranked[i] = ranked[i] with { Rank = i + 1 };
+
+        return ranked;
+    }
+
     public IReadOnlyList<CulpritReportItem> Analyze(
         TimeSpan window,
         int topN,
@@ -401,6 +551,30 @@ public class PowerCulpritAnalyzer
         gaps.Sort();
         // Lower median (gaps[count / 2]) — fine for our purposes; we don't need the
         // average-of-two-middles refinement that statisticians use for even counts.
+        return gaps[gaps.Count / 2];
+    }
+
+    private static double ComputeMedianIntervalSeconds(List<SystemPowerSample> powerSamples)
+    {
+        if (powerSamples.Count < 2)
+            return DefaultIntervalSeconds;
+
+        var sorted = powerSamples
+            .Select(s => s.TimestampUtc)
+            .OrderBy(t => t)
+            .ToList();
+        var gaps = new List<double>(sorted.Count - 1);
+        for (int i = 1; i < sorted.Count; i++)
+        {
+            var dt = (sorted[i] - sorted[i - 1]).TotalSeconds;
+            if (dt > 0 && dt <= MaxValidGapSeconds)
+                gaps.Add(dt);
+        }
+
+        if (gaps.Count == 0)
+            return DefaultIntervalSeconds;
+
+        gaps.Sort();
         return gaps[gaps.Count / 2];
     }
 

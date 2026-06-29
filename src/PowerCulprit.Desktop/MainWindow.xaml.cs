@@ -10,21 +10,43 @@ namespace PowerCulprit.Desktop;
 public sealed partial class MainWindow : Window
 {
     private readonly MainViewModel _viewModel;
+    private readonly CpuAttributionViewModel _cpuViewModel;
     private bool _reallyClosing;
 
-    public MainWindow(MainViewModel viewModel)
+    public MainWindow(MainViewModel viewModel, CpuAttributionViewModel cpuViewModel)
     {
         InitializeComponent();
         ConfigureTitleBar();
         SetWindowIcon();
 
         _viewModel = viewModel;
+        _cpuViewModel = cpuViewModel;
 
-        RootFrame.Navigate(typeof(MainPage), viewModel);
+        RootNavigationView.SelectedItem = RootNavigationView.MenuItems[0];
+        ContentFrame.Navigate(typeof(MainPage), viewModel);
 
         AppWindow.Resize(new Windows.Graphics.SizeInt32(1200, 800));
 
         AppWindow.Closing += OnWindowClosing;
+    }
+
+
+    private void RootNavigationView_SelectionChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
+    {
+        if (args.SelectedItem is not NavigationViewItem item || item.Tag is not string tag)
+            return;
+
+        switch (tag)
+        {
+            case "cpu":
+                if (ContentFrame.CurrentSourcePageType != typeof(CpuAttributionPage))
+                    ContentFrame.Navigate(typeof(CpuAttributionPage), _cpuViewModel);
+                break;
+            default:
+                if (ContentFrame.CurrentSourcePageType != typeof(MainPage))
+                    ContentFrame.Navigate(typeof(MainPage), _viewModel);
+                break;
+        }
     }
 
     private void ConfigureTitleBar()

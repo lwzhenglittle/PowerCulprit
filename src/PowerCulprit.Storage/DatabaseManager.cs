@@ -6,6 +6,15 @@ using PowerCulprit.Core.Models;
 namespace PowerCulprit.Storage;
 
 /// <summary>
+/// Result of compacting raw rows into aggregate history.
+/// </summary>
+public sealed record DatabaseCompactionResult(
+    int ProcessRowsCompacted,
+    int GpuRowsCompacted,
+    int HardwareRowsCompacted,
+    DateTime? CompactedThroughUtc);
+
+/// <summary>
 /// Manages the SQLite database for PowerCulprit: initialization, schema,
 /// batch writes, time-window queries, and historical data cleanup.
 /// </summary>
@@ -33,6 +42,9 @@ public class DatabaseManager : IDisposable
     private readonly string _connectionString;
     private bool _initialized;
     private const int BusyTimeoutMilliseconds = 5000;
+    private const int CurrentSchemaVersion = 3;
+    public static readonly TimeSpan DefaultRawRetention = TimeSpan.FromHours(24);
+    public static readonly TimeSpan DefaultAggregationWindow = TimeSpan.FromMinutes(5);
 
     // Persistent write connection, lazily opened on first write and reused for
     // every subsequent write. MonitoringService.RunSingleCycleAsync fans out up
@@ -42,6 +54,9 @@ public class DatabaseManager : IDisposable
     // still use ephemeral pooled connections so they don't contend with writes.
     private SqliteConnection? _writeConnection;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly Dictionary<string, long> _timestampIdCache = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, long> _serviceGroupIdCache = new(StringComparer.Ordinal);
+    private readonly Dictionary<ProcessIdentityKey, long> _processIdentityIdCache = new();
 
     /// <summary>
     /// Creates a DatabaseManager with the default or custom database path.
@@ -103,6 +118,13 @@ public class DatabaseManager : IDisposable
         // before the write loop starts, so there's no value in holding it open.
         await using var connection = await OpenConnectionAsync();
         await EnableWalAsync(connection);
+        await DropObsoleteIndexesAsync(connection);
+
+        var schemaVersion = await GetUserVersionAsync(connection);
+        if (schemaVersion < 2)
+        {
+            await RebuildForSchemaV2Async(connection);
+        }
 
         await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync();
 
@@ -113,9 +135,78 @@ public class DatabaseManager : IDisposable
         await CreateAnalysisReportsTableAsync(connection, transaction);
         await CreateSourceStatusTableAsync(connection, transaction);
         await CreateBatteryCycleTablesAsync(connection, transaction);
+        await CreateMetadataTableAsync(connection, transaction);
+        await CreateAggregateTablesAsync(connection, transaction);
 
         await transaction.CommitAsync();
+        await SetUserVersionAsync(connection, CurrentSchemaVersion);
         _initialized = true;
+    }
+
+    private static async Task<int> GetUserVersionAsync(SqliteConnection connection)
+    {
+        await using var cmd = new SqliteCommand("PRAGMA user_version;", connection);
+        return Convert.ToInt32(await cmd.ExecuteScalarAsync());
+    }
+
+    private static async Task DropObsoleteIndexesAsync(SqliteConnection connection)
+    {
+        const string sql = """
+            DROP INDEX IF EXISTS idx_process_facts_timestamp_pid;
+            DROP INDEX IF EXISTS idx_process_facts_timestamp_identity;
+            DROP INDEX IF EXISTS idx_gpu_process_pid;
+            DROP INDEX IF EXISTS idx_gpu_process_ts_pid;
+            DROP INDEX IF EXISTS idx_hw_sensor_source;
+            DROP INDEX IF EXISTS idx_hw_sensor_ts_metric;
+            """;
+
+        await using var cmd = new SqliteCommand(sql, connection);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    private static async Task SetUserVersionAsync(SqliteConnection connection, int version)
+    {
+        await using var cmd = new SqliteCommand($"PRAGMA user_version={version};", connection);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    private async Task RebuildForSchemaV2Async(SqliteConnection connection)
+    {
+        await using (var cmd = new SqliteCommand(
+            """
+            DROP INDEX IF EXISTS idx_process_samples_ts;
+            DROP INDEX IF EXISTS idx_process_samples_pid;
+            DROP INDEX IF EXISTS idx_process_samples_ts_pid;
+            DROP INDEX IF EXISTS idx_process_samples_ts_name;
+            DROP TABLE IF EXISTS process_samples;
+            DROP TABLE IF EXISTS process_sample_facts;
+            DROP TABLE IF EXISTS process_identities;
+            DROP TABLE IF EXISTS service_group_members;
+            DROP TABLE IF EXISTS service_groups;
+            DROP TABLE IF EXISTS sample_timestamps;
+            DROP TABLE IF EXISTS battery_cycles;
+            DROP TABLE IF EXISTS battery_display_cycles;
+            DROP TABLE IF EXISTS system_power_samples;
+            DROP TABLE IF EXISTS gpu_process_samples;
+            DROP TABLE IF EXISTS hardware_sensor_samples;
+            DROP TABLE IF EXISTS analysis_reports;
+            DROP TABLE IF EXISTS source_status;
+            DROP TABLE IF EXISTS session_start_markers;
+            DROP TABLE IF EXISTS process_analysis_aggregates;
+            DROP TABLE IF EXISTS gpu_analysis_aggregates;
+            DROP TABLE IF EXISTS hardware_sensor_aggregates;
+            DROP TABLE IF EXISTS metadata;
+            """,
+            connection))
+        {
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        _timestampIdCache.Clear();
+        _serviceGroupIdCache.Clear();
+        _processIdentityIdCache.Clear();
+
+        await VacuumCoreAsync(connection);
     }
 
     // ──────────────────────────────────────────────
@@ -142,6 +233,7 @@ public class DatabaseManager : IDisposable
         var connection = new SqliteConnection(_connectionString);
         await connection.OpenAsync();
         await ApplyConnectionPragmasAsync(connection);
+        await RegisterSqliteFunctionsAsync(connection);
         _writeConnection = connection;
         return connection;
     }
@@ -151,6 +243,7 @@ public class DatabaseManager : IDisposable
         var connection = new SqliteConnection(_connectionString);
         await connection.OpenAsync();
         await ApplyConnectionPragmasAsync(connection);
+        await RegisterSqliteFunctionsAsync(connection);
         return connection;
     }
 
@@ -160,6 +253,15 @@ public class DatabaseManager : IDisposable
             $"PRAGMA busy_timeout={BusyTimeoutMilliseconds};",
             connection);
         await cmd.ExecuteNonQueryAsync();
+    }
+
+    private static async Task RegisterSqliteFunctionsAsync(SqliteConnection connection)
+    {
+        connection.CreateFunction("ToIsoUtc", (string value) =>
+            DateTime.Parse(value, null, System.Globalization.DateTimeStyles.AssumeUniversal)
+                .ToUniversalTime()
+                .ToString("O"));
+        await Task.CompletedTask;
     }
 
     private static async Task EnableWalAsync(SqliteConnection connection)
@@ -199,14 +301,43 @@ public class DatabaseManager : IDisposable
         SqliteConnection connection, SqliteTransaction transaction)
     {
         const string sql = """
-            CREATE TABLE IF NOT EXISTS process_samples (
+            CREATE TABLE IF NOT EXISTS sample_timestamps (
+                timestamp_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_utc TEXT NOT NULL UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS service_groups (
+                service_group_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint      TEXT NOT NULL UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS service_group_members (
+                service_group_id INTEGER NOT NULL,
+                service_name     TEXT    NOT NULL,
+                PRIMARY KEY (service_group_id, service_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS process_identities (
+                process_identity_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                process_name        TEXT    NOT NULL,
+                executable_path     TEXT,
+                command_line        TEXT,
+                parent_pid          INTEGER,
+                service_group_id    INTEGER
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_process_identities_key
+                ON process_identities(
+                    process_name,
+                    COALESCE(executable_path, ''),
+                    COALESCE(command_line, ''),
+                    COALESCE(parent_pid, -1),
+                    COALESCE(service_group_id, 0));
+
+            CREATE TABLE IF NOT EXISTS process_sample_facts (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp_utc   TEXT    NOT NULL,
+                timestamp_id    INTEGER NOT NULL,
+                process_identity_id INTEGER NOT NULL,
                 pid             INTEGER NOT NULL,
-                process_name    TEXT    NOT NULL,
-                executable_path TEXT,
-                command_line    TEXT,
-                parent_pid      INTEGER,
                 cpu_percent     REAL,
                 working_set_mb  REAL,
                 private_memory_mb REAL,
@@ -217,28 +348,16 @@ public class DatabaseManager : IDisposable
                 network_receive_bytes_per_second REAL,
                 network_send_bytes_per_second    REAL,
                 is_foreground_process INTEGER NOT NULL,
-                service_name    TEXT
+                process_start_count INTEGER,
+                process_stop_count INTEGER,
+                process_short_lived_count INTEGER
             );
-            CREATE INDEX IF NOT EXISTS idx_process_samples_ts
-                ON process_samples(timestamp_utc);
-            CREATE INDEX IF NOT EXISTS idx_process_samples_pid
-                ON process_samples(pid);
-            CREATE INDEX IF NOT EXISTS idx_process_samples_ts_pid
-                ON process_samples(timestamp_utc, pid);
-            CREATE INDEX IF NOT EXISTS idx_process_samples_ts_name
-                ON process_samples(timestamp_utc, process_name);
+            CREATE INDEX IF NOT EXISTS idx_process_facts_timestamp
+                ON process_sample_facts(timestamp_id);
             """;
 
         await using var cmd = new SqliteCommand(sql, connection, transaction);
         await cmd.ExecuteNonQueryAsync();
-
-        // Backfill the column on older DBs created before svchost-service attribution.
-        // CREATE TABLE IF NOT EXISTS won't add columns to an existing table, so we
-        // probe via PRAGMA table_info and ALTER TABLE ADD COLUMN when needed.
-        await AddColumnIfMissingAsync(connection, transaction, "process_samples", "service_name", "TEXT");
-        await AddColumnIfMissingAsync(connection, transaction, "process_samples", "process_start_count", "INTEGER");
-        await AddColumnIfMissingAsync(connection, transaction, "process_samples", "process_stop_count", "INTEGER");
-        await AddColumnIfMissingAsync(connection, transaction, "process_samples", "process_short_lived_count", "INTEGER");
     }
 
     private static async Task AddColumnIfMissingAsync(
@@ -288,10 +407,6 @@ public class DatabaseManager : IDisposable
             );
             CREATE INDEX IF NOT EXISTS idx_gpu_process_ts
                 ON gpu_process_samples(timestamp_utc);
-            CREATE INDEX IF NOT EXISTS idx_gpu_process_pid
-                ON gpu_process_samples(pid);
-            CREATE INDEX IF NOT EXISTS idx_gpu_process_ts_pid
-                ON gpu_process_samples(timestamp_utc, pid);
             """;
 
         await using var cmd = new SqliteCommand(sql, connection, transaction);
@@ -314,8 +429,6 @@ public class DatabaseManager : IDisposable
             );
             CREATE INDEX IF NOT EXISTS idx_hw_sensor_ts
                 ON hardware_sensor_samples(timestamp_utc);
-            CREATE INDEX IF NOT EXISTS idx_hw_sensor_source
-                ON hardware_sensor_samples(source);
             """;
 
         await using var cmd = new SqliteCommand(sql, connection, transaction);
@@ -380,10 +493,95 @@ public class DatabaseManager : IDisposable
         await cmd.ExecuteNonQueryAsync();
     }
 
-    // ──────────────────────────────────────────────
-    //  Batch writes
-    // ──────────────────────────────────────────────
+    private static async Task CreateMetadataTableAsync(
+        SqliteConnection connection, SqliteTransaction transaction)
+    {
+        const string sql = """
+            CREATE TABLE IF NOT EXISTS metadata (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            """;
 
+        await using var cmd = new SqliteCommand(sql, connection, transaction);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    private static async Task CreateAggregateTablesAsync(
+        SqliteConnection connection, SqliteTransaction transaction)
+    {
+        const string sql = """
+            CREATE TABLE IF NOT EXISTS process_analysis_aggregates (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                window_start_utc TEXT NOT NULL,
+                window_end_utc   TEXT NOT NULL,
+                process_name     TEXT NOT NULL,
+                service_name     TEXT,
+                sample_count     INTEGER NOT NULL,
+                cpu_sum          REAL,
+                cpu_count        INTEGER NOT NULL DEFAULT 0,
+                avg_cpu_percent  REAL,
+                max_cpu_percent  REAL,
+                working_set_sum  REAL,
+                working_set_count INTEGER NOT NULL DEFAULT 0,
+                avg_working_set_mb REAL,
+                total_disk_bytes_per_second REAL NOT NULL DEFAULT 0,
+                total_network_bytes_per_second REAL NOT NULL DEFAULT 0,
+                foreground_sample_count INTEGER NOT NULL DEFAULT 0,
+                background_sample_count INTEGER NOT NULL DEFAULT 0,
+                process_start_count INTEGER,
+                process_stop_count INTEGER,
+                short_lived_process_count INTEGER,
+                activity_score REAL NOT NULL DEFAULT 0,
+                is_active_at_window_end INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_process_agg_window_name_service
+                ON process_analysis_aggregates(window_start_utc, window_end_utc, process_name, service_name);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_process_agg_window_name_null_service
+                ON process_analysis_aggregates(window_start_utc, window_end_utc, process_name)
+                WHERE service_name IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_process_agg_window
+                ON process_analysis_aggregates(window_start_utc, window_end_utc);
+
+            CREATE TABLE IF NOT EXISTS gpu_analysis_aggregates (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                window_start_utc TEXT NOT NULL,
+                window_end_utc   TEXT NOT NULL,
+                process_name     TEXT NOT NULL,
+                sample_count     INTEGER NOT NULL,
+                utilization_sum  REAL NOT NULL DEFAULT 0,
+                avg_utilization_percent REAL NOT NULL DEFAULT 0,
+                max_utilization_percent REAL NOT NULL DEFAULT 0,
+                video_activity_percent REAL NOT NULL DEFAULT 0
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_gpu_agg_window_name
+                ON gpu_analysis_aggregates(window_start_utc, window_end_utc, process_name);
+            CREATE INDEX IF NOT EXISTS idx_gpu_agg_window
+                ON gpu_analysis_aggregates(window_start_utc, window_end_utc);
+
+            CREATE TABLE IF NOT EXISTS hardware_sensor_aggregates (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                window_start_utc TEXT NOT NULL,
+                window_end_utc   TEXT NOT NULL,
+                source          TEXT NOT NULL,
+                device_name     TEXT NOT NULL,
+                sensor_name     TEXT NOT NULL,
+                metric_name     TEXT NOT NULL,
+                unit            TEXT NOT NULL,
+                sample_count    INTEGER NOT NULL,
+                avg_value       REAL NOT NULL,
+                min_value       REAL NOT NULL,
+                max_value       REAL NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_hw_agg_window_sensor
+                ON hardware_sensor_aggregates(window_start_utc, window_end_utc, source, device_name, sensor_name, metric_name, unit);
+            CREATE INDEX IF NOT EXISTS idx_hw_agg_window
+                ON hardware_sensor_aggregates(window_start_utc, window_end_utc);
+            """;
+
+        await using var cmd = new SqliteCommand(sql, connection, transaction);
+        await cmd.ExecuteNonQueryAsync();
+    }
     private static async Task CreateBatteryCycleTablesAsync(
         SqliteConnection connection, SqliteTransaction transaction)
     {
@@ -516,68 +714,7 @@ public class DatabaseManager : IDisposable
             var connection = await GetOrOpenWriteConnectionAsync();
             await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync();
 
-            const string sql = """
-                INSERT INTO process_samples
-                    (timestamp_utc, pid, process_name, executable_path, command_line,
-                     parent_pid, cpu_percent, working_set_mb, private_memory_mb,
-                     thread_count, handle_count, disk_read_bytes_per_second,
-                     disk_write_bytes_per_second, network_receive_bytes_per_second,
-                     network_send_bytes_per_second, is_foreground_process, service_name,
-                     process_start_count, process_stop_count, process_short_lived_count)
-                VALUES
-                    ($ts, $pid, $pn, $ep, $cl, $pp, $cpu, $ws, $pmem,
-                     $tc, $hc, $dr, $dw, $nr, $ns, $fg, $sn, $psc, $pstc, $slc);
-                """;
-
-            await using var cmd = new SqliteCommand(sql, connection, transaction);
-
-            // Reuse parameter objects across iterations
-            var p_ts  = cmd.Parameters.Add("$ts",   SqliteType.Text);
-            var p_pid = cmd.Parameters.Add("$pid",  SqliteType.Integer);
-            var p_pn  = cmd.Parameters.Add("$pn",   SqliteType.Text);
-            var p_ep  = cmd.Parameters.Add("$ep",   SqliteType.Text);
-            var p_cl  = cmd.Parameters.Add("$cl",   SqliteType.Text);
-            var p_pp  = cmd.Parameters.Add("$pp",   SqliteType.Integer);
-            var p_cpu = cmd.Parameters.Add("$cpu",  SqliteType.Real);
-            var p_ws  = cmd.Parameters.Add("$ws",   SqliteType.Real);
-            var p_pmem = cmd.Parameters.Add("$pmem", SqliteType.Real);
-            var p_tc  = cmd.Parameters.Add("$tc",   SqliteType.Integer);
-            var p_hc  = cmd.Parameters.Add("$hc",   SqliteType.Integer);
-            var p_dr  = cmd.Parameters.Add("$dr",   SqliteType.Real);
-            var p_dw  = cmd.Parameters.Add("$dw",   SqliteType.Real);
-            var p_nr  = cmd.Parameters.Add("$nr",   SqliteType.Real);
-            var p_ns  = cmd.Parameters.Add("$ns",   SqliteType.Real);
-            var p_fg  = cmd.Parameters.Add("$fg",   SqliteType.Integer);
-            var p_sn  = cmd.Parameters.Add("$sn",   SqliteType.Text);
-            var p_psc = cmd.Parameters.Add("$psc",  SqliteType.Integer);
-            var p_pstc = cmd.Parameters.Add("$pstc", SqliteType.Integer);
-            var p_slc = cmd.Parameters.Add("$slc",  SqliteType.Integer);
-
-            foreach (var sample in samples)
-            {
-                p_ts.Value  = SerializeTimestamp(sample.TimestampUtc);
-                p_pid.Value = sample.Pid;
-                p_pn.Value  = sample.ProcessName;
-                p_ep.Value  = (object?)sample.ExecutablePath ?? DBNull.Value;
-                p_cl.Value  = (object?)sample.CommandLine ?? DBNull.Value;
-                p_pp.Value  = (object?)sample.ParentPid ?? DBNull.Value;
-                p_cpu.Value = (object?)sample.CpuPercent ?? DBNull.Value;
-                p_ws.Value  = (object?)sample.WorkingSetMb ?? DBNull.Value;
-                p_pmem.Value = (object?)sample.PrivateMemoryMb ?? DBNull.Value;
-                p_tc.Value  = (object?)sample.ThreadCount ?? DBNull.Value;
-                p_hc.Value  = (object?)sample.HandleCount ?? DBNull.Value;
-                p_dr.Value  = (object?)sample.DiskReadBytesPerSecond ?? DBNull.Value;
-                p_dw.Value  = (object?)sample.DiskWriteBytesPerSecond ?? DBNull.Value;
-                p_nr.Value  = (object?)sample.NetworkReceiveBytesPerSecond ?? DBNull.Value;
-                p_ns.Value  = (object?)sample.NetworkSendBytesPerSecond ?? DBNull.Value;
-                p_fg.Value  = sample.IsForegroundProcess ? 1L : 0L;
-                p_sn.Value  = (object?)sample.ServiceName ?? DBNull.Value;
-                p_psc.Value = (object?)sample.ProcessStartCount ?? DBNull.Value;
-                p_pstc.Value = (object?)sample.ProcessStopCount ?? DBNull.Value;
-                p_slc.Value = (object?)sample.ShortLivedProcessCount ?? DBNull.Value;
-
-                await cmd.ExecuteNonQueryAsync();
-            }
+            await InsertProcessSamplesInTransactionAsync(connection, transaction, samples);
 
             await transaction.CommitAsync();
         }
@@ -804,50 +941,51 @@ public class DatabaseManager : IDisposable
         await cmd.ExecuteNonQueryAsync();
     }
 
-    private static async Task InsertProcessSamplesInTransactionAsync(
+    private async Task InsertProcessSamplesInTransactionAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
         IReadOnlyList<ProcessSample> samples)
     {
         const string sql = """
-            INSERT INTO process_samples
-                (timestamp_utc, pid, process_name, executable_path, command_line,
-                 parent_pid, cpu_percent, working_set_mb, private_memory_mb,
-                 thread_count, handle_count, disk_read_bytes_per_second,
-                 disk_write_bytes_per_second, network_receive_bytes_per_second,
-                 network_send_bytes_per_second, is_foreground_process, service_name)
+            INSERT INTO process_sample_facts
+                (timestamp_id, process_identity_id, pid, cpu_percent,
+                 working_set_mb, private_memory_mb, thread_count, handle_count,
+                 disk_read_bytes_per_second, disk_write_bytes_per_second,
+                 network_receive_bytes_per_second, network_send_bytes_per_second,
+                 is_foreground_process, process_start_count, process_stop_count,
+                 process_short_lived_count)
             VALUES
-                ($ts, $pid, $pn, $ep, $cl, $pp, $cpu, $ws, $pmem,
-                 $tc, $hc, $dr, $dw, $nr, $ns, $fg, $sn);
+                ($tsid, $piid, $pid, $cpu, $ws, $pmem, $tc, $hc,
+                 $dr, $dw, $nr, $ns, $fg, $psc, $pstc, $slc);
             """;
 
         await using var cmd = new SqliteCommand(sql, connection, transaction);
-        var p_ts  = cmd.Parameters.Add("$ts",   SqliteType.Text);
-        var p_pid = cmd.Parameters.Add("$pid",  SqliteType.Integer);
-        var p_pn  = cmd.Parameters.Add("$pn",   SqliteType.Text);
-        var p_ep  = cmd.Parameters.Add("$ep",   SqliteType.Text);
-        var p_cl  = cmd.Parameters.Add("$cl",   SqliteType.Text);
-        var p_pp  = cmd.Parameters.Add("$pp",   SqliteType.Integer);
-        var p_cpu = cmd.Parameters.Add("$cpu",  SqliteType.Real);
-        var p_ws  = cmd.Parameters.Add("$ws",   SqliteType.Real);
+        var p_tsid = cmd.Parameters.Add("$tsid", SqliteType.Integer);
+        var p_piid = cmd.Parameters.Add("$piid", SqliteType.Integer);
+        var p_pid = cmd.Parameters.Add("$pid", SqliteType.Integer);
+        var p_cpu = cmd.Parameters.Add("$cpu", SqliteType.Real);
+        var p_ws = cmd.Parameters.Add("$ws", SqliteType.Real);
         var p_pmem = cmd.Parameters.Add("$pmem", SqliteType.Real);
-        var p_tc  = cmd.Parameters.Add("$tc",   SqliteType.Integer);
-        var p_hc  = cmd.Parameters.Add("$hc",   SqliteType.Integer);
-        var p_dr  = cmd.Parameters.Add("$dr",   SqliteType.Real);
-        var p_dw  = cmd.Parameters.Add("$dw",   SqliteType.Real);
-        var p_nr  = cmd.Parameters.Add("$nr",   SqliteType.Real);
-        var p_ns  = cmd.Parameters.Add("$ns",   SqliteType.Real);
-        var p_fg  = cmd.Parameters.Add("$fg",   SqliteType.Integer);
-        var p_sn  = cmd.Parameters.Add("$sn",   SqliteType.Text);
+        var p_tc = cmd.Parameters.Add("$tc", SqliteType.Integer);
+        var p_hc = cmd.Parameters.Add("$hc", SqliteType.Integer);
+        var p_dr = cmd.Parameters.Add("$dr", SqliteType.Real);
+        var p_dw = cmd.Parameters.Add("$dw", SqliteType.Real);
+        var p_nr = cmd.Parameters.Add("$nr", SqliteType.Real);
+        var p_ns = cmd.Parameters.Add("$ns", SqliteType.Real);
+        var p_fg = cmd.Parameters.Add("$fg", SqliteType.Integer);
+        var p_psc = cmd.Parameters.Add("$psc", SqliteType.Integer);
+        var p_pstc = cmd.Parameters.Add("$pstc", SqliteType.Integer);
+        var p_slc = cmd.Parameters.Add("$slc", SqliteType.Integer);
 
         foreach (var sample in samples)
         {
-            p_ts.Value  = SerializeTimestamp(sample.TimestampUtc);
+            var timestampId = await GetOrCreateTimestampIdAsync(connection, transaction, SerializeTimestamp(sample.TimestampUtc));
+            var serviceGroupId = await GetOrCreateServiceGroupIdAsync(connection, transaction, sample.ServiceName);
+            var identityId = await GetOrCreateProcessIdentityIdAsync(connection, transaction, sample, serviceGroupId);
+
+            p_tsid.Value = timestampId;
+            p_piid.Value = identityId;
             p_pid.Value = sample.Pid;
-            p_pn.Value  = sample.ProcessName;
-            p_ep.Value  = (object?)sample.ExecutablePath ?? DBNull.Value;
-            p_cl.Value  = (object?)sample.CommandLine ?? DBNull.Value;
-            p_pp.Value  = (object?)sample.ParentPid ?? DBNull.Value;
             p_cpu.Value = (object?)sample.CpuPercent ?? DBNull.Value;
             p_ws.Value  = (object?)sample.WorkingSetMb ?? DBNull.Value;
             p_pmem.Value = (object?)sample.PrivateMemoryMb ?? DBNull.Value;
@@ -858,9 +996,135 @@ public class DatabaseManager : IDisposable
             p_nr.Value  = (object?)sample.NetworkReceiveBytesPerSecond ?? DBNull.Value;
             p_ns.Value  = (object?)sample.NetworkSendBytesPerSecond ?? DBNull.Value;
             p_fg.Value  = sample.IsForegroundProcess ? 1L : 0L;
-            p_sn.Value  = (object?)sample.ServiceName ?? DBNull.Value;
+            p_psc.Value = (object?)sample.ProcessStartCount ?? DBNull.Value;
+            p_pstc.Value = (object?)sample.ProcessStopCount ?? DBNull.Value;
+            p_slc.Value = (object?)sample.ShortLivedProcessCount ?? DBNull.Value;
             await cmd.ExecuteNonQueryAsync();
         }
+    }
+
+    private async Task<long> GetOrCreateTimestampIdAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string timestampUtc)
+    {
+        if (_timestampIdCache.TryGetValue(timestampUtc, out var cached))
+            return cached;
+
+        await using (var insert = new SqliteCommand(
+            "INSERT OR IGNORE INTO sample_timestamps(timestamp_utc) VALUES ($ts);",
+            connection, transaction))
+        {
+            insert.Parameters.AddWithValue("$ts", timestampUtc);
+            await insert.ExecuteNonQueryAsync();
+        }
+
+        await using var select = new SqliteCommand(
+            "SELECT timestamp_id FROM sample_timestamps WHERE timestamp_utc = $ts;",
+            connection, transaction);
+        select.Parameters.AddWithValue("$ts", timestampUtc);
+        var id = Convert.ToInt64(await select.ExecuteScalarAsync());
+        _timestampIdCache[timestampUtc] = id;
+        return id;
+    }
+
+    private async Task<long?> GetOrCreateServiceGroupIdAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string? serviceName)
+    {
+        var services = SplitServiceNames(serviceName);
+        if (services.Count == 0)
+            return null;
+
+        var fingerprint = string.Join('\u001f', services);
+        if (_serviceGroupIdCache.TryGetValue(fingerprint, out var cached))
+            return cached;
+
+        await using (var insert = new SqliteCommand(
+            "INSERT OR IGNORE INTO service_groups(fingerprint) VALUES ($fp);",
+            connection, transaction))
+        {
+            insert.Parameters.AddWithValue("$fp", fingerprint);
+            await insert.ExecuteNonQueryAsync();
+        }
+
+        await using var select = new SqliteCommand(
+            "SELECT service_group_id FROM service_groups WHERE fingerprint = $fp;",
+            connection, transaction);
+        select.Parameters.AddWithValue("$fp", fingerprint);
+        var id = Convert.ToInt64(await select.ExecuteScalarAsync());
+
+        await using var memberInsert = new SqliteCommand(
+            """
+            INSERT OR IGNORE INTO service_group_members(service_group_id, service_name)
+            VALUES ($id, $name);
+            """,
+            connection, transaction);
+        var idParam = memberInsert.Parameters.Add("$id", SqliteType.Integer);
+        var nameParam = memberInsert.Parameters.Add("$name", SqliteType.Text);
+        foreach (var service in services)
+        {
+            idParam.Value = id;
+            nameParam.Value = service;
+            await memberInsert.ExecuteNonQueryAsync();
+        }
+
+        _serviceGroupIdCache[fingerprint] = id;
+        return id;
+    }
+
+    private async Task<long> GetOrCreateProcessIdentityIdAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ProcessSample sample,
+        long? serviceGroupId)
+    {
+        var key = new ProcessIdentityKey(
+            sample.ProcessName,
+            sample.ExecutablePath,
+            sample.CommandLine,
+            sample.ParentPid,
+            serviceGroupId);
+
+        if (_processIdentityIdCache.TryGetValue(key, out var cached))
+            return cached;
+
+        await using (var insert = new SqliteCommand(
+            """
+            INSERT OR IGNORE INTO process_identities
+                (process_name, executable_path, command_line, parent_pid, service_group_id)
+            VALUES ($pn, $ep, $cl, $pp, $sg);
+            """,
+            connection, transaction))
+        {
+            insert.Parameters.AddWithValue("$pn", sample.ProcessName);
+            insert.Parameters.AddWithValue("$ep", (object?)sample.ExecutablePath ?? DBNull.Value);
+            insert.Parameters.AddWithValue("$cl", (object?)sample.CommandLine ?? DBNull.Value);
+            insert.Parameters.AddWithValue("$pp", (object?)sample.ParentPid ?? DBNull.Value);
+            insert.Parameters.AddWithValue("$sg", (object?)serviceGroupId ?? DBNull.Value);
+            await insert.ExecuteNonQueryAsync();
+        }
+
+        await using var select = new SqliteCommand(
+            """
+            SELECT process_identity_id
+            FROM process_identities
+            WHERE process_name = $pn
+              AND COALESCE(executable_path, '') = COALESCE($ep, '')
+              AND COALESCE(command_line, '') = COALESCE($cl, '')
+              AND COALESCE(parent_pid, -1) = COALESCE($pp, -1)
+              AND COALESCE(service_group_id, 0) = COALESCE($sg, 0);
+            """,
+            connection, transaction);
+        select.Parameters.AddWithValue("$pn", sample.ProcessName);
+        select.Parameters.AddWithValue("$ep", (object?)sample.ExecutablePath ?? DBNull.Value);
+        select.Parameters.AddWithValue("$cl", (object?)sample.CommandLine ?? DBNull.Value);
+        select.Parameters.AddWithValue("$pp", (object?)sample.ParentPid ?? DBNull.Value);
+        select.Parameters.AddWithValue("$sg", (object?)serviceGroupId ?? DBNull.Value);
+        var id = Convert.ToInt64(await select.ExecuteScalarAsync());
+        _processIdentityIdCache[key] = id;
+        return id;
     }
 
     private static async Task InsertGpuProcessSamplesInTransactionAsync(
@@ -1101,15 +1365,27 @@ public class DatabaseManager : IDisposable
         await using var connection = await OpenConnectionAsync();
 
         const string sql = """
-            SELECT timestamp_utc, pid, process_name, executable_path, command_line,
-                   parent_pid, cpu_percent, working_set_mb, private_memory_mb,
-                   thread_count, handle_count, disk_read_bytes_per_second,
-                   disk_write_bytes_per_second, network_receive_bytes_per_second,
-                   network_send_bytes_per_second, is_foreground_process, service_name,
-                   process_start_count, process_stop_count, process_short_lived_count
-            FROM process_samples
-            WHERE timestamp_utc >= $from AND timestamp_utc <= $to
-            ORDER BY timestamp_utc;
+            WITH service_names AS (
+                SELECT service_group_id, group_concat(service_name, ', ') AS service_name
+                FROM (
+                    SELECT service_group_id, service_name
+                    FROM service_group_members
+                    ORDER BY service_group_id, service_name
+                )
+                GROUP BY service_group_id
+            )
+            SELECT t.timestamp_utc, f.pid, i.process_name, i.executable_path, i.command_line,
+                   i.parent_pid, f.cpu_percent, f.working_set_mb, f.private_memory_mb,
+                   f.thread_count, f.handle_count, f.disk_read_bytes_per_second,
+                   f.disk_write_bytes_per_second, f.network_receive_bytes_per_second,
+                   f.network_send_bytes_per_second, f.is_foreground_process, sn.service_name,
+                   f.process_start_count, f.process_stop_count, f.process_short_lived_count
+            FROM process_sample_facts f
+            JOIN sample_timestamps t ON t.timestamp_id = f.timestamp_id
+            JOIN process_identities i ON i.process_identity_id = f.process_identity_id
+            LEFT JOIN service_names sn ON sn.service_group_id = i.service_group_id
+            WHERE t.timestamp_utc >= $from AND t.timestamp_utc <= $to
+            ORDER BY t.timestamp_utc;
             """;
 
         await using var cmd = new SqliteCommand(sql, connection);
@@ -1159,14 +1435,26 @@ public class DatabaseManager : IDisposable
         await using var connection = await OpenConnectionAsync();
 
         const string sql = """
-            SELECT timestamp_utc, pid, process_name, cpu_percent, working_set_mb,
-                   disk_read_bytes_per_second, disk_write_bytes_per_second,
-                   network_receive_bytes_per_second, network_send_bytes_per_second,
-                   is_foreground_process, service_name, process_start_count,
-                   process_stop_count, process_short_lived_count
-            FROM process_samples
-            WHERE timestamp_utc >= $from AND timestamp_utc <= $to
-            ORDER BY timestamp_utc;
+            WITH service_names AS (
+                SELECT service_group_id, group_concat(service_name, ', ') AS service_name
+                FROM (
+                    SELECT service_group_id, service_name
+                    FROM service_group_members
+                    ORDER BY service_group_id, service_name
+                )
+                GROUP BY service_group_id
+            )
+            SELECT t.timestamp_utc, f.pid, i.process_name, f.cpu_percent, f.working_set_mb,
+                   f.disk_read_bytes_per_second, f.disk_write_bytes_per_second,
+                   f.network_receive_bytes_per_second, f.network_send_bytes_per_second,
+                   f.is_foreground_process, sn.service_name, f.process_start_count,
+                   f.process_stop_count, f.process_short_lived_count
+            FROM process_sample_facts f
+            JOIN sample_timestamps t ON t.timestamp_id = f.timestamp_id
+            JOIN process_identities i ON i.process_identity_id = f.process_identity_id
+            LEFT JOIN service_names sn ON sn.service_group_id = i.service_group_id
+            WHERE t.timestamp_utc >= $from AND t.timestamp_utc <= $to
+            ORDER BY t.timestamp_utc;
             """;
 
         await using var cmd = new SqliteCommand(sql, connection);
@@ -1193,6 +1481,134 @@ public class DatabaseManager : IDisposable
                 ProcessStartCount = reader.IsDBNull(11) ? null : reader.GetInt32(11),
                 ProcessStopCount = reader.IsDBNull(12) ? null : reader.GetInt32(12),
                 ShortLivedProcessCount = reader.IsDBNull(13) ? null : reader.GetInt32(13)
+            });
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// Returns SQL-side process aggregates for the historical analyzer.
+    /// </summary>
+    public async Task<IReadOnlyList<ProcessAnalysisAggregate>> GetProcessAggregatesForAnalysisAsync(
+        IReadOnlyList<(DateTime FromUtc, DateTime ToUtc)> intervals)
+    {
+        await EnsureInitializedAsync();
+        if (intervals.Count == 0)
+            return Array.Empty<ProcessAnalysisAggregate>();
+
+        await using var connection = await OpenConnectionAsync();
+        var (rawWhereClause, rawParameters) = BuildIntervalWhereClause(intervals, "t.timestamp_utc");
+        var (aggregateWhereClause, aggregateParameters) = BuildIntervalWhereClause(intervals, "window_end_utc", "agg");
+
+        var sql = $"""
+            WITH service_names AS (
+                SELECT service_group_id, group_concat(service_name, ', ') AS service_name
+                FROM (
+                    SELECT service_group_id, service_name
+                    FROM service_group_members
+                    ORDER BY service_group_id, service_name
+                )
+                GROUP BY service_group_id
+            ),
+            raw_agg AS (
+                SELECT i.process_name,
+                       sn.service_name,
+                       SUM(f.cpu_percent) AS sum_cpu,
+                       COUNT(f.cpu_percent) AS count_cpu,
+                       MAX(f.cpu_percent) AS max_cpu,
+                       SUM(f.working_set_mb) AS sum_ws,
+                       COUNT(f.working_set_mb) AS count_ws,
+                       SUM(COALESCE(f.disk_read_bytes_per_second, 0) + COALESCE(f.disk_write_bytes_per_second, 0)) AS total_disk,
+                       SUM(COALESCE(f.network_receive_bytes_per_second, 0) + COALESCE(f.network_send_bytes_per_second, 0)) AS total_network,
+                       COUNT(f.process_start_count) AS start_count,
+                       SUM(COALESCE(f.process_start_count, 0)) AS starts,
+                       COUNT(f.process_stop_count) AS stop_count,
+                       SUM(COALESCE(f.process_stop_count, 0)) AS stops,
+                       COUNT(f.process_short_lived_count) AS short_lived_count,
+                       SUM(COALESCE(f.process_short_lived_count, 0)) AS short_lived,
+                       SUM(CASE WHEN f.is_foreground_process != 0 THEN 1 ELSE 0 END) AS fg_samples,
+                       SUM(CASE WHEN f.is_foreground_process = 0 THEN 1 ELSE 0 END) AS bg_samples,
+                       COUNT(*) AS sample_count
+                FROM process_sample_facts f
+                JOIN sample_timestamps t ON t.timestamp_id = f.timestamp_id
+                JOIN process_identities i ON i.process_identity_id = f.process_identity_id
+                LEFT JOIN service_names sn ON sn.service_group_id = i.service_group_id
+                WHERE f.pid NOT IN (0, 4)
+                  AND ({rawWhereClause})
+                GROUP BY i.process_name, sn.service_name
+            ),
+            stored_agg AS (
+                SELECT process_name,
+                       service_name,
+                       SUM(cpu_sum) AS sum_cpu,
+                       SUM(cpu_count) AS count_cpu,
+                       MAX(max_cpu_percent) AS max_cpu,
+                       SUM(working_set_sum) AS sum_ws,
+                       SUM(working_set_count) AS count_ws,
+                       SUM(total_disk_bytes_per_second) AS total_disk,
+                       SUM(total_network_bytes_per_second) AS total_network,
+                       COUNT(process_start_count) AS start_count,
+                       SUM(COALESCE(process_start_count, 0)) AS starts,
+                       COUNT(process_stop_count) AS stop_count,
+                       SUM(COALESCE(process_stop_count, 0)) AS stops,
+                       COUNT(short_lived_process_count) AS short_lived_count,
+                       SUM(COALESCE(short_lived_process_count, 0)) AS short_lived,
+                       SUM(foreground_sample_count) AS fg_samples,
+                       SUM(background_sample_count) AS bg_samples,
+                       SUM(sample_count) AS sample_count
+                FROM process_analysis_aggregates
+                WHERE {aggregateWhereClause}
+                GROUP BY process_name, service_name
+            ),
+            combined AS (
+                SELECT * FROM raw_agg
+                UNION ALL
+                SELECT * FROM stored_agg
+            )
+            SELECT process_name,
+                   service_name,
+                   CASE WHEN SUM(count_cpu) = 0 THEN NULL ELSE SUM(sum_cpu) / SUM(count_cpu) END AS avg_cpu,
+                   MAX(max_cpu) AS max_cpu,
+                   CASE WHEN SUM(count_ws) = 0 THEN NULL ELSE SUM(sum_ws) / SUM(count_ws) END AS avg_ws,
+                   SUM(total_disk) AS total_disk,
+                   SUM(total_network) AS total_network,
+                   CASE WHEN SUM(start_count) = 0 THEN NULL ELSE SUM(starts) END AS starts,
+                   CASE WHEN SUM(stop_count) = 0 THEN NULL ELSE SUM(stops) END AS stops,
+                   CASE WHEN SUM(short_lived_count) = 0 THEN NULL ELSE SUM(short_lived) END AS short_lived,
+                   SUM(fg_samples) AS fg_samples,
+                   SUM(bg_samples) AS bg_samples,
+                   SUM(sample_count) AS sample_count
+            FROM combined
+            GROUP BY process_name, service_name
+            ORDER BY avg_cpu DESC;
+            """;
+
+        await using var cmd = new SqliteCommand(sql, connection);
+        foreach (var (name, value) in rawParameters)
+            cmd.Parameters.AddWithValue(name, value);
+        foreach (var (name, value) in aggregateParameters)
+            cmd.Parameters.AddWithValue(name, value);
+
+        var results = new List<ProcessAnalysisAggregate>();
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            results.Add(new ProcessAnalysisAggregate
+            {
+                ProcessName = reader.GetString(0),
+                ServiceName = reader.IsDBNull(1) ? null : reader.GetString(1),
+                AvgCpuPercent = reader.IsDBNull(2) ? null : reader.GetDouble(2),
+                MaxCpuPercent = reader.IsDBNull(3) ? null : reader.GetDouble(3),
+                AvgWorkingSetMb = reader.IsDBNull(4) ? null : reader.GetDouble(4),
+                TotalDiskBytesPerSecond = reader.IsDBNull(5) ? 0 : reader.GetDouble(5),
+                TotalNetworkBytesPerSecond = reader.IsDBNull(6) ? 0 : reader.GetDouble(6),
+                ProcessStartCount = reader.IsDBNull(7) ? null : Convert.ToInt32(reader.GetInt64(7)),
+                ProcessStopCount = reader.IsDBNull(8) ? null : Convert.ToInt32(reader.GetInt64(8)),
+                ShortLivedProcessCount = reader.IsDBNull(9) ? null : Convert.ToInt32(reader.GetInt64(9)),
+                ForegroundSampleCount = Convert.ToInt32(reader.GetInt64(10)),
+                BackgroundSampleCount = Convert.ToInt32(reader.GetInt64(11)),
+                SampleCount = Convert.ToInt32(reader.GetInt64(12))
             });
         }
 
@@ -1234,6 +1650,116 @@ public class DatabaseManager : IDisposable
                     ? engineType
                     : GpuEngineType.Other,
                 UtilizationPercent = reader.GetDouble(5)
+            });
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// Returns SQL-side GPU Engine aggregates for the historical analyzer.
+    /// </summary>
+    public async Task<IReadOnlyList<GpuProcessAnalysisAggregate>> GetGpuProcessAggregatesAsync(
+        IReadOnlyList<(DateTime FromUtc, DateTime ToUtc)> intervals)
+    {
+        await EnsureInitializedAsync();
+        if (intervals.Count == 0)
+            return Array.Empty<GpuProcessAnalysisAggregate>();
+
+        await using var connection = await OpenConnectionAsync();
+        var (rawWhereClause, rawParameters) = BuildIntervalWhereClause(intervals);
+        var (aggregateWhereClause, aggregateParameters) = BuildIntervalWhereClause(intervals, "window_end_utc", "agg");
+
+        var sql = $"""
+            WITH combined AS (
+                SELECT process_name,
+                       SUM(utilization_percent) AS util_sum,
+                       COUNT(*) AS sample_count,
+                       MAX(utilization_percent) AS max_util,
+                       SUM(CASE WHEN engine_type IN ('VideoDecode', 'VideoEncode')
+                                THEN utilization_percent ELSE 0 END) AS video_activity
+                FROM gpu_process_samples
+                WHERE process_name IS NOT NULL
+                  AND ({rawWhereClause})
+                GROUP BY process_name
+                UNION ALL
+                SELECT process_name,
+                       SUM(utilization_sum) AS util_sum,
+                       SUM(sample_count) AS sample_count,
+                       MAX(max_utilization_percent) AS max_util,
+                       SUM(video_activity_percent) AS video_activity
+                FROM gpu_analysis_aggregates
+                WHERE {aggregateWhereClause}
+                GROUP BY process_name
+            )
+            SELECT process_name,
+                   CASE WHEN SUM(sample_count) = 0 THEN 0 ELSE SUM(util_sum) / SUM(sample_count) END AS avg_util,
+                   MAX(max_util) AS max_util,
+                   SUM(video_activity) AS video_activity
+            FROM combined
+            GROUP BY process_name;
+            """;
+
+        await using var cmd = new SqliteCommand(sql, connection);
+        foreach (var (name, value) in rawParameters)
+            cmd.Parameters.AddWithValue(name, value);
+        foreach (var (name, value) in aggregateParameters)
+            cmd.Parameters.AddWithValue(name, value);
+
+        var results = new List<GpuProcessAnalysisAggregate>();
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            results.Add(new GpuProcessAnalysisAggregate
+            {
+                ProcessName = reader.GetString(0),
+                AvgUtilizationPercent = reader.GetDouble(1),
+                MaxUtilizationPercent = reader.GetDouble(2),
+                VideoActivityPercent = reader.IsDBNull(3) ? 0 : reader.GetDouble(3)
+            });
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// Returns hardware sensor samples within the given UTC time window.
+    /// </summary>
+    public async Task<IReadOnlyList<HardwareSensorSample>> GetHardwareSensorSamplesAsync(
+        DateTime fromUtc, DateTime toUtc)
+    {
+        await EnsureInitializedAsync();
+
+        await using var connection = await OpenConnectionAsync();
+
+        const string sql = """
+            SELECT timestamp_utc, source, device_name, sensor_name, metric_name, value, unit
+            FROM hardware_sensor_samples
+            WHERE timestamp_utc >= $from AND timestamp_utc <= $to
+            UNION ALL
+            SELECT window_start_utc AS timestamp_utc, source, device_name, sensor_name, metric_name, avg_value AS value, unit
+            FROM hardware_sensor_aggregates
+            WHERE window_end_utc >= $from AND window_start_utc <= $to
+            ORDER BY timestamp_utc;
+            """;
+
+        await using var cmd = new SqliteCommand(sql, connection);
+        cmd.Parameters.AddWithValue("$from", SerializeTimestamp(fromUtc));
+        cmd.Parameters.AddWithValue("$to", SerializeTimestamp(toUtc));
+
+        var results = new List<HardwareSensorSample>();
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            results.Add(new HardwareSensorSample
+            {
+                TimestampUtc = DeserializeTimestamp(reader.GetString(0)),
+                Source = reader.GetString(1),
+                DeviceName = reader.GetString(2),
+                SensorName = reader.GetString(3),
+                MetricName = reader.GetString(4),
+                Value = reader.GetDouble(5),
+                Unit = reader.GetString(6)
             });
         }
 
@@ -1484,16 +2010,346 @@ public class DatabaseManager : IDisposable
     }
 
     /// <summary>
-    /// Deletes data older than the specified number of days from all tables.
-    /// Returns the total number of deleted rows.
+    /// Compacts raw process/GPU/hardware rows older than the cutoff into fixed-size aggregate windows.
     /// </summary>
-    /// <param name="retentionDays">Number of days of data to keep. Default is 7.</param>
-    public async Task<int> CleanupOldDataAsync(int retentionDays = 7)
+    public async Task<DatabaseCompactionResult> CompactRawDataAsync(
+        DateTime compactBeforeUtc,
+        TimeSpan? windowSize = null)
     {
         await EnsureInitializedAsync();
 
-        var cutoff = DateTime.UtcNow.AddDays(-retentionDays);
-        var cutoffStr = SerializeTimestamp(cutoff);
+        var effectiveWindow = windowSize ?? DefaultAggregationWindow;
+        if (effectiveWindow <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(windowSize), "Compaction window must be positive.");
+
+        var compactThroughUtc = AlignDown(compactBeforeUtc, effectiveWindow);
+        if (compactThroughUtc <= DateTime.MinValue.AddDays(1))
+            return new DatabaseCompactionResult(0, 0, 0, null);
+
+        var compactThroughStr = SerializeTimestamp(compactThroughUtc);
+        var processRows = 0;
+        var gpuRows = 0;
+        var hardwareRows = 0;
+
+        await _writeLock.WaitAsync();
+        try
+        {
+            var connection = await GetOrOpenWriteConnectionAsync();
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync();
+
+            var lastCompacted = await GetMetadataTimestampAsync(connection, transaction, "last_compaction_window_end_utc");
+            var lowerBound = lastCompacted is null ? null : SerializeTimestamp(lastCompacted.Value);
+
+            processRows = await CompactProcessRowsAsync(connection, transaction, lowerBound, compactThroughStr, effectiveWindow);
+            gpuRows = await CompactGpuRowsAsync(connection, transaction, lowerBound, compactThroughStr, effectiveWindow);
+            hardwareRows = await CompactHardwareRowsAsync(connection, transaction, lowerBound, compactThroughStr, effectiveWindow);
+
+            await DeleteCompactedRawRowsAsync(connection, transaction, lowerBound, compactThroughStr);
+            await CleanupOrphanProcessMetadataAsync(connection, transaction);
+            await SetMetadataAsync(connection, transaction, "last_compaction_window_end_utc", compactThroughStr);
+
+            await transaction.CommitAsync();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+
+        if (processRows > 0 || gpuRows > 0 || hardwareRows > 0)
+            await CheckpointWalTruncateAsync();
+
+        return new DatabaseCompactionResult(processRows, gpuRows, hardwareRows, compactThroughUtc);
+    }
+
+    private static async Task<DateTime?> GetMetadataTimestampAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string key)
+    {
+        await using var cmd = new SqliteCommand("SELECT value FROM metadata WHERE key = $key;", connection, transaction);
+        cmd.Parameters.AddWithValue("$key", key);
+        var value = await cmd.ExecuteScalarAsync();
+        return value is string text ? DeserializeTimestamp(text) : null;
+    }
+
+    private static async Task SetMetadataAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string key,
+        string value)
+    {
+        await using var cmd = new SqliteCommand(
+            """
+            INSERT INTO metadata(key, value) VALUES ($key, $value)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            """,
+            connection, transaction);
+        cmd.Parameters.AddWithValue("$key", key);
+        cmd.Parameters.AddWithValue("$value", value);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<int> CompactProcessRowsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string? lowerBound,
+        string compactThroughStr,
+        TimeSpan windowSize)
+    {
+        var lowerClause = lowerBound is null ? string.Empty : "AND t.timestamp_utc > $lower";
+        var sql = $"""
+            WITH service_names AS (
+                SELECT service_group_id, group_concat(service_name, ', ') AS service_name
+                FROM (
+                    SELECT service_group_id, service_name
+                    FROM service_group_members
+                    ORDER BY service_group_id, service_name
+                )
+                GROUP BY service_group_id
+            ),
+            raw AS (
+                SELECT datetime((CAST(strftime('%s', t.timestamp_utc) AS INTEGER) / $windowSeconds) * $windowSeconds, 'unixepoch') AS window_start,
+                       datetime(((CAST(strftime('%s', t.timestamp_utc) AS INTEGER) / $windowSeconds) + 1) * $windowSeconds, 'unixepoch') AS window_end,
+                       i.process_name,
+                       sn.service_name,
+                       f.cpu_percent,
+                       f.working_set_mb,
+                       COALESCE(f.disk_read_bytes_per_second, 0) + COALESCE(f.disk_write_bytes_per_second, 0) AS disk_total,
+                       COALESCE(f.network_receive_bytes_per_second, 0) + COALESCE(f.network_send_bytes_per_second, 0) AS network_total,
+                       f.is_foreground_process,
+                       f.process_start_count,
+                       f.process_stop_count,
+                       f.process_short_lived_count
+                FROM process_sample_facts f
+                JOIN sample_timestamps t ON t.timestamp_id = f.timestamp_id
+                JOIN process_identities i ON i.process_identity_id = f.process_identity_id
+                LEFT JOIN service_names sn ON sn.service_group_id = i.service_group_id
+                WHERE t.timestamp_utc <= $through
+                  {lowerClause}
+                  AND f.pid NOT IN (0, 4)
+            ),
+            grouped AS (
+                SELECT window_start,
+                       window_end,
+                       process_name,
+                       service_name,
+                       COUNT(*) AS sample_count,
+                       SUM(cpu_percent) AS cpu_sum,
+                       COUNT(cpu_percent) AS cpu_count,
+                       AVG(cpu_percent) AS avg_cpu,
+                       MAX(cpu_percent) AS max_cpu,
+                       SUM(working_set_mb) AS ws_sum,
+                       COUNT(working_set_mb) AS ws_count,
+                       AVG(working_set_mb) AS avg_ws,
+                       SUM(disk_total) AS total_disk,
+                       SUM(network_total) AS total_network,
+                       SUM(CASE WHEN is_foreground_process != 0 THEN 1 ELSE 0 END) AS fg_samples,
+                       SUM(CASE WHEN is_foreground_process = 0 THEN 1 ELSE 0 END) AS bg_samples,
+                       COUNT(process_start_count) AS start_count,
+                       SUM(COALESCE(process_start_count, 0)) AS starts,
+                       COUNT(process_stop_count) AS stop_count,
+                       SUM(COALESCE(process_stop_count, 0)) AS stops,
+                       COUNT(process_short_lived_count) AS short_count,
+                       SUM(COALESCE(process_short_lived_count, 0)) AS short_lived
+                FROM raw
+                GROUP BY window_start, window_end, process_name, service_name
+            )
+            INSERT OR REPLACE INTO process_analysis_aggregates
+                (window_start_utc, window_end_utc, process_name, service_name, sample_count,
+                 cpu_sum, cpu_count, avg_cpu_percent, max_cpu_percent,
+                 working_set_sum, working_set_count, avg_working_set_mb,
+                 total_disk_bytes_per_second, total_network_bytes_per_second,
+                 foreground_sample_count, background_sample_count,
+                 process_start_count, process_stop_count, short_lived_process_count,
+                 activity_score, is_active_at_window_end)
+            SELECT ToIsoUtc(window_start), ToIsoUtc(window_end), process_name, service_name, sample_count,
+                   cpu_sum, cpu_count, avg_cpu, max_cpu,
+                   ws_sum, ws_count, avg_ws,
+                   total_disk, total_network,
+                   fg_samples, bg_samples,
+                   CASE WHEN start_count = 0 THEN NULL ELSE starts END,
+                   CASE WHEN stop_count = 0 THEN NULL ELSE stops END,
+                   CASE WHEN short_count = 0 THEN NULL ELSE short_lived END,
+                   COALESCE(avg_cpu, 0) + (COALESCE(total_disk, 0) + COALESCE(total_network, 0)) / 1048576.0,
+                   1
+            FROM grouped;
+            """;
+
+        await using var cmd = new SqliteCommand(sql, connection, transaction);
+        cmd.Parameters.AddWithValue("$windowSeconds", Convert.ToInt64(windowSize.TotalSeconds));
+        cmd.Parameters.AddWithValue("$through", compactThroughStr);
+        if (lowerBound is not null)
+            cmd.Parameters.AddWithValue("$lower", lowerBound);
+        return await cmd.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<int> CompactGpuRowsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string? lowerBound,
+        string compactThroughStr,
+        TimeSpan windowSize)
+    {
+        var lowerClause = lowerBound is null ? string.Empty : "AND timestamp_utc > $lower";
+        var sql = $"""
+            WITH raw AS (
+                SELECT datetime((CAST(strftime('%s', timestamp_utc) AS INTEGER) / $windowSeconds) * $windowSeconds, 'unixepoch') AS window_start,
+                       datetime(((CAST(strftime('%s', timestamp_utc) AS INTEGER) / $windowSeconds) + 1) * $windowSeconds, 'unixepoch') AS window_end,
+                       process_name,
+                       engine_type,
+                       utilization_percent
+                FROM gpu_process_samples
+                WHERE timestamp_utc <= $through
+                  {lowerClause}
+                  AND process_name IS NOT NULL
+                  AND utilization_percent > 0
+            ),
+            grouped AS (
+                SELECT window_start,
+                       window_end,
+                       process_name,
+                       COUNT(*) AS sample_count,
+                       SUM(utilization_percent) AS util_sum,
+                       AVG(utilization_percent) AS avg_util,
+                       MAX(utilization_percent) AS max_util,
+                       SUM(CASE WHEN engine_type IN ('VideoDecode', 'VideoEncode') THEN utilization_percent ELSE 0 END) AS video_activity
+                FROM raw
+                GROUP BY window_start, window_end, process_name
+                HAVING max_util > 0
+            )
+            INSERT OR REPLACE INTO gpu_analysis_aggregates
+                (window_start_utc, window_end_utc, process_name, sample_count,
+                 utilization_sum, avg_utilization_percent, max_utilization_percent, video_activity_percent)
+            SELECT ToIsoUtc(window_start), ToIsoUtc(window_end), process_name, sample_count,
+                   util_sum, avg_util, max_util, video_activity
+            FROM grouped;
+            """;
+
+        await using var cmd = new SqliteCommand(sql, connection, transaction);
+        cmd.Parameters.AddWithValue("$windowSeconds", Convert.ToInt64(windowSize.TotalSeconds));
+        cmd.Parameters.AddWithValue("$through", compactThroughStr);
+        if (lowerBound is not null)
+            cmd.Parameters.AddWithValue("$lower", lowerBound);
+        return await cmd.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<int> CompactHardwareRowsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string? lowerBound,
+        string compactThroughStr,
+        TimeSpan windowSize)
+    {
+        var lowerClause = lowerBound is null ? string.Empty : "AND timestamp_utc > $lower";
+        var sql = $"""
+            WITH raw AS (
+                SELECT datetime((CAST(strftime('%s', timestamp_utc) AS INTEGER) / $windowSeconds) * $windowSeconds, 'unixepoch') AS window_start,
+                       datetime(((CAST(strftime('%s', timestamp_utc) AS INTEGER) / $windowSeconds) + 1) * $windowSeconds, 'unixepoch') AS window_end,
+                       source, device_name, sensor_name, metric_name, unit, value
+                FROM hardware_sensor_samples
+                WHERE timestamp_utc <= $through
+                  {lowerClause}
+            ),
+            grouped AS (
+                SELECT window_start,
+                       window_end,
+                       source,
+                       device_name,
+                       sensor_name,
+                       metric_name,
+                       unit,
+                       COUNT(*) AS sample_count,
+                       AVG(value) AS avg_value,
+                       MIN(value) AS min_value,
+                       MAX(value) AS max_value
+                FROM raw
+                GROUP BY window_start, window_end, source, device_name, sensor_name, metric_name, unit
+            )
+            INSERT OR REPLACE INTO hardware_sensor_aggregates
+                (window_start_utc, window_end_utc, source, device_name, sensor_name, metric_name, unit,
+                 sample_count, avg_value, min_value, max_value)
+            SELECT ToIsoUtc(window_start), ToIsoUtc(window_end), source, device_name, sensor_name, metric_name, unit,
+                   sample_count, avg_value, min_value, max_value
+            FROM grouped;
+            """;
+
+        await using var cmd = new SqliteCommand(sql, connection, transaction);
+        cmd.Parameters.AddWithValue("$windowSeconds", Convert.ToInt64(windowSize.TotalSeconds));
+        cmd.Parameters.AddWithValue("$through", compactThroughStr);
+        if (lowerBound is not null)
+            cmd.Parameters.AddWithValue("$lower", lowerBound);
+        return await cmd.ExecuteNonQueryAsync();
+    }
+
+    private static async Task DeleteCompactedRawRowsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string? lowerBound,
+        string compactThroughStr)
+    {
+        var lowerClause = lowerBound is null ? string.Empty : "AND timestamp_utc > $lower";
+
+        await using (var deleteProcess = new SqliteCommand(
+            $"""
+            DELETE FROM process_sample_facts
+            WHERE timestamp_id IN (
+                SELECT timestamp_id FROM sample_timestamps
+                WHERE timestamp_utc <= $through {lowerClause}
+            );
+            """,
+            connection, transaction))
+        {
+            deleteProcess.Parameters.AddWithValue("$through", compactThroughStr);
+            if (lowerBound is not null)
+                deleteProcess.Parameters.AddWithValue("$lower", lowerBound);
+            await deleteProcess.ExecuteNonQueryAsync();
+        }
+
+        foreach (var table in new[] { "gpu_process_samples", "hardware_sensor_samples" })
+        {
+            await using var cmd = new SqliteCommand(
+                $"DELETE FROM {table} WHERE timestamp_utc <= $through {lowerClause};",
+                connection, transaction);
+            cmd.Parameters.AddWithValue("$through", compactThroughStr);
+            if (lowerBound is not null)
+                cmd.Parameters.AddWithValue("$lower", lowerBound);
+            await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    private async Task CheckpointWalTruncateAsync()
+    {
+        await _writeLock.WaitAsync();
+        try
+        {
+            var connection = await GetOrOpenWriteConnectionAsync();
+            await using var cmd = new SqliteCommand("PRAGMA wal_checkpoint(TRUNCATE);", connection);
+            await cmd.ExecuteNonQueryAsync();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    private static DateTime AlignDown(DateTime timestampUtc, TimeSpan windowSize)
+    {
+        var utc = timestampUtc.Kind == DateTimeKind.Utc ? timestampUtc : timestampUtc.ToUniversalTime();
+        var ticks = utc.Ticks - utc.Ticks % windowSize.Ticks;
+        return new DateTime(ticks, DateTimeKind.Utc);
+    }
+
+
+    /// <summary>
+    /// Deletes old history using separate retention windows for raw high-volume tables and longer-lived aggregate/history tables.
+    /// </summary>
+    public async Task<int> CleanupOldDataAsync(int retentionDays = 7, TimeSpan? rawRetention = null)
+    {
+        await EnsureInitializedAsync();
+
+        var (rawCutoff, historyCutoff) = ResolveRetentionCutoffs(retentionDays, rawRetention);
+        var rawCutoffStr = SerializeTimestamp(rawCutoff);
+        var historyCutoffStr = SerializeTimestamp(historyCutoff);
         var totalDeleted = 0;
 
         await _writeLock.WaitAsync();
@@ -1513,28 +2369,47 @@ public class DatabaseManager : IDisposable
             {
                 await using var cmd = new SqliteCommand(sql, connection, transaction);
                 if (sql.Contains("$cutoff", StringComparison.Ordinal))
-                    cmd.Parameters.AddWithValue("$cutoff", cutoffStr);
+                    cmd.Parameters.AddWithValue("$cutoff", historyCutoffStr);
                 totalDeleted += await cmd.ExecuteNonQueryAsync();
             }
 
-            var tables = new[]
-            {
-                "system_power_samples",
-                "process_samples",
-                "gpu_process_samples",
-                "hardware_sensor_samples",
-                "analysis_reports",
-                "source_status",
-                "session_start_markers"
-            };
-
-            foreach (var table in tables)
+            foreach (var table in new[] { "gpu_process_samples", "hardware_sensor_samples" })
             {
                 var sql = $"DELETE FROM {table} WHERE timestamp_utc < $cutoff;";
                 await using var cmd = new SqliteCommand(sql, connection, transaction);
-                cmd.Parameters.AddWithValue("$cutoff", cutoffStr);
+                cmd.Parameters.AddWithValue("$cutoff", rawCutoffStr);
                 totalDeleted += await cmd.ExecuteNonQueryAsync();
             }
+
+            foreach (var table in new[]
+            {
+                "system_power_samples",
+                "analysis_reports",
+                "source_status",
+                "session_start_markers"
+            })
+            {
+                var sql = $"DELETE FROM {table} WHERE timestamp_utc < $cutoff;";
+                await using var cmd = new SqliteCommand(sql, connection, transaction);
+                cmd.Parameters.AddWithValue("$cutoff", historyCutoffStr);
+                totalDeleted += await cmd.ExecuteNonQueryAsync();
+            }
+
+            foreach (var table in new[]
+            {
+                "process_analysis_aggregates",
+                "gpu_analysis_aggregates",
+                "hardware_sensor_aggregates"
+            })
+            {
+                var sql = $"DELETE FROM {table} WHERE window_end_utc < $cutoff;";
+                await using var cmd = new SqliteCommand(sql, connection, transaction);
+                cmd.Parameters.AddWithValue("$cutoff", historyCutoffStr);
+                totalDeleted += await cmd.ExecuteNonQueryAsync();
+            }
+
+            totalDeleted += await DeleteOldProcessFactsAsync(connection, transaction, rawCutoffStr);
+            await CleanupOrphanProcessMetadataAsync(connection, transaction);
 
             await transaction.CommitAsync();
         }
@@ -1542,7 +2417,89 @@ public class DatabaseManager : IDisposable
         {
             _writeLock.Release();
         }
+
+        if (totalDeleted > 0)
+            await CheckpointWalTruncateAsync();
+
         return totalDeleted;
+    }
+
+    private static (DateTime RawCutoff, DateTime HistoryCutoff) ResolveRetentionCutoffs(
+        int retentionDays,
+        TimeSpan? rawRetention)
+    {
+        var now = DateTime.UtcNow;
+        var historyCutoff = now.AddDays(-retentionDays);
+        var rawCutoff = rawRetention.HasValue
+            ? now.Subtract(rawRetention.Value)
+            : historyCutoff;
+        return (rawCutoff, historyCutoff);
+    }
+
+    private static async Task<int> DeleteOldProcessFactsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string cutoffStr)
+    {
+        const string sql = """
+            DELETE FROM process_sample_facts
+            WHERE timestamp_id IN (
+                SELECT timestamp_id
+                FROM sample_timestamps
+                WHERE timestamp_utc < $cutoff
+            );
+            """;
+
+        await using var cmd = new SqliteCommand(sql, connection, transaction);
+        cmd.Parameters.AddWithValue("$cutoff", cutoffStr);
+        return await cmd.ExecuteNonQueryAsync();
+    }
+
+    private async Task CleanupOrphanProcessMetadataAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction)
+    {
+        var cleanupSql = new[]
+        {
+            """
+            DELETE FROM process_identities
+            WHERE process_identity_id NOT IN (
+                SELECT DISTINCT process_identity_id FROM process_sample_facts
+            );
+            """,
+            """
+            DELETE FROM service_group_members
+            WHERE service_group_id NOT IN (
+                SELECT DISTINCT service_group_id
+                FROM process_identities
+                WHERE service_group_id IS NOT NULL
+            );
+            """,
+            """
+            DELETE FROM service_groups
+            WHERE service_group_id NOT IN (
+                SELECT DISTINCT service_group_id
+                FROM process_identities
+                WHERE service_group_id IS NOT NULL
+            );
+            """,
+            """
+            DELETE FROM sample_timestamps
+            WHERE timestamp_id NOT IN (
+                SELECT DISTINCT timestamp_id FROM process_sample_facts
+            );
+            """
+        };
+
+        foreach (var sql in cleanupSql)
+        {
+            await using var cmd = new SqliteCommand(sql, connection, transaction);
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        _timestampIdCache.Clear();
+        _serviceGroupIdCache.Clear();
+        _processIdentityIdCache.Clear();
     }
 
     /// <summary>
@@ -1566,12 +2523,20 @@ public class DatabaseManager : IDisposable
                 "battery_cycles",
                 "battery_display_cycles",
                 "system_power_samples",
-                "process_samples",
+                "process_sample_facts",
+                "process_identities",
+                "service_group_members",
+                "service_groups",
+                "sample_timestamps",
                 "gpu_process_samples",
                 "hardware_sensor_samples",
                 "analysis_reports",
                 "source_status",
-                "session_start_markers"
+                "session_start_markers",
+                "metadata",
+                "process_analysis_aggregates",
+                "gpu_analysis_aggregates",
+                "hardware_sensor_aggregates"
             };
 
             foreach (var table in tables)
@@ -1581,6 +2546,9 @@ public class DatabaseManager : IDisposable
             }
 
             await transaction.CommitAsync();
+            _timestampIdCache.Clear();
+            _serviceGroupIdCache.Clear();
+            _processIdentityIdCache.Clear();
         }
         finally
         {
@@ -1599,6 +2567,11 @@ public class DatabaseManager : IDisposable
         // VACUUM cannot run inside a transaction and rewrites the entire DB file —
         // use an ephemeral connection so we don't keep the write connection busy.
         await using var connection = await OpenConnectionAsync();
+        await VacuumCoreAsync(connection);
+    }
+
+    private static async Task VacuumCoreAsync(SqliteConnection connection)
+    {
         await using var cmd = new SqliteCommand("VACUUM;", connection);
         await cmd.ExecuteNonQueryAsync();
     }
@@ -1606,6 +2579,46 @@ public class DatabaseManager : IDisposable
     // ──────────────────────────────────────────────
     //  Helpers
     // ──────────────────────────────────────────────
+
+    private static (string Sql, List<(string Name, string Value)> Parameters) BuildIntervalWhereClause(
+        IReadOnlyList<(DateTime FromUtc, DateTime ToUtc)> intervals,
+        string columnName = "timestamp_utc",
+        string parameterPrefix = "")
+    {
+        var clauses = new List<string>(intervals.Count);
+        var parameters = new List<(string Name, string Value)>(intervals.Count * 2);
+
+        for (var i = 0; i < intervals.Count; i++)
+        {
+            var fromName = $"${parameterPrefix}from{i}";
+            var toName = $"${parameterPrefix}to{i}";
+            clauses.Add($"({columnName} >= {fromName} AND {columnName} <= {toName})");
+            parameters.Add((fromName, SerializeTimestamp(intervals[i].FromUtc)));
+            parameters.Add((toName, SerializeTimestamp(intervals[i].ToUtc)));
+        }
+
+        return (string.Join(" OR ", clauses), parameters);
+    }
+
+    private static IReadOnlyList<string> SplitServiceNames(string? serviceName)
+    {
+        if (string.IsNullOrWhiteSpace(serviceName))
+            return Array.Empty<string>();
+
+        return serviceName
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(s => !string.IsNullOrWhiteSpace(s))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(s => s, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private sealed record ProcessIdentityKey(
+        string ProcessName,
+        string? ExecutablePath,
+        string? CommandLine,
+        int? ParentPid,
+        long? ServiceGroupId);
 
     private static async Task<long> InsertBatteryDisplayCycleInTransactionAsync(
         SqliteConnection connection,

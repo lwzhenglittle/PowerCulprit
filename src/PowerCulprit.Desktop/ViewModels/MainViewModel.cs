@@ -35,7 +35,7 @@ public partial class MainViewModel : ObservableObject
     private bool _suppressCycleSelection;
     private CancellationTokenSource? _refreshCts;
     private CancellationTokenSource? _analysisCts;
-    private CancellationTokenSource? _selectionDebounceCts;
+    private DispatcherQueueTimer? _selectionDebounceTimer;
 
     public MainViewModel(
         IMonitoringService monitor,
@@ -108,9 +108,14 @@ public partial class MainViewModel : ObservableObject
         _ = LoadSelectedCycleAsync(value.Cycle, resetRange: true);
     }
 
-    public ObservableCollection<BatteryDisplayCycleRow> CycleRows { get; } = new();
-    public ObservableCollection<HistoricalProcessRow> ProcessRows { get; } = new();
-    public ObservableCollection<SourceStatusRow> SourceStatusRows { get; } = new();
+    [ObservableProperty]
+    public partial ObservableCollection<BatteryDisplayCycleRow> CycleRows { get; set; } = new();
+
+    [ObservableProperty]
+    public partial ObservableCollection<HistoricalProcessRow> ProcessRows { get; set; } = new();
+
+    [ObservableProperty]
+    public partial ObservableCollection<SourceStatusRow> SourceStatusRows { get; set; } = new();
 
     [ObservableProperty]
     public partial IReadOnlyList<PowerChartSample> ChartSamples { get; set; } = Array.Empty<PowerChartSample>();
@@ -167,7 +172,7 @@ public partial class MainViewModel : ObservableObject
     {
         _refreshCts?.Cancel();
         _analysisCts?.Cancel();
-        _selectionDebounceCts?.Cancel();
+        _selectionDebounceTimer?.Stop();
 
         try
         {
@@ -231,9 +236,12 @@ public partial class MainViewModel : ObservableObject
 
         try
         {
-            IsHistoryLoading = true;
-            ErrorText = "";
-            HistoryStatusText = "Rebuilding battery cycles...";
+            await RunOnUiThreadAsync(() =>
+            {
+                IsHistoryLoading = true;
+                ErrorText = "";
+                HistoryStatusText = "Rebuilding battery cycles...";
+            });
 
             await _database.RebuildBatteryCyclesAsync();
             token.ThrowIfCancellationRequested();
@@ -245,18 +253,21 @@ public partial class MainViewModel : ObservableObject
 
             var cycles = await cyclesTask;
             var statuses = await statusTask;
-            ApplySourceStatuses(statuses);
 
             var targetCycle = preferredCycleId.HasValue
                 ? cycles.FirstOrDefault(c => c.Id == preferredCycleId.Value)
                 : null;
             targetCycle ??= cycles.FirstOrDefault();
 
-            ApplyCycleRows(cycles, targetCycle?.Id);
+            await RunOnUiThreadAsync(() =>
+            {
+                ApplySourceStatuses(statuses);
+                ApplyCycleRows(cycles, targetCycle?.Id);
+            });
 
             if (targetCycle is null)
             {
-                CycleStatusText = "No battery cycles found";
+                await RunOnUiThreadAsync(() => CycleStatusText = "No battery cycles found");
                 await LoadLastSixHoursCoreAsync(resetRange: true, token);
             }
             else
@@ -270,14 +281,17 @@ public partial class MainViewModel : ObservableObject
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to refresh battery cycles");
-            ErrorText = $"Refresh failed: {ex.Message}";
-            HistoryStatusText = "Refresh failed";
+            await RunOnUiThreadAsync(() =>
+            {
+                ErrorText = $"Refresh failed: {ex.Message}";
+                HistoryStatusText = "Refresh failed";
+            });
         }
         finally
         {
             if (ReferenceEquals(_refreshCts, cts))
             {
-                IsHistoryLoading = false;
+                await RunOnUiThreadAsync(() => IsHistoryLoading = false);
                 _refreshCts = null;
             }
             cts.Dispose();
@@ -293,9 +307,12 @@ public partial class MainViewModel : ObservableObject
 
         try
         {
-            IsHistoryLoading = true;
-            ErrorText = "";
-            HistoryStatusText = "Loading last 6 hours...";
+            await RunOnUiThreadAsync(() =>
+            {
+                IsHistoryLoading = true;
+                ErrorText = "";
+                HistoryStatusText = "Loading last 6 hours...";
+            });
 
             await _database.RebuildBatteryCyclesAsync();
             token.ThrowIfCancellationRequested();
@@ -305,8 +322,11 @@ public partial class MainViewModel : ObservableObject
             await Task.WhenAll(cyclesTask, statusTask);
             token.ThrowIfCancellationRequested();
 
-            ApplyCycleRows(await cyclesTask, selectedCycleId: null);
-            ApplySourceStatuses(await statusTask);
+            await RunOnUiThreadAsync(() =>
+            {
+                ApplyCycleRows(cyclesTask.Result, selectedCycleId: null);
+                ApplySourceStatuses(statusTask.Result);
+            });
             await LoadLastSixHoursCoreAsync(resetRange, token);
         }
         catch (OperationCanceledException)
@@ -315,14 +335,17 @@ public partial class MainViewModel : ObservableObject
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to refresh last 6 hours");
-            ErrorText = $"Refresh failed: {ex.Message}";
-            HistoryStatusText = "Refresh failed";
+            await RunOnUiThreadAsync(() =>
+            {
+                ErrorText = $"Refresh failed: {ex.Message}";
+                HistoryStatusText = "Refresh failed";
+            });
         }
         finally
         {
             if (ReferenceEquals(_refreshCts, cts))
             {
-                IsHistoryLoading = false;
+                await RunOnUiThreadAsync(() => IsHistoryLoading = false);
                 _refreshCts = null;
             }
             cts.Dispose();
@@ -338,9 +361,12 @@ public partial class MainViewModel : ObservableObject
 
         try
         {
-            IsHistoryLoading = true;
-            ErrorText = "";
-            HistoryStatusText = "Loading battery cycle...";
+            await RunOnUiThreadAsync(() =>
+            {
+                IsHistoryLoading = true;
+                ErrorText = "";
+                HistoryStatusText = "Loading battery cycle...";
+            });
 
             var statuses = await _database.GetLatestSourceStatusesAsync();
             token.ThrowIfCancellationRequested();
@@ -352,14 +378,17 @@ public partial class MainViewModel : ObservableObject
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to load selected battery cycle");
-            ErrorText = $"Cycle load failed: {ex.Message}";
-            HistoryStatusText = "Cycle load failed";
+            await RunOnUiThreadAsync(() =>
+            {
+                ErrorText = $"Cycle load failed: {ex.Message}";
+                HistoryStatusText = "Cycle load failed";
+            });
         }
         finally
         {
             if (ReferenceEquals(_refreshCts, cts))
             {
-                IsHistoryLoading = false;
+                await RunOnUiThreadAsync(() => IsHistoryLoading = false);
                 _refreshCts = null;
             }
             cts.Dispose();
@@ -387,31 +416,34 @@ public partial class MainViewModel : ObservableObject
         var rawCycles = await rawCyclesTask;
         var loadedStatuses = await statusTask;
 
-        _isCycleMode = true;
-        _selectedDisplayCycle = displayCycle;
-        _selectedCycleSegments = rawCycles;
-        _loadedPowerSamples = powerSamples;
-        _historyFromUtc = fromUtc;
-        _historyToUtc = toUtc;
-
-        ReplaceChartData(powerSamples);
-        UpdateStatusBar(powerSamples.LastOrDefault());
-        ApplySourceStatuses(loadedStatuses);
-
-        if (resetRange || !HasSelectedRange())
+        await RunOnUiThreadAsync(() =>
         {
-            SetSelectedRange(fromUtc, toUtc, updateAxis: true);
-        }
-        else
-        {
-            var clamped = ClampRange(_selectedFromUtc, _selectedToUtc);
-            var changed = clamped.FromUtc != _selectedFromUtc || clamped.ToUtc != _selectedToUtc;
-            SetSelectedRange(clamped.FromUtc, clamped.ToUtc, updateAxis: changed);
-        }
+            _isCycleMode = true;
+            _selectedDisplayCycle = displayCycle;
+            _selectedCycleSegments = rawCycles;
+            _loadedPowerSamples = powerSamples;
+            _historyFromUtc = fromUtc;
+            _historyToUtc = toUtc;
 
-        CycleStatusText = FormatCycleSummary(displayCycle);
-        HistoryStatusText = $"{powerSamples.Count} power samples, {FormatCycleSummary(displayCycle)}";
-        await AnalyzeSelectedRangeAsync();
+            ReplaceChartData(powerSamples);
+            UpdateStatusBar(powerSamples.LastOrDefault());
+            ApplySourceStatuses(loadedStatuses);
+
+            if (resetRange || !HasSelectedRange())
+            {
+                SetSelectedRange(fromUtc, toUtc, updateAxis: true);
+            }
+            else
+            {
+                var clamped = ClampRange(_selectedFromUtc, _selectedToUtc);
+                var changed = clamped.FromUtc != _selectedFromUtc || clamped.ToUtc != _selectedToUtc;
+                SetSelectedRange(clamped.FromUtc, clamped.ToUtc, updateAxis: changed);
+            }
+
+            CycleStatusText = FormatCycleSummary(displayCycle);
+            HistoryStatusText = $"{powerSamples.Count} power samples, {FormatCycleSummary(displayCycle)}; 24h raw + 7d aggregate history";
+        });
+        StartAnalyzeSelectedRangeInBackground();
     }
 
     private async Task LoadLastSixHoursCoreAsync(bool resetRange, CancellationToken token)
@@ -427,49 +459,55 @@ public partial class MainViewModel : ObservableObject
         var powerSamples = await powerTask;
         var statuses = await statusTask;
 
-        _isCycleMode = false;
-        _selectedDisplayCycle = null;
-        _selectedCycleSegments = Array.Empty<BatteryCycle>();
-        _loadedPowerSamples = powerSamples;
-        _historyFromUtc = fromUtc;
-        _historyToUtc = toUtc;
-
-        _suppressCycleSelection = true;
-        try
+        await RunOnUiThreadAsync(() =>
         {
-            SelectedCycleRow = null;
-        }
-        finally
-        {
-            _suppressCycleSelection = false;
-        }
+            _isCycleMode = false;
+            _selectedDisplayCycle = null;
+            _selectedCycleSegments = Array.Empty<BatteryCycle>();
+            _loadedPowerSamples = powerSamples;
+            _historyFromUtc = fromUtc;
+            _historyToUtc = toUtc;
 
-        ReplaceChartData(powerSamples);
-        UpdateStatusBar(powerSamples.LastOrDefault());
-        ApplySourceStatuses(statuses);
+            _suppressCycleSelection = true;
+            try
+            {
+                SelectedCycleRow = null;
+            }
+            finally
+            {
+                _suppressCycleSelection = false;
+            }
 
-        if (resetRange || !HasSelectedRange())
-        {
-            SetSelectedRange(fromUtc, toUtc, updateAxis: true);
-        }
-        else
-        {
-            var clamped = ClampRange(_selectedFromUtc, _selectedToUtc);
-            var changed = clamped.FromUtc != _selectedFromUtc || clamped.ToUtc != _selectedToUtc;
-            SetSelectedRange(clamped.FromUtc, clamped.ToUtc, updateAxis: changed);
-        }
+            ReplaceChartData(powerSamples);
+            UpdateStatusBar(powerSamples.LastOrDefault());
+            ApplySourceStatuses(statuses);
 
-        CycleStatusText = "Last 6 hours";
-        HistoryStatusText = $"{powerSamples.Count} power samples, {FormatRange(_historyFromUtc, _historyToUtc)}";
-        await AnalyzeSelectedRangeAsync();
+            if (resetRange || !HasSelectedRange())
+            {
+                SetSelectedRange(fromUtc, toUtc, updateAxis: true);
+            }
+            else
+            {
+                var clamped = ClampRange(_selectedFromUtc, _selectedToUtc);
+                var changed = clamped.FromUtc != _selectedFromUtc || clamped.ToUtc != _selectedToUtc;
+                SetSelectedRange(clamped.FromUtc, clamped.ToUtc, updateAxis: changed);
+            }
+
+            CycleStatusText = "Last 6 hours";
+            HistoryStatusText = $"{powerSamples.Count} power samples, {FormatRange(_historyFromUtc, _historyToUtc)}; 24h raw + 7d aggregate history";
+        });
+        StartAnalyzeSelectedRangeInBackground();
     }
 
     private async Task AnalyzeSelectedRangeAsync()
     {
         if (!HasSelectedRange())
         {
-            AnalysisStatusText = "No range selected";
-            ProcessRows.Clear();
+            await RunOnUiThreadAsync(() =>
+            {
+                AnalysisStatusText = "No range selected";
+                ProcessRows.Clear();
+            });
             return;
         }
 
@@ -482,49 +520,57 @@ public partial class MainViewModel : ObservableObject
 
         try
         {
-            IsAnalyzing = true;
-            AnalysisStatusText = $"Analyzing {FormatRange(fromUtc, toUtc)}...";
+            await RunOnUiThreadAsync(() =>
+            {
+                IsAnalyzing = true;
+                AnalysisStatusText = $"Analyzing {FormatRange(fromUtc, toUtc)}...";
+            });
+
+            var intervals = GetSelectedAnalysisIntervals(fromUtc, toUtc);
+            if (intervals.Count == 0)
+            {
+                await RunOnUiThreadAsync(() =>
+                {
+                    ProcessRows.Clear();
+                    AnalysisStatusText = "No offline cycle segment in selected range";
+                });
+                return;
+            }
 
             var powerTask = _database.GetSystemPowerSamplesAsync(fromUtc, toUtc);
-            var processTask = _database.GetProcessSamplesForAnalysisAsync(fromUtc, toUtc);
-            var gpuTask = _database.GetGpuProcessSamplesAsync(fromUtc, toUtc);
+            var processTask = _database.GetProcessAggregatesForAnalysisAsync(intervals);
+            var gpuTask = _database.GetGpuProcessAggregatesAsync(intervals);
             await Task.WhenAll(powerTask, processTask, gpuTask);
             token.ThrowIfCancellationRequested();
 
             var powerSamples = await powerTask;
-            var processSamples = await processTask;
-            var gpuSamples = await gpuTask;
-            var intervals = GetSelectedAnalysisIntervals(fromUtc, toUtc);
-            if (intervals.Count == 0)
-            {
-                ProcessRows.Clear();
-                AnalysisStatusText = "No offline cycle segment in selected range";
-                return;
-            }
+            var processAggregates = await processTask;
+            var gpuAggregates = await gpuTask;
 
             powerSamples = FilterByIntervals(powerSamples, s => s.TimestampUtc, intervals)
                 .Where(s => !_isCycleMode || !s.IsAcOnline)
                 .ToList();
-            processSamples = FilterByIntervals(processSamples, s => s.TimestampUtc, intervals);
-            gpuSamples = FilterByIntervals(gpuSamples, s => s.TimestampUtc, intervals);
 
             var windowStart = intervals.Min(i => i.FromUtc);
             var windowEnd = intervals.Max(i => i.ToUtc);
             var window = windowEnd - windowStart;
 
             var results = await Task.Run(
-                () => _analyzer.Analyze(
+                () => _analyzer.AnalyzeAggregates(
                     window,
                     DisplayProcessLimit,
                     powerSamples,
-                    processSamples,
-                    gpuSamples,
-                    ProcessGroupingMode.ProcessName),
+                    processAggregates,
+                    gpuAggregates),
                 token);
             token.ThrowIfCancellationRequested();
 
-            ApplyAnalysisResults(results);
-            AnalysisStatusText = $"{results.Count} processes, {processSamples.Count} process samples, {gpuSamples.Count} GPU samples";
+            var processSampleCount = processAggregates.Sum(a => a.SampleCount);
+            await RunOnUiThreadAsync(() =>
+            {
+                ApplyAnalysisResults(results);
+                AnalysisStatusText = $"{results.Count} processes, {processSampleCount} active/topN process samples aggregated";
+            });
         }
         catch (OperationCanceledException)
         {
@@ -532,18 +578,54 @@ public partial class MainViewModel : ObservableObject
         catch (Exception ex)
         {
             _logger.LogError(ex, "Historical analysis failed");
-            ErrorText = $"Analysis failed: {ex.Message}";
-            AnalysisStatusText = "Analysis failed";
+            await RunOnUiThreadAsync(() =>
+            {
+                ErrorText = $"Analysis failed: {ex.Message}";
+                AnalysisStatusText = "Analysis failed";
+            });
         }
         finally
         {
             if (ReferenceEquals(_analysisCts, cts))
             {
-                IsAnalyzing = false;
+                await RunOnUiThreadAsync(() => IsAnalyzing = false);
                 _analysisCts = null;
             }
             cts.Dispose();
         }
+    }
+
+    private void StartAnalyzeSelectedRangeInBackground()
+    {
+        _ = AnalyzeSelectedRangeAsync();
+    }
+
+    private Task RunOnUiThreadAsync(Action action)
+    {
+        if (_dispatcher.HasThreadAccess)
+        {
+            action();
+            return Task.CompletedTask;
+        }
+
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_dispatcher.TryEnqueue(() =>
+        {
+            try
+            {
+                action();
+                tcs.TrySetResult();
+            }
+            catch (Exception ex)
+            {
+                tcs.TrySetException(ex);
+            }
+        }))
+        {
+            tcs.TrySetException(new InvalidOperationException("Failed to enqueue UI update."));
+        }
+
+        return tcs.Task;
     }
 
     private void OnMonitorRunningChanged(bool running)
@@ -557,27 +639,18 @@ public partial class MainViewModel : ObservableObject
 
     private void ScheduleAnalyzeSelectedRange()
     {
-        _selectionDebounceCts?.Cancel();
-        var cts = new CancellationTokenSource();
-        _selectionDebounceCts = cts;
+        _selectionDebounceTimer ??= CreateSelectionDebounceTimer();
+        _selectionDebounceTimer.Stop();
+        _selectionDebounceTimer.Start();
+    }
 
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await Task.Delay(SelectionDebounce, cts.Token);
-            }
-            catch (OperationCanceledException)
-            {
-                return;
-            }
-
-            _dispatcher.TryEnqueue(() =>
-            {
-                if (!cts.IsCancellationRequested)
-                    _ = AnalyzeSelectedRangeAsync();
-            });
-        });
+    private DispatcherQueueTimer CreateSelectionDebounceTimer()
+    {
+        var timer = _dispatcher.CreateTimer();
+        timer.Interval = SelectionDebounce;
+        timer.IsRepeating = false;
+        timer.Tick += (_, _) => _ = AnalyzeSelectedRangeAsync();
+        return timer;
     }
 
     private void ReplaceChartData(IReadOnlyList<SystemPowerSample> powerSamples)
@@ -629,9 +702,9 @@ public partial class MainViewModel : ObservableObject
         _isCycleMode = false;
 
         ClearChartSeries();
-        CycleRows.Clear();
-        ProcessRows.Clear();
-        SourceStatusRows.Clear();
+        CycleRows = new ObservableCollection<BatteryDisplayCycleRow>();
+        ProcessRows = new ObservableCollection<HistoricalProcessRow>();
+        SourceStatusRows = new ObservableCollection<SourceStatusRow>();
 
         AcStatusText = "--";
         BatteryPercentText = "--";
@@ -741,21 +814,20 @@ public partial class MainViewModel : ObservableObject
 
     private void ApplySourceStatuses(IReadOnlyList<SourceStatus> statuses)
     {
-        SourceStatusRows.Clear();
-        foreach (var ss in statuses)
-        {
-            SourceStatusRows.Add(new SourceStatusRow
+        var rows = new ObservableCollection<SourceStatusRow>(
+            statuses.Select(ss => new SourceStatusRow
             {
                 SourceName = ss.SourceName,
                 Status = ss.Status,
                 Details = ss.Details ?? ""
-            });
-        }
+            }));
+
+        SourceStatusRows = rows;
     }
 
     private void ApplyCycleRows(IReadOnlyList<BatteryDisplayCycle> cycles, long? selectedCycleId)
     {
-        CycleRows.Clear();
+        var rows = new ObservableCollection<BatteryDisplayCycleRow>();
         BatteryDisplayCycleRow? selectedRow = null;
 
         foreach (var cycle in cycles)
@@ -770,7 +842,7 @@ public partial class MainViewModel : ObservableObject
                 ConfidenceText = cycle.Confidence.ToString()
             };
 
-            CycleRows.Add(row);
+            rows.Add(row);
             if (selectedCycleId.HasValue && cycle.Id == selectedCycleId.Value)
                 selectedRow = row;
         }
@@ -778,6 +850,7 @@ public partial class MainViewModel : ObservableObject
         _suppressCycleSelection = true;
         try
         {
+            CycleRows = rows;
             SelectedCycleRow = selectedRow;
         }
         finally
@@ -788,15 +861,13 @@ public partial class MainViewModel : ObservableObject
 
     private void ApplyAnalysisResults(IReadOnlyList<CulpritReportItem> results)
     {
-        ProcessRows.Clear();
-        foreach (var item in results
+        var rows = new ObservableCollection<HistoricalProcessRow>(results
             .OrderByDescending(r => r.Score)
             .ThenByDescending(r => r.AvgCpuPercent ?? 0.0)
             .ThenByDescending(r => r.MaxGpuPercent ?? 0.0)
             .ThenBy(r => r.ProcessName, StringComparer.OrdinalIgnoreCase)
-            .Take(DisplayProcessLimit))
-        {
-            ProcessRows.Add(new HistoricalProcessRow
+            .Take(DisplayProcessLimit)
+            .Select(item => new HistoricalProcessRow
             {
                 Rank = item.Rank,
                 ProcessName = string.IsNullOrEmpty(item.ServiceName)
@@ -815,8 +886,9 @@ public partial class MainViewModel : ObservableObject
                     ? (item.BackgroundActiveSeconds.Value / 60.0).ToString("F1")
                     : "--",
                 ReasonText = item.Reason
-            });
-        }
+            }));
+
+        ProcessRows = rows;
     }
 
     private IReadOnlyList<(DateTime FromUtc, DateTime ToUtc)> GetSelectedAnalysisIntervals(

@@ -3,8 +3,11 @@ namespace PowerCulprit.Core.Services;
 public sealed class SingleInstanceGuard : IDisposable
 {
     public const string MutexName = @"Local\PowerCulprit.SingleInstance";
+    public const string ShowWindowEventName = @"Local\PowerCulprit.ShowWindow";
 
     private Mutex? _mutex;
+    private EventWaitHandle? _showWindowEvent;
+    private RegisteredWaitHandle? _showWindowRegistration;
     private bool _ownsMutex;
 
     public bool TryAcquire()
@@ -43,8 +46,54 @@ public sealed class SingleInstanceGuard : IDisposable
         return !probe.TryAcquire();
     }
 
+    public static bool SignalExistingInstance()
+    {
+        if (!OperatingSystem.IsWindows())
+            return false;
+
+        try
+        {
+            using var showWindowEvent = EventWaitHandle.OpenExisting(ShowWindowEventName);
+            return showWindowEvent.Set();
+        }
+        catch (WaitHandleCannotBeOpenedException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    public void StartShowWindowListener(Action showWindow)
+    {
+        if (!_ownsMutex || _showWindowRegistration is not null)
+            return;
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        _showWindowEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShowWindowEventName);
+        _showWindowRegistration = ThreadPool.RegisterWaitForSingleObject(
+            _showWindowEvent,
+            static (state, timedOut) =>
+            {
+                if (!timedOut && state is Action callback)
+                    callback();
+            },
+            showWindow,
+            Timeout.InfiniteTimeSpan,
+            executeOnlyOnce: false);
+    }
+
     public void Dispose()
     {
+        _showWindowRegistration?.Unregister(null);
+        _showWindowRegistration = null;
+
+        _showWindowEvent?.Dispose();
+        _showWindowEvent = null;
+
         if (_mutex is null)
             return;
 

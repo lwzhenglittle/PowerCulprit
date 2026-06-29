@@ -35,11 +35,17 @@ public class MonitoringService : IMonitoringService
     private DateTime _lastSourceStatusRefresh = DateTime.MinValue;
     private DateTime _lastGpuEngineCollectUtc = DateTime.MinValue;
     private DateTime _lastCleanupUtc = DateTime.MinValue;
+    private DateTime _lastCompactionUtc = DateTime.MinValue;
     private IReadOnlyList<GpuProcessSample> _lastGpuSamples = Array.Empty<GpuProcessSample>();
     private static readonly TimeSpan SourceStatusRefreshInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan GpuEngineCollectInterval = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan CleanupInterval = TimeSpan.FromHours(24);
+    private static readonly TimeSpan CompactionInterval = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan RawRetention = TimeSpan.FromHours(24);
     private const int RetentionDays = 7;
+    private const int PersistedProcessTopN = 50;
+    private const double PersistedProcessCpuThreshold = 0.1;
+    private const double PersistedGpuUtilizationThreshold = 0.1;
 
     public bool IsRunning { get; private set; }
 
@@ -239,6 +245,7 @@ public class MonitoringService : IMonitoringService
             try
             {
                 await CleanupOldDataIfDueAsync(force: false);
+                await CompactRawDataIfDueAsync(force: false);
                 await RunSingleCycleAsync();
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -274,13 +281,46 @@ public class MonitoringService : IMonitoringService
         _lastCleanupUtc = now;
         try
         {
-            var deleted = await _databaseManager.CleanupOldDataAsync(RetentionDays);
+            var deleted = await _databaseManager.CleanupOldDataAsync(RetentionDays, RawRetention);
             if (deleted > 0)
-                _logger.LogInformation("Cleaned up {DeletedRows} rows older than {RetentionDays} days", deleted, RetentionDays);
+                _logger.LogInformation(
+                    "Cleaned up {DeletedRows} rows older than raw retention {RawRetentionHours}h / aggregate retention {RetentionDays}d",
+                    deleted,
+                    RawRetention.TotalHours,
+                    RetentionDays);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Historical data cleanup failed");
+        }
+    }
+
+    private async Task CompactRawDataIfDueAsync(bool force)
+    {
+        if (Environment.GetEnvironmentVariable("POWERCULPRIT_DISABLE_COMPACTION") == "1")
+            return;
+
+        var now = DateTime.UtcNow;
+        if (!force && now - _lastCompactionUtc < CompactionInterval)
+            return;
+
+        _lastCompactionUtc = now;
+        try
+        {
+            var result = await _databaseManager.CompactRawDataAsync(now - RawRetention);
+            if (result.ProcessRowsCompacted > 0 || result.GpuRowsCompacted > 0 || result.HardwareRowsCompacted > 0)
+            {
+                _logger.LogInformation(
+                    "Compacted raw database rows through {CompactedThroughUtc}: process={ProcessRows}, gpu={GpuRows}, hardware={HardwareRows}",
+                    result.CompactedThroughUtc,
+                    result.ProcessRowsCompacted,
+                    result.GpuRowsCompacted,
+                    result.HardwareRowsCompacted);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Historical data compaction failed");
         }
     }
 
@@ -402,8 +442,10 @@ public class MonitoringService : IMonitoringService
             await writeQueue.Writer.WriteAsync(new MonitoringWriteBatch
             {
                 PowerSample = batterySample,
-                ProcessSamples = processSamples,
-                GpuSamples = gpuSamplesAreFresh ? gpuSamples : Array.Empty<GpuProcessSample>(),
+                ProcessSamples = SelectPersistedProcessSamples(processSamples),
+                GpuSamples = gpuSamplesAreFresh
+                    ? SelectPersistedGpuSamples(gpuSamples)
+                    : Array.Empty<GpuProcessSample>(),
                 HardwareSamples = hwSamples,
                 SourceStatuses = sourceStatuses
             });
@@ -427,6 +469,84 @@ public class MonitoringService : IMonitoringService
         };
 
         lock (_lock) { _latestSnapshot = snapshot; }
+    }
+
+    private static IReadOnlyList<ProcessSample> SelectPersistedProcessSamples(IReadOnlyList<ProcessSample> samples)
+    {
+        if (samples.Count == 0)
+            return samples;
+
+        var selected = new HashSet<int>();
+        var results = new List<ProcessSample>(Math.Min(samples.Count, PersistedProcessTopN * 3));
+
+        AddWhere(samples, results, selected, IsAlwaysPersistedProcess);
+        AddTopBy(samples, results, selected, s => s.CpuPercent ?? 0, PersistedProcessTopN);
+        AddTopBy(samples, results, selected, s => s.WorkingSetMb ?? 0, PersistedProcessTopN);
+        AddTopBy(samples, results, selected, s => GetDiskActivity(s) + GetNetworkActivity(s), PersistedProcessTopN);
+
+        return results.Count == samples.Count ? samples : results;
+    }
+
+    private static bool IsAlwaysPersistedProcess(ProcessSample sample)
+    {
+        return sample.IsForegroundProcess
+            || (sample.CpuPercent ?? 0) >= PersistedProcessCpuThreshold
+            || GetDiskActivity(sample) > 0
+            || GetNetworkActivity(sample) > 0
+            || (sample.ProcessStartCount ?? 0) > 0
+            || (sample.ProcessStopCount ?? 0) > 0
+            || (sample.ShortLivedProcessCount ?? 0) > 0
+            || !string.IsNullOrWhiteSpace(sample.ServiceName);
+    }
+
+    private static void AddWhere(
+        IReadOnlyList<ProcessSample> samples,
+        List<ProcessSample> results,
+        HashSet<int> selected,
+        Func<ProcessSample, bool> predicate)
+    {
+        for (var i = 0; i < samples.Count; i++)
+        {
+            if (predicate(samples[i]) && selected.Add(i))
+                results.Add(samples[i]);
+        }
+    }
+
+    private static void AddTopBy(
+        IReadOnlyList<ProcessSample> samples,
+        List<ProcessSample> results,
+        HashSet<int> selected,
+        Func<ProcessSample, double> scoreSelector,
+        int count)
+    {
+        foreach (var item in samples
+            .Select((sample, index) => new { sample, index, score = scoreSelector(sample) })
+            .Where(x => x.score > 0)
+            .OrderByDescending(x => x.score)
+            .Take(count))
+        {
+            if (selected.Add(item.index))
+                results.Add(item.sample);
+        }
+    }
+
+    private static double GetDiskActivity(ProcessSample sample)
+        => Math.Max(0, sample.DiskReadBytesPerSecond ?? 0)
+            + Math.Max(0, sample.DiskWriteBytesPerSecond ?? 0);
+
+    private static double GetNetworkActivity(ProcessSample sample)
+        => Math.Max(0, sample.NetworkReceiveBytesPerSecond ?? 0)
+            + Math.Max(0, sample.NetworkSendBytesPerSecond ?? 0);
+
+    private static IReadOnlyList<GpuProcessSample> SelectPersistedGpuSamples(IReadOnlyList<GpuProcessSample> samples)
+    {
+        if (samples.Count == 0)
+            return samples;
+
+        var results = samples
+            .Where(s => s.UtilizationPercent > PersistedGpuUtilizationThreshold)
+            .ToList();
+        return results.Count == samples.Count ? samples : results;
     }
 
     private IReadOnlyList<SourceStatus> RefreshSourceStatuses(

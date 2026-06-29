@@ -15,6 +15,7 @@ public partial class App : Application
     private ServiceProvider? _serviceProvider;
     private TrayManager? _trayManager;
     private SingleInstanceGuard? _singleInstanceGuard;
+    private bool _isExiting;
 
     public App()
     {
@@ -23,9 +24,13 @@ public partial class App : Application
 
     protected override void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs args)
     {
+        SynchronizationContext.SetSynchronizationContext(
+            new DispatcherQueueSynchronizationContext(DispatcherQueue.GetForCurrentThread()));
+
         _singleInstanceGuard = new SingleInstanceGuard();
         if (!_singleInstanceGuard.TryAcquire())
         {
+            SingleInstanceGuard.SignalExistingInstance();
             _singleInstanceGuard.Dispose();
             _singleInstanceGuard = null;
             Exit();
@@ -35,7 +40,9 @@ public partial class App : Application
         _serviceProvider = BuildServiceProvider();
 
         var mainViewModel = _serviceProvider.GetRequiredService<MainViewModel>();
-        _window = new MainWindow(mainViewModel);
+        var cpuViewModel = _serviceProvider.GetRequiredService<CpuAttributionViewModel>();
+        _window = new MainWindow(mainViewModel, cpuViewModel);
+        _singleInstanceGuard.StartShowWindowListener(ShowWindow);
 
         // Start tray icon
         var monitor = _serviceProvider.GetRequiredService<IMonitoringService>();
@@ -50,9 +57,16 @@ public partial class App : Application
 
         _window.Activate();
 
-        // Begin monitoring immediately; the UI reads historical data from SQLite.
         _ = mainViewModel.StartMonitoringCommand.ExecuteAsync(null);
-        _ = mainViewModel.LatestCommand.ExecuteAsync(null);
+        _ = LoadInitialHistoryAfterFirstFrameAsync(mainViewModel, _window.DispatcherQueue);
+    }
+
+    private static async Task LoadInitialHistoryAfterFirstFrameAsync(
+        MainViewModel viewModel,
+        DispatcherQueue dispatcher)
+    {
+        await Task.Delay(TimeSpan.FromMilliseconds(750));
+        dispatcher.TryEnqueue(() => _ = viewModel.LatestCommand.ExecuteAsync(null));
     }
 
     private void ShowWindow()
@@ -87,28 +101,35 @@ public partial class App : Application
         var dispatcher = _window?.DispatcherQueue;
         if (dispatcher is null)
         {
-            DoExitOnUiThread();
+            _ = DoExitOnUiThreadAsync();
             return;
         }
 
         if (dispatcher.HasThreadAccess)
-            DoExitOnUiThread();
+            _ = DoExitOnUiThreadAsync();
         else
-            dispatcher.TryEnqueue(DoExitOnUiThread);
+            dispatcher.TryEnqueue(() => _ = DoExitOnUiThreadAsync());
     }
 
-    private void DoExitOnUiThread()
+    private async Task DoExitOnUiThreadAsync()
     {
+        if (_isExiting)
+            return;
+        _isExiting = true;
+
+        _trayManager?.Dispose();
+        _trayManager = null;
+
         // Stop monitoring
         try
         {
             var monitor = _serviceProvider?.GetService<IMonitoringService>();
-            monitor?.StopAsync().Wait(TimeSpan.FromSeconds(5));
+            if (monitor is not null)
+                await monitor.StopAsync();
         }
         catch { /* best effort */ }
 
         // Dispose tray BEFORE closing window
-        _trayManager?.Dispose();
         _trayManager = null;
 
         // Dispose DI container — must happen before final window close so
@@ -119,11 +140,12 @@ public partial class App : Application
         _singleInstanceGuard?.Dispose();
         _singleInstanceGuard = null;
 
-        // Actually close the window
-        if (_window is MainWindow mw)
+        if (_window is MainWindow window)
         {
-            mw.CloseForReal();
+            window.CloseForReal();
+            _window = null;
         }
+
     }
 
     private async Task ExportDataAsync()
@@ -196,6 +218,7 @@ public partial class App : Application
         services.AddSingleton<IMonitoringService>(sp => sp.GetRequiredService<MonitoringService>());
 
         services.AddSingleton<MainViewModel>();
+        services.AddSingleton<CpuAttributionViewModel>();
         services.AddSingleton(DispatcherQueue.GetForCurrentThread());
 
         return services.BuildServiceProvider();

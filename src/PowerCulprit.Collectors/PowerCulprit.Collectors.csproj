@@ -12,11 +12,11 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="LibreHardwareMonitorLib" Version="*" />
-    <PackageReference Include="System.Management" Version="*" />
-    <PackageReference Include="System.Diagnostics.PerformanceCounter" Version="*" />
+    <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.7-pre704" />
+    <PackageReference Include="System.Management" Version="10.0.9" />
+    <PackageReference Include="System.Diagnostics.PerformanceCounter" Version="10.0.9" />
     <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="3.2.4" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="*" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.9" />
   </ItemGroup>
 
   <ItemGroup>

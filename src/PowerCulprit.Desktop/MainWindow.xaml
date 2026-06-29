@@ -32,7 +32,22 @@
             </StackPanel>
         </Grid>
 
-        <Frame x:Name="RootFrame"
-               Grid.Row="1" />
+        <NavigationView x:Name="RootNavigationView"
+                        Grid.Row="1"
+                        IsBackButtonVisible="Collapsed"
+                        IsSettingsVisible="False"
+                        PaneDisplayMode="Top"
+                        SelectionChanged="RootNavigationView_SelectionChanged">
+            <NavigationView.MenuItems>
+                <NavigationViewItem Content="Overview"
+                                    Icon="Home"
+                                    Tag="overview" />
+                <NavigationViewItem Content="CPU Attribution"
+                                    Icon="ReportHacked"
+                                    Tag="cpu" />
+            </NavigationView.MenuItems>
+            <Frame x:Name="ContentFrame"
+                   IsNavigationStackEnabled="False" />
+        </NavigationView>
     </Grid>
 </Window>

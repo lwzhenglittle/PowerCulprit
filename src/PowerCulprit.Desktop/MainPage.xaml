@@ -259,7 +259,7 @@
 
                             <ListView Grid.Row="1"
                                       MaxHeight="210"
-                                      ItemsSource="{x:Bind ViewModel.SourceStatusRows}"
+                                      ItemsSource="{x:Bind ViewModel.SourceStatusRows, Mode=OneWay}"
                                       SelectionMode="None">
                                 <ListView.ItemContainerStyle>
                                     <Style TargetType="ListViewItem">
@@ -267,6 +267,7 @@
                                         <Setter Property="Margin" Value="0,0,0,2" />
                                         <Setter Property="MinHeight" Value="0" />
                                         <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                        <Setter Property="Height" Value="54" />
                                     </Style>
                                 </ListView.ItemContainerStyle>
                                 <ListView.ItemTemplate>
@@ -356,7 +357,7 @@
                     </Border>
 
                     <ListView Grid.Row="2"
-                              ItemsSource="{x:Bind ViewModel.ProcessRows}"
+                              ItemsSource="{x:Bind ViewModel.ProcessRows, Mode=OneWay}"
                               SelectionMode="None"
                               ScrollViewer.HorizontalScrollBarVisibility="Auto">
                         <ListView.ItemContainerStyle>
@@ -365,6 +366,7 @@
                                 <Setter Property="Margin" Value="0" />
                                 <Setter Property="MinHeight" Value="0" />
                                 <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                <Setter Property="Height" Value="36" />
                             </Style>
                         </ListView.ItemContainerStyle>
                         <ListView.ItemTemplate>

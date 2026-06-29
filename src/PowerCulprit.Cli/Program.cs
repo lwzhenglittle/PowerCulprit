@@ -304,9 +304,12 @@ internal class Program
             .Owner?.IsWellKnown(System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid) ?? false;
         Console.WriteLine($"Administrator:     {(isAdmin ? "Yes" : "No")}");
 
-        // Paths
+        // Paths and persistence policy
         Console.WriteLine($"Default DB path:   {DatabaseManager.GetDefaultDatabasePath()}");
         Console.WriteLine($"Default log path:  {DatabaseManager.GetDefaultLogPath()}");
+        Console.WriteLine("History policy:    24h raw process/GPU/hardware samples; 7d aggregate history");
+        Console.WriteLine("Process history:   Active + TopN persisted for attribution, not a per-process wattmeter");
+        Console.WriteLine("GPU history:       Non-zero Intel GPU Engine activity persisted when GPU sampling is enabled");
 
         Console.WriteLine();
         Console.WriteLine("Diagnose complete.");
@@ -335,6 +338,7 @@ internal class Program
         Console.WriteLine($"Interval:  {intervalSec}s");
         Console.WriteLine($"GPU Engine sampling: {(enableGpuSampling ? "Enabled" : "Disabled")}");
         Console.WriteLine($"DB path:   {(dbPath ?? DatabaseManager.GetDefaultDatabasePath())}");
+        Console.WriteLine("Storage:   24h raw high-volume samples + 7d aggregate history; process rows use active + TopN persistence.");
         Console.WriteLine("Press Ctrl+C to stop early.");
         Console.WriteLine();
 
