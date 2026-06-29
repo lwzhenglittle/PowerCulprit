@@ -42,7 +42,8 @@ public class DatabaseManager : IDisposable
     private readonly string _connectionString;
     private bool _initialized;
     private const int BusyTimeoutMilliseconds = 5000;
-    private const int CurrentSchemaVersion = 3;
+    private const int CurrentSchemaVersion = 6;
+    private const string WmiActivityLastRecordIdMetadataKey = "wmi_activity_last_event_record_id";
     public static readonly TimeSpan DefaultRawRetention = TimeSpan.FromHours(24);
     public static readonly TimeSpan DefaultAggregationWindow = TimeSpan.FromMinutes(5);
 
@@ -134,9 +135,11 @@ public class DatabaseManager : IDisposable
         await CreateHardwareSensorSamplesTableAsync(connection, transaction);
         await CreateAnalysisReportsTableAsync(connection, transaction);
         await CreateSourceStatusTableAsync(connection, transaction);
+        await CreateWmiActivitySamplesTableAsync(connection, transaction);
         await CreateBatteryCycleTablesAsync(connection, transaction);
         await CreateMetadataTableAsync(connection, transaction);
         await CreateAggregateTablesAsync(connection, transaction);
+        await CreatePowerStateEventsTableAsync(connection, transaction);
 
         await transaction.CommitAsync();
         await SetUserVersionAsync(connection, CurrentSchemaVersion);
@@ -191,7 +194,9 @@ public class DatabaseManager : IDisposable
             DROP TABLE IF EXISTS hardware_sensor_samples;
             DROP TABLE IF EXISTS analysis_reports;
             DROP TABLE IF EXISTS source_status;
+            DROP TABLE IF EXISTS wmi_activity_samples;
             DROP TABLE IF EXISTS session_start_markers;
+            DROP TABLE IF EXISTS power_state_events;
             DROP TABLE IF EXISTS process_analysis_aggregates;
             DROP TABLE IF EXISTS gpu_analysis_aggregates;
             DROP TABLE IF EXISTS hardware_sensor_aggregates;
@@ -582,6 +587,44 @@ public class DatabaseManager : IDisposable
         await using var cmd = new SqliteCommand(sql, connection, transaction);
         await cmd.ExecuteNonQueryAsync();
     }
+    private static async Task CreateWmiActivitySamplesTableAsync(
+        SqliteConnection connection, SqliteTransaction transaction)
+    {
+        const string sql = """
+            CREATE TABLE IF NOT EXISTS wmi_activity_samples (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_utc       TEXT    NOT NULL,
+                event_record_id     INTEGER,
+                client_process_id   INTEGER NOT NULL,
+                event_id            INTEGER NOT NULL,
+                user                TEXT,
+                operation           TEXT,
+                namespace_name      TEXT,
+                query_text          TEXT,
+                result_code         TEXT,
+                possible_cause      TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_wmi_activity_ts
+                ON wmi_activity_samples(timestamp_utc);
+            CREATE INDEX IF NOT EXISTS idx_wmi_activity_pid
+                ON wmi_activity_samples(client_process_id);
+            """;
+
+        await using var cmd = new SqliteCommand(sql, connection, transaction);
+        await cmd.ExecuteNonQueryAsync();
+        await AddColumnIfMissingAsync(connection, transaction, "wmi_activity_samples", "event_record_id", "INTEGER");
+
+        await using var indexCmd = new SqliteCommand(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_wmi_activity_event_record
+                ON wmi_activity_samples(event_record_id)
+                WHERE event_record_id IS NOT NULL;
+            """,
+            connection,
+            transaction);
+        await indexCmd.ExecuteNonQueryAsync();
+    }
+
     private static async Task CreateBatteryCycleTablesAsync(
         SqliteConnection connection, SqliteTransaction transaction)
     {
@@ -640,6 +683,28 @@ public class DatabaseManager : IDisposable
             "battery_cycles",
             "started_at_session_boundary",
             "INTEGER NOT NULL DEFAULT 0");
+    }
+
+    private static async Task CreatePowerStateEventsTableAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction)
+    {
+        const string sql = """
+            CREATE TABLE IF NOT EXISTS power_state_events (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_utc TEXT    NOT NULL,
+                kind          TEXT    NOT NULL,
+                source        TEXT    NOT NULL,
+                details       TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_power_state_events_ts
+                ON power_state_events(timestamp_utc);
+            CREATE INDEX IF NOT EXISTS idx_power_state_events_kind
+                ON power_state_events(kind);
+            """;
+
+        await using var cmd = new SqliteCommand(sql, connection, transaction);
+        await cmd.ExecuteNonQueryAsync();
     }
 
     /// <summary>
@@ -826,6 +891,108 @@ public class DatabaseManager : IDisposable
         }
     }
 
+    public async Task InsertWmiActivitySamplesAsync(IReadOnlyList<WmiActivitySample> samples)
+    {
+        if (samples.Count == 0) return;
+
+        await EnsureInitializedAsync();
+
+        await _writeLock.WaitAsync();
+        try
+        {
+            var connection = await GetOrOpenWriteConnectionAsync();
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync();
+
+            await InsertWmiActivitySamplesInTransactionAsync(connection, transaction, samples);
+
+            await transaction.CommitAsync();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    private static async Task InsertWmiActivitySamplesInTransactionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        IReadOnlyList<WmiActivitySample> samples)
+    {
+        const string sql = """
+            INSERT OR IGNORE INTO wmi_activity_samples
+                (timestamp_utc, event_record_id, client_process_id, event_id, user, operation,
+                 namespace_name, query_text, result_code, possible_cause)
+            VALUES
+                ($ts, $rid, $pid, $eid, $user, $op, $ns, $query, $result, $cause);
+            """;
+
+        await using var cmd = new SqliteCommand(sql, connection, transaction);
+        var p_ts = cmd.Parameters.Add("$ts", SqliteType.Text);
+        var p_rid = cmd.Parameters.Add("$rid", SqliteType.Integer);
+        var p_pid = cmd.Parameters.Add("$pid", SqliteType.Integer);
+        var p_eid = cmd.Parameters.Add("$eid", SqliteType.Integer);
+        var p_user = cmd.Parameters.Add("$user", SqliteType.Text);
+        var p_op = cmd.Parameters.Add("$op", SqliteType.Text);
+        var p_ns = cmd.Parameters.Add("$ns", SqliteType.Text);
+        var p_query = cmd.Parameters.Add("$query", SqliteType.Text);
+        var p_result = cmd.Parameters.Add("$result", SqliteType.Text);
+        var p_cause = cmd.Parameters.Add("$cause", SqliteType.Text);
+
+        foreach (var sample in samples)
+        {
+            p_ts.Value = SerializeTimestamp(sample.TimestampUtc);
+            p_rid.Value = (object?)sample.EventRecordId ?? DBNull.Value;
+            p_pid.Value = sample.ClientProcessId;
+            p_eid.Value = sample.EventId;
+            p_user.Value = (object?)sample.User ?? DBNull.Value;
+            p_op.Value = (object?)sample.Operation ?? DBNull.Value;
+            p_ns.Value = (object?)sample.NamespaceName ?? DBNull.Value;
+            p_query.Value = (object?)sample.QueryText ?? DBNull.Value;
+            p_result.Value = (object?)sample.ResultCode ?? DBNull.Value;
+            p_cause.Value = (object?)sample.PossibleCause ?? DBNull.Value;
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        var maxRecordId = samples
+            .Where(s => s.EventRecordId.HasValue)
+            .Select(s => s.EventRecordId!.Value)
+            .DefaultIfEmpty(0)
+            .Max();
+        if (maxRecordId > 0)
+        {
+            await SetMetadataAsync(
+                connection,
+                transaction,
+                WmiActivityLastRecordIdMetadataKey,
+                maxRecordId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        }
+    }
+
+    public async Task<long?> GetLatestWmiActivityEventRecordIdAsync()
+    {
+        await EnsureInitializedAsync();
+
+        await using var connection = await OpenConnectionAsync();
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync();
+        var metadataRecordId = await GetMetadataLongAsync(connection, transaction, WmiActivityLastRecordIdMetadataKey);
+
+        const string sql = """
+            SELECT MAX(event_record_id)
+            FROM wmi_activity_samples
+            WHERE event_record_id IS NOT NULL;
+            """;
+        await using var cmd = new SqliteCommand(sql, connection, transaction);
+        var result = await cmd.ExecuteScalarAsync();
+        long? sampleRecordId = result is null or DBNull
+            ? null
+            : Convert.ToInt64(result);
+        await transaction.CommitAsync();
+
+        if (metadataRecordId.HasValue && sampleRecordId.HasValue)
+            return Math.Max(metadataRecordId.Value, sampleRecordId.Value);
+        return metadataRecordId ?? sampleRecordId;
+    }
+
     /// <summary>
     /// Inserts a single SourceStatus record.
     /// Only the latest status per source is typically needed, but all are retained for history.
@@ -873,13 +1040,17 @@ public class DatabaseManager : IDisposable
         IReadOnlyList<ProcessSample> processSamples,
         IReadOnlyList<GpuProcessSample> gpuSamples,
         IReadOnlyList<HardwareSensorSample> hardwareSamples,
-        IReadOnlyList<SourceStatus> sourceStatuses)
+        IReadOnlyList<SourceStatus> sourceStatuses,
+        IReadOnlyList<WmiActivitySample>? wmiActivitySamples = null)
     {
+        wmiActivitySamples ??= Array.Empty<WmiActivitySample>();
+
         if (powerSample is null &&
             processSamples.Count == 0 &&
             gpuSamples.Count == 0 &&
             hardwareSamples.Count == 0 &&
-            sourceStatuses.Count == 0)
+            sourceStatuses.Count == 0 &&
+            wmiActivitySamples.Count == 0)
         {
             return;
         }
@@ -906,6 +1077,9 @@ public class DatabaseManager : IDisposable
 
             if (sourceStatuses.Count > 0)
                 await InsertSourceStatusesInTransactionAsync(connection, transaction, sourceStatuses);
+
+            if (wmiActivitySamples.Count > 0)
+                await InsertWmiActivitySamplesInTransactionAsync(connection, transaction, wmiActivitySamples);
 
             await transaction.CommitAsync();
         }
@@ -1656,6 +1830,102 @@ public class DatabaseManager : IDisposable
         return results;
     }
 
+    public async Task<IReadOnlyList<WmiCallerAggregate>> GetWmiCallerAggregatesAsync(
+        DateTime fromUtc, DateTime toUtc, int limit = 100)
+    {
+        await EnsureInitializedAsync();
+        if (limit <= 0)
+            return Array.Empty<WmiCallerAggregate>();
+
+        await using var connection = await OpenConnectionAsync();
+
+        const string sql = """
+            WITH wmi AS (
+                SELECT id, timestamp_utc, client_process_id, operation, result_code, possible_cause
+                FROM wmi_activity_samples
+                WHERE timestamp_utc >= $from AND timestamp_utc <= $to
+            ),
+            process_names AS (
+                SELECT f.pid,
+                       i.process_name,
+                       i.executable_path,
+                       COUNT(*) AS sample_count,
+                       MAX(t.timestamp_utc) AS latest_seen
+                FROM process_sample_facts f
+                JOIN sample_timestamps t ON t.timestamp_id = f.timestamp_id
+                JOIN process_identities i ON i.process_identity_id = f.process_identity_id
+                WHERE t.timestamp_utc >= $from AND t.timestamp_utc <= $to
+                GROUP BY f.pid, i.process_name, i.executable_path
+            ),
+            ranked_names AS (
+                SELECT pid,
+                       process_name,
+                       executable_path,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY pid
+                           ORDER BY sample_count DESC, latest_seen DESC
+                       ) AS rn
+                FROM process_names
+            ),
+            last_events AS (
+                SELECT w.*
+                FROM wmi w
+                WHERE w.id = (
+                    SELECT w2.id
+                    FROM wmi w2
+                    WHERE w2.client_process_id = w.client_process_id
+                    ORDER BY w2.timestamp_utc DESC, w2.id DESC
+                    LIMIT 1
+                )
+            )
+            SELECT w.client_process_id,
+                   rn.process_name,
+                   rn.executable_path,
+                   COUNT(*) AS call_count,
+                   SUM(CASE WHEN w.result_code IS NOT NULL AND w.result_code NOT IN ('0x0', '0') THEN 1 ELSE 0 END) AS failure_count,
+                   COUNT(DISTINCT COALESCE(w.operation, '')) AS unique_operation_count,
+                   MIN(w.timestamp_utc) AS first_seen_utc,
+                   MAX(w.timestamp_utc) AS last_seen_utc,
+                   le.operation AS last_operation,
+                   le.result_code AS last_result_code,
+                   le.possible_cause AS last_possible_cause
+            FROM wmi w
+            LEFT JOIN ranked_names rn ON rn.pid = w.client_process_id AND rn.rn = 1
+            LEFT JOIN last_events le ON le.client_process_id = w.client_process_id
+            GROUP BY w.client_process_id, rn.process_name, rn.executable_path,
+                     le.operation, le.result_code, le.possible_cause
+            ORDER BY call_count DESC, failure_count DESC, last_seen_utc DESC
+            LIMIT $limit;
+            """;
+
+        await using var cmd = new SqliteCommand(sql, connection);
+        cmd.Parameters.AddWithValue("$from", SerializeTimestamp(fromUtc));
+        cmd.Parameters.AddWithValue("$to", SerializeTimestamp(toUtc));
+        cmd.Parameters.AddWithValue("$limit", limit);
+
+        var results = new List<WmiCallerAggregate>();
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            results.Add(new WmiCallerAggregate
+            {
+                ClientProcessId = reader.GetInt32(0),
+                ProcessName = reader.IsDBNull(1) ? null : reader.GetString(1),
+                ExecutablePath = reader.IsDBNull(2) ? null : reader.GetString(2),
+                CallCount = Convert.ToInt32(reader.GetInt64(3)),
+                FailureCount = Convert.ToInt32(reader.GetInt64(4)),
+                UniqueOperationCount = Convert.ToInt32(reader.GetInt64(5)),
+                FirstSeenUtc = DeserializeTimestamp(reader.GetString(6)),
+                LastSeenUtc = DeserializeTimestamp(reader.GetString(7)),
+                LastOperation = reader.IsDBNull(8) ? null : reader.GetString(8),
+                LastResultCode = reader.IsDBNull(9) ? null : reader.GetString(9),
+                LastPossibleCause = reader.IsDBNull(10) ? null : reader.GetString(10)
+            });
+        }
+
+        return results;
+    }
+
     /// <summary>
     /// Returns SQL-side GPU Engine aggregates for the historical analyzer.
     /// </summary>
@@ -1869,6 +2139,75 @@ public class DatabaseManager : IDisposable
         }
     }
 
+    /// <summary>
+    /// Inserts a single power state event (suspend/resume).
+    /// Designed for direct synchronous calls so suspend events can be
+    /// flushed before the system actually sleeps.
+    /// </summary>
+    public async Task InsertPowerStateEventAsync(PowerStateEvent evt)
+    {
+        await EnsureInitializedAsync();
+
+        await _writeLock.WaitAsync();
+        try
+        {
+            var connection = await GetOrOpenWriteConnectionAsync();
+            const string sql = """
+                INSERT INTO power_state_events (timestamp_utc, kind, source, details)
+                VALUES ($ts, $kind, $src, $details);
+                """;
+
+            await using var cmd = new SqliteCommand(sql, connection);
+            cmd.Parameters.AddWithValue("$ts", SerializeTimestamp(evt.TimestampUtc));
+            cmd.Parameters.AddWithValue("$kind", evt.Kind.ToString());
+            cmd.Parameters.AddWithValue("$src", evt.Source);
+            cmd.Parameters.AddWithValue("$details", (object?)evt.Details ?? DBNull.Value);
+            await cmd.ExecuteNonQueryAsync();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Returns power state events in the given time range, ordered by time.
+    /// </summary>
+    public async Task<IReadOnlyList<PowerStateEvent>> GetPowerStateEventsAsync(
+        DateTime fromUtc,
+        DateTime toUtc)
+    {
+        await EnsureInitializedAsync();
+
+        await using var connection = await OpenConnectionAsync();
+        const string sql = """
+            SELECT id, timestamp_utc, kind, source, details
+            FROM power_state_events
+            WHERE timestamp_utc >= $from AND timestamp_utc <= $to
+            ORDER BY timestamp_utc;
+            """;
+
+        await using var cmd = new SqliteCommand(sql, connection);
+        cmd.Parameters.AddWithValue("$from", SerializeTimestamp(fromUtc));
+        cmd.Parameters.AddWithValue("$to", SerializeTimestamp(toUtc));
+
+        var results = new List<PowerStateEvent>();
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            results.Add(new PowerStateEvent
+            {
+                Id = reader.GetInt64(0),
+                TimestampUtc = DeserializeTimestamp(reader.GetString(1)),
+                Kind = Enum.Parse<PowerStateEventKind>(reader.GetString(2)),
+                Source = reader.GetString(3),
+                Details = reader.IsDBNull(4) ? null : reader.GetString(4)
+            });
+        }
+
+        return results;
+    }
+
     public async Task<IReadOnlyList<DateTime>> GetSessionStartMarkersAsync(DateTime fromUtc, DateTime toUtc)
     {
         await EnsureInitializedAsync();
@@ -1904,7 +2243,9 @@ public class DatabaseManager : IDisposable
         var fromUtc = toUtc.AddDays(-retentionDays);
         var powerSamples = await GetSystemPowerSamplesAsync(fromUtc, toUtc);
         var sessionStarts = await GetSessionStartMarkersAsync(fromUtc, toUtc);
-        var result = BatteryCycleBuilder.Build(powerSamples, sessionStarts);
+        var powerEvents = await GetPowerStateEventsAsync(fromUtc, toUtc);
+        var sleepIntervals = GapDetector.DetectSleepOnly(powerEvents);
+        var result = BatteryCycleBuilder.Build(powerSamples, sessionStarts, sleepIntervals);
 
         await _writeLock.WaitAsync();
         try
@@ -2070,6 +2411,20 @@ public class DatabaseManager : IDisposable
         cmd.Parameters.AddWithValue("$key", key);
         var value = await cmd.ExecuteScalarAsync();
         return value is string text ? DeserializeTimestamp(text) : null;
+    }
+
+    private static async Task<long?> GetMetadataLongAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string key)
+    {
+        await using var cmd = new SqliteCommand("SELECT value FROM metadata WHERE key = $key;", connection, transaction);
+        cmd.Parameters.AddWithValue("$key", key);
+        var value = await cmd.ExecuteScalarAsync();
+        return value is string text &&
+               long.TryParse(text, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : null;
     }
 
     private static async Task SetMetadataAsync(
@@ -2373,7 +2728,7 @@ public class DatabaseManager : IDisposable
                 totalDeleted += await cmd.ExecuteNonQueryAsync();
             }
 
-            foreach (var table in new[] { "gpu_process_samples", "hardware_sensor_samples" })
+            foreach (var table in new[] { "gpu_process_samples", "hardware_sensor_samples", "wmi_activity_samples" })
             {
                 var sql = $"DELETE FROM {table} WHERE timestamp_utc < $cutoff;";
                 await using var cmd = new SqliteCommand(sql, connection, transaction);
@@ -2386,7 +2741,8 @@ public class DatabaseManager : IDisposable
                 "system_power_samples",
                 "analysis_reports",
                 "source_status",
-                "session_start_markers"
+                "session_start_markers",
+                "power_state_events"
             })
             {
                 var sql = $"DELETE FROM {table} WHERE timestamp_utc < $cutoff;";
@@ -2532,7 +2888,9 @@ public class DatabaseManager : IDisposable
                 "hardware_sensor_samples",
                 "analysis_reports",
                 "source_status",
+                "wmi_activity_samples",
                 "session_start_markers",
+                "power_state_events",
                 "metadata",
                 "process_analysis_aggregates",
                 "gpu_analysis_aggregates",
@@ -2543,6 +2901,15 @@ public class DatabaseManager : IDisposable
             {
                 await using var cmd = new SqliteCommand($"DELETE FROM {table};", connection, transaction);
                 totalDeleted += await cmd.ExecuteNonQueryAsync();
+            }
+
+            await using (var cmd = new SqliteCommand(
+                "INSERT INTO session_start_markers (timestamp_utc) VALUES ($ts);",
+                connection,
+                transaction))
+            {
+                cmd.Parameters.AddWithValue("$ts", SerializeTimestamp(DateTime.UtcNow));
+                await cmd.ExecuteNonQueryAsync();
             }
 
             await transaction.CommitAsync();

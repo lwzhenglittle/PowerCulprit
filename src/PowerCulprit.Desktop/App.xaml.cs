@@ -14,6 +14,7 @@ public partial class App : Application
     private Window? _window;
     private ServiceProvider? _serviceProvider;
     private TrayManager? _trayManager;
+    private PowerStateMonitor? _powerStateMonitor;
     private SingleInstanceGuard? _singleInstanceGuard;
     private bool _isExiting;
 
@@ -41,7 +42,8 @@ public partial class App : Application
 
         var mainViewModel = _serviceProvider.GetRequiredService<MainViewModel>();
         var cpuViewModel = _serviceProvider.GetRequiredService<CpuAttributionViewModel>();
-        _window = new MainWindow(mainViewModel, cpuViewModel);
+        var wmiViewModel = _serviceProvider.GetRequiredService<WmiAttributionViewModel>();
+        _window = new MainWindow(mainViewModel, cpuViewModel, wmiViewModel);
         _singleInstanceGuard.StartShowWindowListener(ShowWindow);
 
         // Start tray icon
@@ -54,6 +56,22 @@ public partial class App : Application
             ExitApplication);
         _trayManager.OnExportRequested += () => _ = ExportDataAsync();
         _trayManager.Start();
+
+        // Attach power state monitor to receive suspend/resume notifications
+        try
+        {
+            var psLogger = _serviceProvider.GetRequiredService<ILogger<PowerStateMonitor>>();
+            _powerStateMonitor = new PowerStateMonitor(
+                (Window)_window,
+                monitor,
+                psLogger);
+        }
+        catch (Exception ex)
+        {
+            var fallbackLogger = _serviceProvider.GetService<ILogger<App>>();
+            fallbackLogger?.LogWarning(ex,
+                "PowerStateMonitor failed to initialize — sleep/hibernate detection disabled");
+        }
 
         _window.Activate();
 
@@ -119,6 +137,10 @@ public partial class App : Application
 
         _trayManager?.Dispose();
         _trayManager = null;
+
+        // Detach power state monitor before stopping monitoring
+        _powerStateMonitor?.Dispose();
+        _powerStateMonitor = null;
 
         // Stop monitoring
         try
@@ -213,12 +235,15 @@ public partial class App : Application
         services.AddSingleton<IntelGpuPowerCollector>();
         services.AddSingleton<WindowsEtwActivityCollector>();
         services.AddSingleton<IWindowsEtwActivityCollector>(sp => sp.GetRequiredService<WindowsEtwActivityCollector>());
+        services.AddSingleton<WmiActivityCollector>();
+        services.AddSingleton<IWmiActivityCollector>(sp => sp.GetRequiredService<WmiActivityCollector>());
 
         services.AddSingleton<MonitoringService>();
         services.AddSingleton<IMonitoringService>(sp => sp.GetRequiredService<MonitoringService>());
 
         services.AddSingleton<MainViewModel>();
         services.AddSingleton<CpuAttributionViewModel>();
+        services.AddSingleton<WmiAttributionViewModel>();
         services.AddSingleton(DispatcherQueue.GetForCurrentThread());
 
         return services.BuildServiceProvider();

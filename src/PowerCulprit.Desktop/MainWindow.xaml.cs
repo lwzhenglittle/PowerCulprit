@@ -11,9 +11,10 @@ public sealed partial class MainWindow : Window
 {
     private readonly MainViewModel _viewModel;
     private readonly CpuAttributionViewModel _cpuViewModel;
+    private readonly WmiAttributionViewModel _wmiViewModel;
     private bool _reallyClosing;
 
-    public MainWindow(MainViewModel viewModel, CpuAttributionViewModel cpuViewModel)
+    public MainWindow(MainViewModel viewModel, CpuAttributionViewModel cpuViewModel, WmiAttributionViewModel wmiViewModel)
     {
         InitializeComponent();
         ConfigureTitleBar();
@@ -21,6 +22,7 @@ public sealed partial class MainWindow : Window
 
         _viewModel = viewModel;
         _cpuViewModel = cpuViewModel;
+        _wmiViewModel = wmiViewModel;
 
         RootNavigationView.SelectedItem = RootNavigationView.MenuItems[0];
         ContentFrame.Navigate(typeof(MainPage), viewModel);
@@ -41,6 +43,10 @@ public sealed partial class MainWindow : Window
             case "cpu":
                 if (ContentFrame.CurrentSourcePageType != typeof(CpuAttributionPage))
                     ContentFrame.Navigate(typeof(CpuAttributionPage), _cpuViewModel);
+                break;
+            case "wmi":
+                if (ContentFrame.CurrentSourcePageType != typeof(WmiAttributionPage))
+                    ContentFrame.Navigate(typeof(WmiAttributionPage), _wmiViewModel);
                 break;
             default:
                 if (ContentFrame.CurrentSourcePageType != typeof(MainPage))

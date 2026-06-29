@@ -84,6 +84,49 @@ public class CpuTimelineBuilderTests
         Assert.Contains("CPU package power is unavailable", result.Summary);
     }
 
+    [Fact]
+    public void Build_GapLargerThanMaxSampleGap_DoesNotExtrapolateEnergy()
+    {
+        // Two samples 2 hours apart — an unobserved gap (sleep / hibernate).
+        // A bogus 0.5 W boundary sample (as the capacity-delta estimate would
+        // produce) must NOT be integrated across the gap.
+        var power = new[]
+        {
+            PowerSample(_baseTime, 10),
+            PowerSample(_baseTime.AddHours(2), 0.5)
+        };
+
+        var result = CpuTimelineBuilder.Build(power, Array.Empty<HardwareSensorSample>());
+
+        var last = result[^1];
+        // Pre-fix this extrapolated (10 + 0.5) / 2 W × 2 h ≈ 10.5 Wh.
+        Assert.Null(last.CumulativeEnergyWh);
+    }
+
+    [Fact]
+    public void Build_SleepBetweenContiguousRuns_OnlyAwakePortionsAccumulate()
+    {
+        // A pre-sleep run at 10 W, an 8 h sleep (bogus 0.5 W boundary sample),
+        // then a post-resume run back at 10 W.
+        var power = new[]
+        {
+            PowerSample(_baseTime, 10),
+            PowerSample(_baseTime.AddSeconds(1), 10),
+            PowerSample(_baseTime.AddHours(8), 0.5),
+            PowerSample(_baseTime.AddHours(8).AddSeconds(1), 10)
+        };
+
+        var result = CpuTimelineBuilder.Build(power, Array.Empty<HardwareSensorSample>());
+
+        // sample1 (end of first awake run): (10 + 10) / 2 W sustained for 1 s.
+        Assert.Equal(10.0 / 3600.0, result[1].CumulativeEnergyWh!.Value, 4);
+        // sample2 (first post-gap point): unchanged — the 8 h gap is skipped,
+        // boundary wattage is NOT extrapolated across it.
+        Assert.Equal(result[1].CumulativeEnergyWh, result[2].CumulativeEnergyWh);
+        // sample3: adds one more 1 s awake segment (~0.0015 Wh).
+        Assert.InRange(result[3].CumulativeEnergyWh!.Value, 0.004, 0.005);
+    }
+
     private HardwareSensorSample Sensor(string name, string metric, double value, string unit)
         => new()
         {
@@ -94,5 +137,13 @@ public class CpuTimelineBuilderTests
             MetricName = metric,
             Value = value,
             Unit = unit
+        };
+
+    private static SystemPowerSample PowerSample(DateTime ts, double dischargeWatts)
+        => new()
+        {
+            TimestampUtc = ts,
+            IsAcOnline = false,
+            ChargeRateMilliwatts = -dischargeWatts * 1000.0
         };
 }

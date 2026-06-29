@@ -93,6 +93,9 @@ public partial class MainViewModel : ObservableObject
     public partial bool IsAnalyzing { get; set; }
 
     [ObservableProperty]
+    public partial string ExcludedIntervalsSummary { get; set; } = "";
+
+    [ObservableProperty]
     public partial BatteryDisplayCycleRow? SelectedCycleRow { get; set; }
 
     partial void OnIsGpuSamplingEnabledChanged(bool value)
@@ -526,8 +529,8 @@ public partial class MainViewModel : ObservableObject
                 AnalysisStatusText = $"Analyzing {FormatRange(fromUtc, toUtc)}...";
             });
 
-            var intervals = GetSelectedAnalysisIntervals(fromUtc, toUtc);
-            if (intervals.Count == 0)
+            var rawIntervals = GetSelectedAnalysisIntervals(fromUtc, toUtc);
+            if (rawIntervals.Count == 0)
             {
                 await RunOnUiThreadAsync(() =>
                 {
@@ -537,22 +540,63 @@ public partial class MainViewModel : ObservableObject
                 return;
             }
 
+            // Fetch power state events and power samples to detect sleep/gap
+            // intervals that should be excluded from process attribution.
             var powerTask = _database.GetSystemPowerSamplesAsync(fromUtc, toUtc);
-            var processTask = _database.GetProcessAggregatesForAnalysisAsync(intervals);
-            var gpuTask = _database.GetGpuProcessAggregatesAsync(intervals);
-            await Task.WhenAll(powerTask, processTask, gpuTask);
+            var eventsTask = _monitor.GetPowerStateEventsAsync(fromUtc, toUtc);
+            var processTask = _database.GetProcessAggregatesForAnalysisAsync(rawIntervals);
+            var gpuTask = _database.GetGpuProcessAggregatesAsync(rawIntervals);
+            await Task.WhenAll(powerTask, eventsTask, processTask, gpuTask);
             token.ThrowIfCancellationRequested();
 
             var powerSamples = await powerTask;
+            var powerEvents = await eventsTask;
             var processAggregates = await processTask;
             var gpuAggregates = await gpuTask;
 
-            powerSamples = FilterByIntervals(powerSamples, s => s.TimestampUtc, intervals)
+            // Detect unobserved gaps and subtract them from analysis intervals.
+            var gapIntervals = GapDetector.Detect(powerEvents, powerSamples, fromUtc, toUtc);
+            var awakeIntervals = IntervalSubtractor.Exclude(rawIntervals,
+                gapIntervals.Select(g => (g.StartUtc, g.EndUtc)).ToList());
+
+            if (awakeIntervals.Count == 0)
+            {
+                var sleepDuration = gapIntervals
+                    .Where(g => g.Kind == GapKind.ConfirmedSleep)
+                    .Aggregate(TimeSpan.Zero, (sum, g) => sum + (g.EndUtc - g.StartUtc));
+                var unknownDuration = gapIntervals
+                    .Where(g => g.Kind == GapKind.UnknownGap)
+                    .Aggregate(TimeSpan.Zero, (sum, g) => sum + (g.EndUtc - g.StartUtc));
+
+                await RunOnUiThreadAsync(() =>
+                {
+                    ProcessRows.Clear();
+                    var parts = new List<string>();
+                    if (sleepDuration > TimeSpan.Zero)
+                        parts.Add($"sleep/hibernate ({FormatDuration(sleepDuration)})");
+                    if (unknownDuration > TimeSpan.Zero)
+                        parts.Add($"unknown gaps ({FormatDuration(unknownDuration)})");
+                    var reason = parts.Count > 0 ? string.Join(", ", parts) : "no awake samples";
+                    AnalysisStatusText = $"No awake intervals in selected range — {reason} excluded from attribution";
+                    ExcludedIntervalsSummary = BuildExcludedSummary(gapIntervals);
+                });
+                return;
+            }
+
+            // Build excluded-interval summary for the UI.
+            var excludedSummary = BuildExcludedSummary(gapIntervals);
+
+            // Limit power samples and aggregates to awake intervals only.
+            powerSamples = FilterByIntervals(powerSamples, s => s.TimestampUtc, awakeIntervals)
                 .Where(s => !_isCycleMode || !s.IsAcOnline)
                 .ToList();
 
-            var windowStart = intervals.Min(i => i.FromUtc);
-            var windowEnd = intervals.Max(i => i.ToUtc);
+            // Re-query aggregates narrowed to awake intervals.
+            processAggregates = await _database.GetProcessAggregatesForAnalysisAsync(awakeIntervals);
+            gpuAggregates = await _database.GetGpuProcessAggregatesAsync(awakeIntervals);
+
+            var windowStart = awakeIntervals.Min(i => i.FromUtc);
+            var windowEnd = awakeIntervals.Max(i => i.ToUtc);
             var window = windowEnd - windowStart;
 
             var results = await Task.Run(
@@ -569,7 +613,11 @@ public partial class MainViewModel : ObservableObject
             await RunOnUiThreadAsync(() =>
             {
                 ApplyAnalysisResults(results);
-                AnalysisStatusText = $"{results.Count} processes, {processSampleCount} active/topN process samples aggregated";
+                ExcludedIntervalsSummary = excludedSummary;
+                var excludedNote = gapIntervals.Count > 0
+                    ? $"; {gapIntervals.Count(g => g.Kind == GapKind.ConfirmedSleep)} sleep, {gapIntervals.Count(g => g.Kind == GapKind.UnknownGap)} unknown gaps excluded"
+                    : "";
+                AnalysisStatusText = $"{results.Count} processes, {processSampleCount} active/topN process samples aggregated{excludedNote}";
             });
         }
         catch (OperationCanceledException)
@@ -785,32 +833,7 @@ public partial class MainViewModel : ObservableObject
     }
 
     private static double? CalculateEnergyUsedWh(IReadOnlyList<SystemPowerSample> samples)
-    {
-        if (samples.Count < 2)
-            return null;
-
-        double totalWh = 0;
-        var hasPower = false;
-        for (var i = 1; i < samples.Count; i++)
-        {
-            var previous = samples[i - 1];
-            var current = samples[i];
-            var elapsedHours = (current.TimestampUtc - previous.TimestampUtc).TotalHours;
-            if (elapsedHours <= 0)
-                continue;
-
-            var previousWatts = GetDischargeWatts(previous);
-            var currentWatts = GetDischargeWatts(current);
-            if (!previousWatts.HasValue && !currentWatts.HasValue)
-                continue;
-
-            var watts = (Math.Max(0, previousWatts ?? currentWatts!.Value) + Math.Max(0, currentWatts ?? previousWatts!.Value)) / 2.0;
-            totalWh += watts * elapsedHours;
-            hasPower = true;
-        }
-
-        return hasPower ? totalWh : null;
-    }
+        => DischargeEnergyCalculator.CalculateEnergyUsedWh(samples);
 
     private void ApplySourceStatuses(IReadOnlyList<SourceStatus> statuses)
     {
@@ -981,15 +1004,7 @@ public partial class MainViewModel : ObservableObject
     }
 
     private static double? GetDischargeWatts(SystemPowerSample sample)
-    {
-        if (sample.ChargeRateMilliwatts.HasValue)
-        {
-            var chargeRateW = sample.ChargeRateMilliwatts.Value / 1000.0;
-            return chargeRateW < 0 ? Math.Abs(chargeRateW) : 0.0;
-        }
-
-        return sample.EstimatedDischargeWatts;
-    }
+        => DischargeEnergyCalculator.GetDischargeWatts(sample);
 
     private static string FormatCycleLabel(BatteryDisplayCycle cycle)
     {
@@ -1021,6 +1036,60 @@ public partial class MainViewModel : ObservableObject
     {
         var minutes = Math.Max(0, (toUtc - fromUtc).TotalMinutes);
         return $"{FormatRange(fromUtc, toUtc)} ({minutes:F0} min)";
+    }
+
+    private static string BuildExcludedSummary(IReadOnlyList<PowerStateInterval> gaps)
+    {
+        if (gaps.Count == 0)
+            return "";
+
+        var sleepCount = 0;
+        var unknownCount = 0;
+        var sleepDuration = TimeSpan.Zero;
+        var unknownDuration = TimeSpan.Zero;
+
+        foreach (var gap in gaps)
+        {
+            if (gap.Kind == GapKind.ConfirmedSleep)
+            {
+                sleepCount++;
+                sleepDuration += gap.EndUtc - gap.StartUtc;
+            }
+            else
+            {
+                unknownCount++;
+                unknownDuration += gap.EndUtc - gap.StartUtc;
+            }
+        }
+
+        var parts = new List<string>();
+        if (sleepCount > 0)
+            parts.Add($"{sleepCount} confirmed sleep/hibernate interval{(sleepCount > 1 ? "s" : "")} ({FormatDuration(sleepDuration)})");
+        if (unknownCount > 0)
+            parts.Add($"{unknownCount} unknown monitoring gap{(unknownCount > 1 ? "s" : "")} ({FormatDuration(unknownDuration)})");
+
+        return parts.Count > 0
+            ? $"Excluded from attribution: {string.Join(", ", parts)}"
+            : "";
+    }
+
+    private static string FormatDuration(TimeSpan duration)
+    {
+        if (duration.TotalHours >= 1)
+        {
+            var hours = (int)duration.TotalHours;
+            var minutes = duration.Minutes;
+            return $"{hours}h {minutes}m";
+        }
+
+        if (duration.TotalMinutes >= 1)
+        {
+            var minutes = (int)duration.TotalMinutes;
+            var seconds = duration.Seconds;
+            return $"{minutes}m {seconds}s";
+        }
+
+        return $"{(int)duration.TotalSeconds}s";
     }
 
     private static string FormatPercent(double? value)

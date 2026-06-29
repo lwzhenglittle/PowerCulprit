@@ -1,3 +1,4 @@
+using PowerCulprit.Core.Analysis;
 using PowerCulprit.Core.Models;
 using Microsoft.Data.Sqlite;
 
@@ -59,7 +60,7 @@ public class DatabaseManagerTests : IDisposable
         Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_analysis_aggregates';"));
         Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='gpu_analysis_aggregates';"));
         Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='hardware_sensor_aggregates';"));
-        Assert.Equal(3, await ScalarLongAsync("PRAGMA user_version;"));
+        Assert.Equal(6, await ScalarLongAsync("PRAGMA user_version;"));
     }
 
     [Fact]
@@ -90,7 +91,7 @@ public class DatabaseManagerTests : IDisposable
 
         await _db.InitializeAsync();
 
-        Assert.Equal(3, await ScalarLongAsync("PRAGMA user_version;"));
+        Assert.Equal(6, await ScalarLongAsync("PRAGMA user_version;"));
         Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM system_power_samples;"));
         Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_analysis_aggregates';"));
         var samples = await _db.GetSystemPowerSamplesAsync(ts.AddSeconds(-1), ts.AddSeconds(1));
@@ -802,16 +803,57 @@ public class DatabaseManagerTests : IDisposable
     }
 
     [Fact]
-    public async Task ClearHistoricalData_RemovesSessionStartMarkers()
+    public async Task RebuildBatteryCycles_UsesPowerStateEvents_ToPreserveHighConfidence()
+    {
+        var start = DateTime.UtcNow.AddHours(-2);
+        await _db.InsertSystemPowerSamplesAsync(new[]
+        {
+            Power(start, ac: true, percent: 80),
+            Power(start.AddMinutes(1), ac: false, percent: 80),
+            // Gap > 10 minutes, but covered by a confirmed sleep interval.
+            Power(start.AddMinutes(11).AddSeconds(1), ac: false, percent: 75),
+            Power(start.AddMinutes(12), ac: true, percent: 75)
+        });
+        await _db.InsertPowerStateEventAsync(new PowerStateEvent
+        {
+            TimestampUtc = start.AddMinutes(2),
+            Kind = PowerStateEventKind.Suspend,
+            Source = "PowerCulprit",
+            Details = "test suspend"
+        });
+        await _db.InsertPowerStateEventAsync(new PowerStateEvent
+        {
+            TimestampUtc = start.AddMinutes(10),
+            Kind = PowerStateEventKind.Resume,
+            Source = "PowerCulprit",
+            Details = "test resume"
+        });
+
+        await _db.RebuildBatteryCyclesAsync();
+
+        var displayCycles = await _db.GetLatestBatteryDisplayCyclesAsync(10);
+        var display = Assert.Single(displayCycles);
+        Assert.Equal(BatteryCycleConfidence.High, display.Confidence);
+
+        var rawCycles = await _db.GetBatteryCyclesForDisplayCycleAsync(display.Id);
+        Assert.All(rawCycles, c => Assert.Equal(BatteryCycleConfidence.High, c.Confidence));
+    }
+
+    [Fact]
+    public async Task ClearHistoricalData_ReplacesSessionStartMarkersWithClearBoundary()
     {
         var ts = DateTime.UtcNow;
         await _db.InsertSessionStartMarkerAsync(ts);
 
         Assert.Single(await _db.GetSessionStartMarkersAsync(ts.AddSeconds(-1), ts.AddSeconds(1)));
 
+        var beforeClear = DateTime.UtcNow;
         await _db.ClearHistoricalDataAsync();
+        var afterClear = DateTime.UtcNow;
 
-        Assert.Empty(await _db.GetSessionStartMarkersAsync(ts.AddSeconds(-1), ts.AddSeconds(1)));
+        var markers = await _db.GetSessionStartMarkersAsync(beforeClear.AddSeconds(-1), afterClear.AddSeconds(1));
+        var marker = Assert.Single(markers);
+        Assert.InRange(marker, beforeClear.AddSeconds(-1), afterClear.AddSeconds(1));
     }
 
 
@@ -1034,7 +1076,7 @@ public class DatabaseManagerTests : IDisposable
             using var legacyDb = new PowerCulprit.Storage.DatabaseManager(legacyPath);
             await legacyDb.InitializeAsync();
 
-            Assert.Equal(3, await ScalarLongAsync(legacyPath, "PRAGMA user_version;"));
+            Assert.Equal(6, await ScalarLongAsync(legacyPath, "PRAGMA user_version;"));
             Assert.Equal(0, await ScalarLongAsync(
                 legacyPath,
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_samples';"));
@@ -1050,6 +1092,150 @@ public class DatabaseManagerTests : IDisposable
                 try { File.Delete(legacyPath); } catch { /* best effort */ }
             }
         }
+    }
+
+    [Fact]
+    public async Task WmiActivitySamples_RoundTripAndAggregateByCaller()
+    {
+        var ts = DateTime.UtcNow;
+        await _db.InsertProcessSamplesAsync(new[]
+        {
+            new ProcessSample
+            {
+                TimestampUtc = ts,
+                Pid = 4242,
+                ProcessName = "caller.exe",
+                ExecutablePath = @"C:\caller.exe",
+                CpuPercent = 1
+            }
+        });
+        await _db.InsertWmiActivitySamplesAsync(new[]
+        {
+            new WmiActivitySample
+            {
+                TimestampUtc = ts.AddSeconds(1),
+                EventRecordId = 1001,
+                ClientProcessId = 4242,
+                EventId = 5858,
+                User = "machine\\user",
+                Operation = "Start IWbemServices::ExecQuery - root\\cimv2 : SELECT * FROM Win32_Process",
+                NamespaceName = "root\\cimv2",
+                QueryText = "SELECT * FROM Win32_Process",
+                ResultCode = "0x0"
+            },
+            new WmiActivitySample
+            {
+                TimestampUtc = ts.AddSeconds(2),
+                EventRecordId = 1002,
+                ClientProcessId = 4242,
+                EventId = 5858,
+                Operation = "Start IWbemServices::ExecQuery - root\\cimv2 : SELECT * FROM Win32_OperatingSystem",
+                NamespaceName = "root\\cimv2",
+                QueryText = "SELECT * FROM Win32_OperatingSystem",
+                ResultCode = "0x80041032",
+                PossibleCause = "Throttling"
+            }
+        });
+
+        var aggregates = await _db.GetWmiCallerAggregatesAsync(ts.AddSeconds(-1), ts.AddSeconds(10), 10);
+
+        var aggregate = Assert.Single(aggregates);
+        Assert.Equal(4242, aggregate.ClientProcessId);
+        Assert.Equal("caller.exe", aggregate.ProcessName);
+        Assert.Equal(@"C:\caller.exe", aggregate.ExecutablePath);
+        Assert.Equal(2, aggregate.CallCount);
+        Assert.Equal(1, aggregate.FailureCount);
+        Assert.Equal(2, aggregate.UniqueOperationCount);
+        Assert.Contains("Win32_OperatingSystem", aggregate.LastOperation);
+        Assert.Equal("0x80041032", aggregate.LastResultCode);
+        Assert.Equal("Throttling", aggregate.LastPossibleCause);
+        Assert.Equal(1002, await _db.GetLatestWmiActivityEventRecordIdAsync());
+    }
+
+    [Fact]
+    public async Task WmiActivitySamples_DuplicateEventRecordId_IsIgnored()
+    {
+        var ts = DateTime.UtcNow;
+        await _db.InsertWmiActivitySamplesAsync(new[]
+        {
+            new WmiActivitySample
+            {
+                TimestampUtc = ts,
+                EventRecordId = 2001,
+                ClientProcessId = 100,
+                EventId = 5858,
+                Operation = "first"
+            },
+            new WmiActivitySample
+            {
+                TimestampUtc = ts.AddSeconds(1),
+                EventRecordId = 2001,
+                ClientProcessId = 100,
+                EventId = 5858,
+                Operation = "duplicate"
+            }
+        });
+
+        var aggregates = await _db.GetWmiCallerAggregatesAsync(ts.AddSeconds(-1), ts.AddSeconds(5), 10);
+
+        var aggregate = Assert.Single(aggregates);
+        Assert.Equal(1, aggregate.CallCount);
+        Assert.Equal("first", aggregate.LastOperation);
+        Assert.Equal(2001, await _db.GetLatestWmiActivityEventRecordIdAsync());
+    }
+
+    [Fact]
+    public async Task CleanupOldData_PreservesWmiActivityCursor()
+    {
+        var ts = DateTime.UtcNow.AddDays(-2);
+        await _db.InsertWmiActivitySamplesAsync(new[]
+        {
+            new WmiActivitySample
+            {
+                TimestampUtc = ts,
+                EventRecordId = 3001,
+                ClientProcessId = 100,
+                EventId = 5858
+            }
+        });
+
+        await _db.CleanupOldDataAsync(retentionDays: 7, rawRetention: TimeSpan.Zero);
+
+        Assert.Empty(await _db.GetWmiCallerAggregatesAsync(ts.AddSeconds(-1), ts.AddSeconds(1), 10));
+        Assert.Equal(3001, await _db.GetLatestWmiActivityEventRecordIdAsync());
+    }
+
+    [Fact]
+    public async Task WmiActivitySamples_QueryRespectsTimeWindow()
+    {
+        var ts = DateTime.UtcNow;
+        await _db.InsertWmiActivitySamplesAsync(new[]
+        {
+            new WmiActivitySample { TimestampUtc = ts.AddMinutes(-10), ClientProcessId = 1, EventId = 5858 },
+            new WmiActivitySample { TimestampUtc = ts, ClientProcessId = 2, EventId = 5858 },
+            new WmiActivitySample { TimestampUtc = ts.AddMinutes(10), ClientProcessId = 3, EventId = 5858 }
+        });
+
+        var aggregates = await _db.GetWmiCallerAggregatesAsync(ts.AddSeconds(-1), ts.AddSeconds(1), 10);
+
+        var aggregate = Assert.Single(aggregates);
+        Assert.Equal(2, aggregate.ClientProcessId);
+    }
+
+    [Fact]
+    public async Task ClearHistoricalData_RemovesWmiActivitySamples()
+    {
+        var ts = DateTime.UtcNow;
+        await _db.InsertWmiActivitySamplesAsync(new[]
+        {
+            new WmiActivitySample { TimestampUtc = ts, ClientProcessId = 7, EventId = 5858 }
+        });
+
+        Assert.Single(await _db.GetWmiCallerAggregatesAsync(ts.AddSeconds(-1), ts.AddSeconds(1), 10));
+
+        await _db.ClearHistoricalDataAsync();
+
+        Assert.Empty(await _db.GetWmiCallerAggregatesAsync(ts.AddSeconds(-1), ts.AddSeconds(1), 10));
     }
 
     private async Task<long> ScalarLongAsync(string sql)

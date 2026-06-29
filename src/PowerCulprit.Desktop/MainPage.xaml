@@ -12,6 +12,7 @@
     <Page.Resources>
         <vm:BoolToInverseConverter x:Key="BoolToInverseConverter" />
         <vm:StatusToBrushConverter x:Key="StatusToBrushConverter" />
+        <vm:StringToVisibilityConverter x:Key="StringToVisibilityConverter" />
     </Page.Resources>
 
     <ScrollViewer x:Name="RootScrollViewer"
@@ -244,6 +245,11 @@
                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                        TextTrimming="CharacterEllipsis"
                                        ToolTipService.ToolTip="{x:Bind ViewModel.AnalysisStatusText, Mode=OneWay}" />
+                            <TextBlock Text="{x:Bind ViewModel.ExcludedIntervalsSummary, Mode=OneWay}"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource SystemFillColorAttentionBrush}"
+                                       TextWrapping="Wrap"
+                                       Visibility="{x:Bind ViewModel.ExcludedIntervalsSummary, Mode=OneWay, Converter={StaticResource StringToVisibilityConverter}}" />
                         </StackPanel>
                     </Border>
 

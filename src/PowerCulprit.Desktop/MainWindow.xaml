@@ -45,6 +45,9 @@
                 <NavigationViewItem Content="CPU Attribution"
                                     Icon="ReportHacked"
                                     Tag="cpu" />
+                <NavigationViewItem Content="WMI Activity"
+                                    Icon="Library"
+                                    Tag="wmi" />
             </NavigationView.MenuItems>
             <Frame x:Name="ContentFrame"
                    IsNavigationStackEnabled="False" />

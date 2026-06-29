@@ -64,12 +64,25 @@ public static class CpuTimelineBuilder
         {
             var previous = samples[i - 1];
             var current = samples[i];
-            var elapsedHours = (current.TimestampUtc - previous.TimestampUtc).TotalHours;
-            if (elapsedHours <= 0)
+            var span = current.TimestampUtc - previous.TimestampUtc;
+            if (span <= TimeSpan.Zero)
             {
                 result[current.TimestampUtc] = hasPower ? totalWh : null;
                 continue;
             }
+
+            // Skip unobserved intervals (sleep / hibernate / monitoring gap) —
+            // never extrapolate boundary wattage across a gap. Reusing
+            // GapDetector.MaxSampleGap keeps the "what counts as a gap" notion
+            // identical to DischargeEnergyCalculator, so the CPU energy curve
+            // and the battery energy total agree on what was awake.
+            if (span > GapDetector.MaxSampleGap)
+            {
+                result[current.TimestampUtc] = hasPower ? Math.Round(totalWh, 4) : null;
+                continue;
+            }
+
+            var elapsedHours = span.TotalHours;
 
             var previousWatts = GetDischargeWatts(previous);
             var currentWatts = GetDischargeWatts(current);
@@ -165,15 +178,7 @@ public static class CpuTimelineBuilder
         => string.Equals(sample.Unit, unit, StringComparison.OrdinalIgnoreCase);
 
     private static double? GetDischargeWatts(SystemPowerSample sample)
-    {
-        if (sample.ChargeRateMilliwatts.HasValue)
-        {
-            var chargeRateW = sample.ChargeRateMilliwatts.Value / 1000.0;
-            return chargeRateW < 0 ? Math.Abs(chargeRateW) : 0.0;
-        }
-
-        return sample.EstimatedDischargeWatts;
-    }
+        => DischargeEnergyCalculator.GetDischargeWatts(sample);
 
     private sealed record CpuValues(
         double? CpuAverageClockMhz,

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Diagnostics.Eventing.Reader;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using PowerCulprit.Collectors;
@@ -299,6 +300,41 @@ internal class Program
             Console.WriteLine($"ETW Kernel Session: Error — {ex.Message}");
         }
 
+        // WMI Activity event log status
+        try
+        {
+            using var config = new EventLogConfiguration(WmiActivityCollector.LogName);
+            var status = config.IsEnabled ? "Available" : "Disabled";
+            string details;
+            try
+            {
+                var query = new EventLogQuery(WmiActivityCollector.LogName, PathType.LogName, "*[System[EventID=5858 or EventID=5860]]")
+                {
+                    ReverseDirection = true
+                };
+                using var reader = new EventLogReader(query);
+                using var latest = reader.ReadEvent();
+                details = latest is null
+                    ? "event log is readable; no recent WMI client events"
+                    : $"event log is readable; latest record {latest.RecordId}";
+            }
+            catch (Exception ex)
+            {
+                status = "Unavailable";
+                details = ex.Message;
+            }
+
+            Console.WriteLine($"WMI Activity Log: {status} ({details})");
+        }
+        catch (EventLogNotFoundException)
+        {
+            Console.WriteLine("WMI Activity Log: Unavailable (Microsoft-Windows-WMI-Activity/Operational not found)");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"WMI Activity Log: Error — {ex.Message}");
+        }
+
         // Admin status
         var isAdmin = System.Security.Principal.WindowsIdentity.GetCurrent()
             .Owner?.IsWellKnown(System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid) ?? false;
@@ -365,6 +401,8 @@ internal class Program
         services.AddSingleton<IntelGpuPowerCollector>();
         services.AddSingleton<WindowsEtwActivityCollector>();
         services.AddSingleton<IWindowsEtwActivityCollector>(sp => sp.GetRequiredService<WindowsEtwActivityCollector>());
+        services.AddSingleton<WmiActivityCollector>();
+        services.AddSingleton<IWmiActivityCollector>(sp => sp.GetRequiredService<WmiActivityCollector>());
         services.AddSingleton<MonitoringService>();
 
         var provider = services.BuildServiceProvider();

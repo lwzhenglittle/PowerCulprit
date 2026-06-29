@@ -20,6 +20,7 @@ public class MonitoringService : IMonitoringService
     private readonly IntelCpuPowerCollector _cpuPowerCollector;
     private readonly IntelGpuPowerCollector _gpuPowerCollector;
     private readonly IWindowsEtwActivityCollector _etwCollector;
+    private readonly IWmiActivityCollector _wmiActivityCollector;
     private readonly DatabaseManager _databaseManager;
     private readonly ILogger<MonitoringService> _logger;
 
@@ -36,6 +37,7 @@ public class MonitoringService : IMonitoringService
     private DateTime _lastGpuEngineCollectUtc = DateTime.MinValue;
     private DateTime _lastCleanupUtc = DateTime.MinValue;
     private DateTime _lastCompactionUtc = DateTime.MinValue;
+    private DateTime? _lastSuspendEventUtc;
     private IReadOnlyList<GpuProcessSample> _lastGpuSamples = Array.Empty<GpuProcessSample>();
     private static readonly TimeSpan SourceStatusRefreshInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan GpuEngineCollectInterval = TimeSpan.FromSeconds(5);
@@ -64,6 +66,7 @@ public class MonitoringService : IMonitoringService
         IntelCpuPowerCollector cpuPowerCollector,
         IntelGpuPowerCollector gpuPowerCollector,
         IWindowsEtwActivityCollector etwCollector,
+        IWmiActivityCollector wmiActivityCollector,
         DatabaseManager databaseManager,
         ILogger<MonitoringService> logger)
     {
@@ -74,6 +77,7 @@ public class MonitoringService : IMonitoringService
         _cpuPowerCollector = cpuPowerCollector;
         _gpuPowerCollector = gpuPowerCollector;
         _etwCollector = etwCollector;
+        _wmiActivityCollector = wmiActivityCollector;
         _databaseManager = databaseManager;
         _logger = logger;
     }
@@ -152,6 +156,9 @@ public class MonitoringService : IMonitoringService
         try { await _etwCollector.StopAsync(); }
         catch (Exception ex) { _logger.LogWarning(ex, "Windows ETW activity collector failed to stop"); }
 
+        try { await _wmiActivityCollector.StopAsync(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "WMI Activity collector failed to stop"); }
+
         lock (_lock)
         {
             _loopTask = null;
@@ -211,6 +218,74 @@ public class MonitoringService : IMonitoringService
         _logger.LogInformation("Windows GPU Engine sampling {State}", enabled ? "enabled" : "disabled");
     }
 
+    /// <inheritdoc/>
+    public async Task RecordPowerStateEventAsync(
+        PowerStateEventKind kind,
+        DateTime? timestampUtc = null,
+        string? details = null)
+    {
+        var evt = new PowerStateEvent
+        {
+            TimestampUtc = timestampUtc ?? DateTime.UtcNow,
+            Kind = kind,
+            Source = "PowerCulprit",
+            Details = details
+        };
+
+        _logger.LogInformation("Power state event: {Kind} at {Timestamp}", kind, evt.TimestampUtc);
+
+        // Suspend events must be persisted before the system sleeps —
+        // use a short timeout to avoid blocking the power transition.
+        if (kind == PowerStateEventKind.Suspend)
+        {
+            try
+            {
+                await _databaseManager.InsertPowerStateEventAsync(evt)
+                    .WaitAsync(TimeSpan.FromMilliseconds(750));
+            }
+            catch (TimeoutException)
+            {
+                _logger.LogWarning(
+                    "Suspend power state event timed out after 750ms — may not have persisted");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to persist suspend power state event");
+            }
+        }
+        else
+        {
+            try
+            {
+                await _databaseManager.InsertPowerStateEventAsync(evt);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to persist power state event {Kind}", kind);
+            }
+        }
+
+        // Track last suspend time for snapshot awareness
+        if (kind == PowerStateEventKind.Suspend)
+            _lastSuspendEventUtc = evt.TimestampUtc;
+    }
+
+    /// <inheritdoc/>
+    public async Task<IReadOnlyList<PowerStateEvent>> GetPowerStateEventsAsync(
+        DateTime fromUtc,
+        DateTime toUtc)
+    {
+        try
+        {
+            return await _databaseManager.GetPowerStateEventsAsync(fromUtc, toUtc);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to query power state events");
+            return Array.Empty<PowerStateEvent>();
+        }
+    }
+
     // ──────────────────────────────────────────────
     //  Main loop
     // ──────────────────────────────────────────────
@@ -230,11 +305,26 @@ public class MonitoringService : IMonitoringService
             _logger.LogWarning(ex, "Source status deduplication failed — continuing");
         }
 
+        try
+        {
+            var lastWmiRecordId = await _databaseManager.GetLatestWmiActivityEventRecordIdAsync();
+            if (lastWmiRecordId.HasValue)
+                _wmiActivityCollector.SetLastRecordId(lastWmiRecordId.Value);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to initialize WMI Activity event-log cursor");
+        }
+
         await CleanupOldDataIfDueAsync(force: true);
 
         // Optional ETW collection starts a background consumer and degrades on failure.
         try { await _etwCollector.StartAsync(cancellationToken); }
         catch (Exception ex) { _logger.LogWarning(ex, "Windows ETW activity collector failed to start"); }
+
+        // Optional WMI Activity collection reads the Operational event log incrementally.
+        try { await _wmiActivityCollector.StartAsync(cancellationToken); }
+        catch (Exception ex) { _logger.LogWarning(ex, "WMI Activity collector failed to start"); }
 
         // One-time hardware init (must be done on startup)
         _lhmCollector.Initialize();
@@ -339,7 +429,8 @@ public class MonitoringService : IMonitoringService
                     batch.ProcessSamples,
                     batch.GpuSamples,
                     batch.HardwareSamples,
-                    batch.SourceStatuses);
+                    batch.SourceStatuses,
+                    batch.WmiActivitySamples);
             }
             catch (Exception ex)
             {
@@ -356,6 +447,7 @@ public class MonitoringService : IMonitoringService
         IReadOnlyList<GpuProcessSample> gpuSamples = Array.Empty<GpuProcessSample>();
         IReadOnlyList<HardwareSensorSample> hwSamples = Array.Empty<HardwareSensorSample>();
         IReadOnlyList<SourceStatus> sourceStatuses = Array.Empty<SourceStatus>();
+        IReadOnlyList<WmiActivitySample> wmiActivitySamples = Array.Empty<WmiActivitySample>();
         var gpuSamplesAreFresh = false;
         var gpuSamplingEnabled = IsGpuSamplingEnabled;
 
@@ -376,6 +468,14 @@ public class MonitoringService : IMonitoringService
             processSamples = ProcessEtwMerger.Merge(processSamples, etwSnapshot);
         }
         catch (Exception ex) { _logger.LogError(ex, "WindowsEtwActivityCollector snapshot/merge threw"); }
+
+        // ── Snapshot WMI Activity events ─────────────
+        try
+        {
+            var wmiSnapshot = _wmiActivityCollector.SnapshotAndReset(now);
+            wmiActivitySamples = wmiSnapshot.Samples;
+        }
+        catch (Exception ex) { _logger.LogError(ex, "WMI Activity collector snapshot threw"); }
 
         // ── Collect GPU Engine ────────────────────
         if (gpuSamplingEnabled && now - _lastGpuEngineCollectUtc >= GpuEngineCollectInterval)
@@ -447,7 +547,8 @@ public class MonitoringService : IMonitoringService
                     ? SelectPersistedGpuSamples(gpuSamples)
                     : Array.Empty<GpuProcessSample>(),
                 HardwareSamples = hwSamples,
-                SourceStatuses = sourceStatuses
+                SourceStatuses = sourceStatuses,
+                WmiActivitySamples = wmiActivitySamples
             });
         }
 
@@ -579,6 +680,7 @@ public class MonitoringService : IMonitoringService
         TryAddStatus(() => _cpuPowerCollector.GetStatus(hwSamples), statuses, now);
         TryAddStatus(() => _gpuPowerCollector.GetStatus(hwSamples, gpuSamples), statuses, now);
         TryAddStatus(() => _etwCollector.GetStatus(), statuses, now);
+        TryAddStatus(() => _wmiActivityCollector.GetStatus(), statuses, now);
 
         return statuses;
     }
@@ -596,5 +698,6 @@ public class MonitoringService : IMonitoringService
         public IReadOnlyList<GpuProcessSample> GpuSamples { get; init; } = Array.Empty<GpuProcessSample>();
         public IReadOnlyList<HardwareSensorSample> HardwareSamples { get; init; } = Array.Empty<HardwareSensorSample>();
         public IReadOnlyList<SourceStatus> SourceStatuses { get; init; } = Array.Empty<SourceStatus>();
+        public IReadOnlyList<WmiActivitySample> WmiActivitySamples { get; init; } = Array.Empty<WmiActivitySample>();
     }
 }

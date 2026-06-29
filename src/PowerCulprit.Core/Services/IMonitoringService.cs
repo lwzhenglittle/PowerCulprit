@@ -77,4 +77,20 @@ public interface IMonitoringService
     /// to the UI thread yourself if needed.
     /// </summary>
     event Action<bool>? RunningChanged;
+
+    /// <summary>
+    /// Record a system power state transition (suspend / resume / resume-automatic)
+    /// received via WM_POWERBROADCAST.
+    /// </summary>
+    Task RecordPowerStateEventAsync(
+        PowerStateEventKind kind,
+        DateTime? timestampUtc = null,
+        string? details = null);
+
+    /// <summary>
+    /// Return power state events in the given time range.
+    /// </summary>
+    Task<IReadOnlyList<PowerStateEvent>> GetPowerStateEventsAsync(
+        DateTime fromUtc,
+        DateTime toUtc);
 }

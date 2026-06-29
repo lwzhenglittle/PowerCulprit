@@ -204,6 +204,53 @@ public class BatteryCycleBuilderTests
         Assert.Equal(original.RawCycles[0].Confidence, withEmptyBoundaries.RawCycles[0].Confidence);
     }
 
+    [Fact]
+    public void LargeSampleGap_CoveredBySleep_Overlap_KeepsHighConfidence()
+    {
+        var start = new DateTime(2026, 6, 24, 8, 0, 0, DateTimeKind.Utc);
+        var samples = new[]
+        {
+            Power(start, ac: true, percent: 80),
+            Power(start.AddMinutes(1), ac: false, percent: 80),
+            // Sleep happens here; next sample is more than 10 minutes later.
+            Power(start.AddMinutes(11).AddSeconds(1), ac: false, percent: 75),
+            Power(start.AddMinutes(12), ac: true, percent: 75)
+        };
+
+        var sleepIntervals = new[]
+        {
+            new PowerStateInterval
+            {
+                StartUtc = start.AddMinutes(2),
+                EndUtc = start.AddMinutes(10),
+                Kind = GapKind.ConfirmedSleep
+            }
+        };
+
+        var result = BatteryCycleBuilder.Build(samples, Array.Empty<DateTime>(), sleepIntervals);
+
+        var cycle = Assert.Single(result.RawCycles);
+        Assert.Equal(BatteryCycleConfidence.High, cycle.Confidence);
+    }
+
+    [Fact]
+    public void LargeSampleGap_NotCoveredBySleep_MarksLowConfidence()
+    {
+        var start = new DateTime(2026, 6, 24, 8, 0, 0, DateTimeKind.Utc);
+        var samples = new[]
+        {
+            Power(start, ac: true, percent: 80),
+            Power(start.AddMinutes(1), ac: false, percent: 80),
+            Power(start.AddMinutes(11).AddSeconds(1), ac: false, percent: 75),
+            Power(start.AddMinutes(12), ac: true, percent: 75)
+        };
+
+        var result = BatteryCycleBuilder.Build(samples);
+
+        var cycle = Assert.Single(result.RawCycles);
+        Assert.Equal(BatteryCycleConfidence.Low, cycle.Confidence);
+    }
+
     private static SystemPowerSample Power(DateTime timestampUtc, bool ac, double percent)
     {
         return new SystemPowerSample

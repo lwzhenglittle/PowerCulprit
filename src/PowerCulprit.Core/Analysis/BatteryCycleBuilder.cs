@@ -11,11 +11,22 @@ public static class BatteryCycleBuilder
     public static readonly TimeSpan MaxSampleGap = TimeSpan.FromMinutes(10);
 
     public static BatteryCycleBuildResult Build(IReadOnlyList<SystemPowerSample> samples)
-        => Build(samples, Array.Empty<DateTime>());
+        => Build(samples, Array.Empty<DateTime>(), Array.Empty<PowerStateInterval>());
 
     public static BatteryCycleBuildResult Build(
         IReadOnlyList<SystemPowerSample> samples,
         IReadOnlyList<DateTime> sessionStarts)
+        => Build(samples, sessionStarts, Array.Empty<PowerStateInterval>());
+
+    /// <summary>
+    /// Build battery cycles with awareness of confirmed sleep intervals.
+    /// When a large sample gap is covered by a ConfirmedSleep interval the
+    /// cycle confidence is NOT lowered — the gap has a known explanation.
+    /// </summary>
+    public static BatteryCycleBuildResult Build(
+        IReadOnlyList<SystemPowerSample> samples,
+        IReadOnlyList<DateTime> sessionStarts,
+        IReadOnlyList<PowerStateInterval> sleepIntervals)
     {
         var ordered = samples
             .Where(s => s.TimestampUtc != default)
@@ -27,14 +38,15 @@ public static class BatteryCycleBuilder
             .OrderBy(t => t)
             .ToList();
 
-        var rawCycles = BuildRawCycles(ordered, orderedSessionStarts);
+        var rawCycles = BuildRawCycles(ordered, orderedSessionStarts, sleepIntervals);
         var (assignedRawCycles, displayCycles) = BuildDisplayCycles(rawCycles);
         return new BatteryCycleBuildResult(assignedRawCycles, displayCycles);
     }
 
     private static List<BatteryCycle> BuildRawCycles(
         IReadOnlyList<SystemPowerSample> samples,
-        IReadOnlyList<DateTime> sessionStarts)
+        IReadOnlyList<DateTime> sessionStarts,
+        IReadOnlyList<PowerStateInterval> sleepIntervals)
     {
         var cycles = new List<BatteryCycle>();
         CycleDraft? current = null;
@@ -42,10 +54,25 @@ public static class BatteryCycleBuilder
         var acSessionReachedFull = false;
         var nextSessionStartIndex = 0;
 
+        // Pre-sort sleep intervals for fast gap-coverage lookup.
+        var sortedSleep = sleepIntervals
+            .Where(i => i.Kind == GapKind.ConfirmedSleep)
+            .OrderBy(i => i.StartUtc)
+            .ToList();
+
         foreach (var sample in samples)
         {
             var largeGap = previous is not null &&
                 sample.TimestampUtc - previous.TimestampUtc > MaxSampleGap;
+
+            // A large gap whose entire span is covered by a confirmed-sleep interval
+            // is not a signal of low confidence — we know why sampling stopped.
+            var knownGap = largeGap &&
+                           IsGapCoveredBySleep(
+                               previous!.TimestampUtc,
+                               sample.TimestampUtc,
+                               sortedSleep);
+
             var sessionBoundary = ConsumeSessionBoundary(
                 sessionStarts,
                 ref nextSessionStartIndex,
@@ -62,7 +89,7 @@ public static class BatteryCycleBuilder
             {
                 if (current is not null)
                 {
-                    if (largeGap)
+                    if (largeGap && !knownGap)
                         current.MarkLowConfidence();
 
                     cycles.Add(current.Finish(sample.TimestampUtc, isOpen: false));
@@ -77,7 +104,7 @@ public static class BatteryCycleBuilder
             if (current is null)
             {
                 var partialStart = !sessionBoundary && (previous is null || !previous.IsAcOnline);
-                var lowConfidence = !sessionBoundary && (partialStart || largeGap);
+                var lowConfidence = !sessionBoundary && (partialStart || (largeGap && !knownGap));
                 var startedAtFullCharge = IsFullCharge(sample) ||
                     (previous?.IsAcOnline == true && IsFullCharge(previous)) ||
                     acSessionReachedFull;
@@ -87,7 +114,7 @@ public static class BatteryCycleBuilder
             }
             else
             {
-                current.AddOfflineSample(sample, largeGap);
+                current.AddOfflineSample(sample, largeGap && !knownGap);
             }
 
             previous = sample;
@@ -243,6 +270,28 @@ public static class BatteryCycleBuilder
         {
             var ratio = sample.RemainingCapacityMWh.Value / sample.FullChargeCapacityMWh.Value;
             return ratio >= FullChargeCapacityRatio;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Returns true when a gap between two sample timestamps is entirely
+    /// covered by at least one confirmed-sleep interval — meaning the
+    /// gap has a known, benign cause and should not lower cycle confidence.
+    /// </summary>
+    private static bool IsGapCoveredBySleep(
+        DateTime gapStart,
+        DateTime gapEnd,
+        IReadOnlyList<PowerStateInterval> sleepIntervals)
+    {
+        foreach (var interval in sleepIntervals)
+        {
+            // The confirmed sleep interval only needs to overlap the sample gap.
+            // In normal operation the sleep is contained within [lastSample, nextSample],
+            // so a strict containment check would falsely mark cycles as low confidence.
+            if (interval.StartUtc < gapEnd && interval.EndUtc > gapStart)
+                return true;
         }
 
         return false;
