@@ -10,7 +10,7 @@ public class SystemPowerSampleTests
         var sample = new SystemPowerSample();
 
         Assert.Equal(default, sample.TimestampUtc);
-        Assert.False(sample.IsAcOnline);
+        Assert.Null(sample.IsAcOnline);
         Assert.Null(sample.BatteryPercent);
         Assert.Null(sample.ChargeRateMilliwatts);
         Assert.Null(sample.RemainingCapacityMWh);
@@ -36,7 +36,7 @@ public class SystemPowerSampleTests
         };
 
         Assert.Equal(ts, sample.TimestampUtc);
-        Assert.False(sample.IsAcOnline);
+        Assert.False(sample.IsAcOnline ?? false);
         Assert.Equal(85.5, sample.BatteryPercent);
         Assert.Equal(-15000.0, sample.ChargeRateMilliwatts);
         Assert.Equal(50000.0, sample.RemainingCapacityMWh);

@@ -213,7 +213,7 @@ public partial class MainViewModel : ObservableObject
             var processSamples = await _database.GetProcessSamplesForAnalysisAsync(fromUtc, toUtc);
 
             powerSamples = FilterByIntervals(powerSamples, s => s.TimestampUtc, intervals)
-                .Where(s => !_isCycleMode || !s.IsAcOnline)
+                .Where(s => !_isCycleMode || s.IsAcOnline != true)
                 .ToList();
             processSamples = FilterByIntervals(processSamples, s => s.TimestampUtc, intervals);
 
@@ -588,7 +588,7 @@ public partial class MainViewModel : ObservableObject
 
             // Limit power samples and aggregates to awake intervals only.
             powerSamples = FilterByIntervals(powerSamples, s => s.TimestampUtc, awakeIntervals)
-                .Where(s => !_isCycleMode || !s.IsAcOnline)
+                .Where(s => !_isCycleMode || s.IsAcOnline != true)
                 .ToList();
 
             // Re-query aggregates narrowed to awake intervals.
@@ -779,7 +779,12 @@ public partial class MainViewModel : ObservableObject
         if (latest is null)
             return;
 
-        AcStatusText = latest.IsAcOnline ? "AC" : "Battery";
+        AcStatusText = latest.IsAcOnline switch
+        {
+            true => "AC",
+            false => "Battery",
+            _ => "--"
+        };
     }
 
     private void UpdateRangeMetrics(DateTime fromUtc, DateTime toUtc)
@@ -1119,8 +1124,9 @@ public partial class MainViewModel : ObservableObject
         await writer.WriteLineAsync("TimestampUtc,IsAcOnline,BatteryPercent,ChargeRateMilliwatts,EstimatedDischargeWatts,PowerMode");
         foreach (var s in powerSamples)
         {
+            var ac = s.IsAcOnline switch { true => "true", false => "false", _ => "" };
             await writer.WriteLineAsync(
-                $"{s.TimestampUtc:O},{s.IsAcOnline},{s.BatteryPercent},{s.ChargeRateMilliwatts},{s.EstimatedDischargeWatts},{s.PowerMode}");
+                $"{s.TimestampUtc:O},{ac},{s.BatteryPercent},{s.ChargeRateMilliwatts},{s.EstimatedDischargeWatts},{s.PowerMode}");
         }
 
         await writer.WriteLineAsync();

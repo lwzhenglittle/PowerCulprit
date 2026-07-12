@@ -144,7 +144,7 @@ public class ProcessResourceCollector
             TimestampUtc = DateTime.UtcNow,
             SourceName = "ProcessResource",
             IsAvailable = true,
-            Status = hasWmi ? "Available" : "Partial",
+            Status = hasWmi ? SourceStatusStrings.Available : SourceStatusStrings.Partial,
             Details = hasWmi ? null : "WMI unavailable; command line and parent PID will be null",
             RequiresAdmin = false
         };

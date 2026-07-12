@@ -1,8 +1,8 @@
 using System.Diagnostics;
-using System.Diagnostics.Eventing.Reader;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using PowerCulprit.Collectors;
+using PowerCulprit.Core.Models;
 using PowerCulprit.Core.Services;
 using PowerCulprit.Storage;
 
@@ -221,119 +221,69 @@ internal class Program
             Console.WriteLine("GPU:             <WMI unavailable>");
         }
 
-        // Battery API status
-        try
-        {
-            var report = Windows.Devices.Power.Battery.AggregateBattery.GetReport();
-            if (report is null)
-            {
-                Console.WriteLine("Battery API:     Unavailable (no battery detected)");
-            }
-            else
-            {
-                Console.WriteLine("Battery API:     Available");
-                Console.WriteLine($"  ChargeRate:    {(report.ChargeRateInMilliwatts.HasValue ? $"{report.ChargeRateInMilliwatts.Value} mW" : "Unavailable")}");
-                Console.WriteLine($"  Remaining:     {(report.RemainingCapacityInMilliwattHours.HasValue ? $"{report.RemainingCapacityInMilliwattHours.Value} mWh" : "Unavailable")}");
-                Console.WriteLine($"  FullCharge:    {(report.FullChargeCapacityInMilliwattHours.HasValue ? $"{report.FullChargeCapacityInMilliwattHours.Value} mWh" : "Unavailable")}");
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Battery API:     Error — {ex.Message}");
-        }
+        Console.WriteLine();
 
-        // GPU Engine counter status
-        try
+        // ── Data source status (reuses each collector's GetStatus / probe) ──
+        // Diagnose used to re-implement every availability probe inline, which
+        // drifted from the collectors' own GetStatus() and from the Desktop
+        // status panel. Now it instantiates each collector and reads the same
+        // SourceStatus the runtime uses, so there is a single source of truth.
+        Console.WriteLine("Data sources:");
+        var loggerFactory = LoggerFactory.Create(builder =>
         {
-            var category = new System.Diagnostics.PerformanceCounterCategory("GPU Engine");
-            var hasUtil = category.CounterExists("Utilization Percentage");
-            var names = category.GetInstanceNames();
-            Console.WriteLine($"GPU Engine Counter: {(hasUtil ? "Available" : "Unavailable")} ({names.Length} instances)");
-        }
-        catch
+            builder.AddConsole();
+            builder.SetMinimumLevel(LogLevel.Warning);
+        });
+
+        // BatteryAPI, ProcessResource — no native handles, safe to cold-probe.
+        PrintStatus(new BatteryPowerCollector(
+            loggerFactory.CreateLogger<BatteryPowerCollector>()).GetStatus());
+        PrintStatus(new ProcessResourceCollector(
+            loggerFactory.CreateLogger<ProcessResourceCollector>()).GetStatus());
+
+        // WindowsGpuEngine — creates a PerformanceCounterCategory (cheap probe).
+        using (var gpuEngine = new WindowsGpuEngineCollector(
+            loggerFactory.CreateLogger<WindowsGpuEngineCollector>()))
         {
-            Console.WriteLine("GPU Engine Counter: Unavailable");
+            PrintStatus(gpuEngine.GetStatus());
         }
 
-        // LibreHardwareMonitor status
-        try
+        // LibreHardwareMonitor — must Initialize() before GetStatus() reflects
+        // real sensor availability; releases the LHM Computer on Dispose.
+        using (var lhm = new LibreHardwareMonitorCollector(
+            loggerFactory.CreateLogger<LibreHardwareMonitorCollector>()))
         {
-            var computer = new LibreHardwareMonitor.Hardware.Computer
-            {
-                IsCpuEnabled = true,
-                IsGpuEnabled = true,
-                IsBatteryEnabled = true
-            };
-            computer.Open();
-            var hasHardware = computer.Hardware.Count > 0;
-            computer.Close();
-            Console.WriteLine($"LibreHardwareMonitor: {(hasHardware ? "Available" : "No hardware detected")}");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"LibreHardwareMonitor: Error — {ex.Message}");
+            lhm.Initialize();
+            PrintStatus(lhm.GetStatus());
         }
 
-        // Intel tools
-        var intelPowerGadget = File.Exists(@"C:\Program Files\Intel\Power Gadget 3.6\PowerLog3.0.exe");
-        Console.WriteLine($"Intel Power Gadget: {(intelPowerGadget ? "Found" : "Not found")}");
+        // Intel CPU / iGPU power — derived from LHM + GPU Engine samples; their
+        // GetStatus() probes LHM sensor filters and Intel tool paths.
+        var cpuPower = new IntelCpuPowerCollector(
+            loggerFactory.CreateLogger<IntelCpuPowerCollector>());
+        PrintStatus(cpuPower.GetStatus());
 
-        var intelPcm = File.Exists(@"C:\Windows\System32\pcm.exe") ||
-                       File.Exists(@"C:\Program Files\Intel\PCM\pcm.exe");
-        Console.WriteLine($"Intel PCM:         {(intelPcm ? "Found" : "Not found")}");
+        var gpuPower = new IntelGpuPowerCollector(
+            loggerFactory.CreateLogger<IntelGpuPowerCollector>());
+        PrintStatus(gpuPower.GetStatus());
 
-        var levelZero = File.Exists(@"C:\Windows\System32\ze_loader.dll");
-        Console.WriteLine($"Level Zero Sysman: {(levelZero ? "ze_loader.dll found" : "Not found")}");
-
-        // ETW status
+        // ETW — a real (short-lived) probe session is more informative than the
+        // collector's cached "not started" status, so keep the dedicated probe.
         try
         {
             var statuses = await WindowsEtwActivityProbe.ProbeAsync(TimeSpan.FromSeconds(2));
             foreach (var status in statuses)
-            {
-                var suffix = string.IsNullOrWhiteSpace(status.Details) ? string.Empty : $" ({status.Details})";
-                Console.WriteLine($"{status.SourceName}: {status.Status}{suffix}");
-            }
+                PrintStatus(status);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"ETW Kernel Session: Error — {ex.Message}");
+            Console.WriteLine($"ETW Kernel Session: {SourceStatusStrings.Unavailable} — {ex.Message}");
         }
 
-        // WMI Activity event log status
-        try
-        {
-            using var config = new EventLogConfiguration(WmiActivityCollector.LogName);
-            var status = config.IsEnabled ? "Available" : "Disabled";
-            string details;
-            try
-            {
-                var query = new EventLogQuery(WmiActivityCollector.LogName, PathType.LogName, "*[System[EventID=5858 or EventID=5860]]")
-                {
-                    ReverseDirection = true
-                };
-                using var reader = new EventLogReader(query);
-                using var latest = reader.ReadEvent();
-                details = latest is null
-                    ? "event log is readable; no recent WMI client events"
-                    : $"event log is readable; latest record {latest.RecordId}";
-            }
-            catch (Exception ex)
-            {
-                status = "Unavailable";
-                details = ex.Message;
-            }
+        // WMI Activity — static cold probe (no need to start the collector).
+        PrintStatus(WmiActivityCollector.ProbeStatus());
 
-            Console.WriteLine($"WMI Activity Log: {status} ({details})");
-        }
-        catch (EventLogNotFoundException)
-        {
-            Console.WriteLine("WMI Activity Log: Unavailable (Microsoft-Windows-WMI-Activity/Operational not found)");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"WMI Activity Log: Error — {ex.Message}");
-        }
+        Console.WriteLine();
 
         // Admin status
         var isAdmin = System.Security.Principal.WindowsIdentity.GetCurrent()
@@ -350,6 +300,14 @@ internal class Program
         Console.WriteLine();
         Console.WriteLine("Diagnose complete.");
         return 0;
+    }
+
+    private static void PrintStatus(SourceStatus status)
+    {
+        var suffix = string.IsNullOrWhiteSpace(status.Details)
+            ? string.Empty
+            : $" ({status.Details})";
+        Console.WriteLine($"  {status.SourceName}: {status.Status}{suffix}");
     }
 
     // ──────────────────────────────────────────────
@@ -405,7 +363,11 @@ internal class Program
         services.AddSingleton<IWmiActivityCollector>(sp => sp.GetRequiredService<WmiActivityCollector>());
         services.AddSingleton<MonitoringService>();
 
-        var provider = services.BuildServiceProvider();
+        // await using so the ServiceProvider is disposed on exit (normal,
+        // Ctrl+C, or fatal). That runs Dispose on the singleton IDisposable
+        // collectors (LHM Computer.Close, GPU Engine PDH counters, ETW session)
+        // — without it every headless run leaks those native handles.
+        await using var provider = services.BuildServiceProvider();
         var monitor = provider.GetRequiredService<MonitoringService>();
         monitor.SetInterval(intervalSec);
         monitor.SetGpuSamplingEnabled(enableGpuSampling);

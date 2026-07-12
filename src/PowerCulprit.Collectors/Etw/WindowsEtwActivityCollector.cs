@@ -24,6 +24,7 @@ public sealed class WindowsEtwActivityCollector : IWindowsEtwActivityCollector, 
     private bool _udpProviderEnabled;
     private long _parseErrors;
     private EtwActivityCounters _lastCounters = new();
+    private int _disposed;
 
     public WindowsEtwActivityCollector(ILogger<WindowsEtwActivityCollector> logger)
     {
@@ -114,6 +115,13 @@ public sealed class WindowsEtwActivityCollector : IWindowsEtwActivityCollector, 
 
     public void Dispose()
     {
+        // Guard against double-dispose: the DI container disposes singletons on
+        // teardown, and MonitoringService.StopAsync already stopped the ETW
+        // session — a second Dispose would re-run the sync-over-async stop for
+        // nothing. Interlocked.Exchange makes the guard thread-safe.
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
+            return;
+
         try { StopAsync().GetAwaiter().GetResult(); }
         catch { /* best effort */ }
     }

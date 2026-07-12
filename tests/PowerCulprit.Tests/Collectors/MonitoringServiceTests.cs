@@ -97,6 +97,54 @@ public class MonitoringServiceTests
         }
     }
 
+    [Fact]
+    public async Task Dispose_CallsStopAsync_AndIsIdempotent()
+    {
+        // Dispose must route through StopAsync (idempotent) so that an exception
+        // path skipping StopAsync still releases the CTS / stops collectors.
+        // Calling Dispose after a normal StopAsync must not throw.
+        var dbPath = Path.Combine(Path.GetTempPath(), $"powerculprit_dispose_{Guid.NewGuid():N}.db");
+
+        try
+        {
+            using var db = new DatabaseManager(dbPath);
+            using var gpuCollector = new WindowsGpuEngineCollector(
+                NullLogger<WindowsGpuEngineCollector>.Instance);
+            using var lhmCollector = new LibreHardwareMonitorCollector(
+                NullLogger<LibreHardwareMonitorCollector>.Instance);
+
+            var service = new MonitoringService(
+                new BatteryPowerCollector(NullLogger<BatteryPowerCollector>.Instance),
+                new ProcessResourceCollector(NullLogger<ProcessResourceCollector>.Instance),
+                gpuCollector,
+                lhmCollector,
+                new IntelCpuPowerCollector(NullLogger<IntelCpuPowerCollector>.Instance),
+                new IntelGpuPowerCollector(NullLogger<IntelGpuPowerCollector>.Instance),
+                new NoOpWindowsEtwActivityCollector(),
+                new NoOpWmiActivityCollector(),
+                db,
+                NullLogger<MonitoringService>.Instance);
+
+            await service.StartAsync();
+            Assert.True(service.IsRunning);
+
+            await service.StopAsync();
+            Assert.False(service.IsRunning);
+
+            // Dispose after StopAsync is the DI-teardown path — must be a no-op,
+            // not a throw. A second Dispose must also be safe.
+            service.Dispose();
+            service.Dispose();
+            Assert.False(service.IsRunning);
+        }
+        finally
+        {
+            TryDelete(dbPath);
+            TryDelete(dbPath + "-wal");
+            TryDelete(dbPath + "-shm");
+        }
+    }
+
     private static void TryDelete(string path)
     {
         try

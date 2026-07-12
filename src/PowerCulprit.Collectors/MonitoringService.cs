@@ -10,7 +10,7 @@ namespace PowerCulprit.Collectors;
 /// Background monitoring service that orchestrates all collectors,
 /// writes samples to SQLite, and publishes snapshots to the UI layer.
 /// </summary>
-public class MonitoringService : IMonitoringService
+public class MonitoringService : IMonitoringService, IDisposable
 {
     // Collectors
     private readonly BatteryPowerCollector _batteryCollector;
@@ -48,6 +48,12 @@ public class MonitoringService : IMonitoringService
     private const int PersistedProcessTopN = 50;
     private const double PersistedProcessCpuThreshold = 0.1;
     private const double PersistedGpuUtilizationThreshold = 0.1;
+
+    // Cap the DB write backlog so a sustained DB stall degrades by dropping the
+    // oldest cycle rather than growing memory without bound. 256 cycles at the
+    // default 2s interval is ~8 minutes of buffered writes — enough to absorb a
+    // short GC/disk hiccup without losing recent data, but bounded.
+    private const int WriteQueueCapacity = 256;
 
     public bool IsRunning { get; private set; }
 
@@ -95,11 +101,15 @@ public class MonitoringService : IMonitoringService
 
             IsRunning = true;
             _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            _writeQueue = Channel.CreateUnbounded<MonitoringWriteBatch>(
-                new UnboundedChannelOptions
+            // Bounded with DropOldest: if the DB writer falls behind, the
+            // oldest pending cycle is discarded so the producer never blocks and
+            // memory stays bounded. Dropping is logged at the write site.
+            _writeQueue = Channel.CreateBounded<MonitoringWriteBatch>(
+                new BoundedChannelOptions(WriteQueueCapacity)
                 {
                     SingleReader = true,
-                    SingleWriter = true
+                    SingleWriter = true,
+                    FullMode = BoundedChannelFullMode.DropOldest
                 });
             _writerTask = Task.Run(RunWriteLoopAsync);
             _loopTask = Task.Run(() => RunLoopAsync(_cts.Token), _cts.Token);
@@ -179,6 +189,20 @@ public class MonitoringService : IMonitoringService
         if (handler is null) return;
         try { handler(running); }
         catch (Exception ex) { _logger.LogError(ex, "RunningChanged subscriber threw"); }
+    }
+
+    /// <summary>
+    /// Disposes the service by stopping the monitoring loop. <see cref="StopAsync"/>
+    /// is idempotent, so calling <see cref="Dispose"/> after a normal shutdown
+    /// (the common case in DI teardown) is a no-op. Dispose exists as the
+    /// last-resort cleanup path so that an exception skipping <see cref="StopAsync"/>
+    /// still releases the linked <see cref="CancellationTokenSource"/> and stops
+    /// the ETW/WMI collectors instead of leaking them.
+    /// </summary>
+    public void Dispose()
+    {
+        try { StopAsync().GetAwaiter().GetResult(); }
+        catch (Exception ex) { _logger.LogError(ex, "MonitoringService.Dispose failed during stop"); }
     }
 
     /// <inheritdoc/>
@@ -629,6 +653,14 @@ public class MonitoringService : IMonitoringService
         var writeQueue = _writeQueue;
         if (writeQueue is not null)
         {
+            // The queue is bounded with DropOldest, so WriteAsync never blocks
+            // and never throws ChannelFullException — if the DB writer is behind,
+            // the oldest pending cycle is silently discarded to keep memory
+            // bounded. Surface near-capacity depth as a warning so a sustained
+            // DB stall is still observable in the logs.
+            if (writeQueue.Reader.Count >= WriteQueueCapacity - 1)
+                _logger.LogWarning("Database write queue near capacity ({Count}/{Capacity}) — oldest batches are being dropped", writeQueue.Reader.Count, WriteQueueCapacity);
+
             await writeQueue.Writer.WriteAsync(new MonitoringWriteBatch
             {
                 PowerSample = batterySample,

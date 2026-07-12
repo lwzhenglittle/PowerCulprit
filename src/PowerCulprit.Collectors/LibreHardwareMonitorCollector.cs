@@ -16,6 +16,7 @@ public class LibreHardwareMonitorCollector : IDisposable
     private LibreHardwareMonitor.Hardware.Computer? _computer;
     private bool _initialized;
     private bool _isAvailable;
+    private int _disposed;
 
     private DateTime _lastSensorBindingRefreshUtc = DateTime.MinValue;
     private static readonly TimeSpan SensorBindingRefreshInterval = TimeSpan.FromSeconds(30);
@@ -215,8 +216,8 @@ public class LibreHardwareMonitorCollector : IDisposable
             SourceName = "LibreHardwareMonitor",
             IsAvailable = _isAvailable,
             Status = _isAvailable
-                ? (isAdmin ? "Available" : "Partial")
-                : "Unavailable",
+                ? (isAdmin ? SourceStatusStrings.Available : SourceStatusStrings.Partial)
+                : SourceStatusStrings.Unavailable,
             Details = _isAvailable && !isAdmin
                 ? "Some sensors may require administrator privileges"
                 : null,
@@ -268,6 +269,11 @@ public class LibreHardwareMonitorCollector : IDisposable
 
     public void Dispose()
     {
+        // Guard against double-dispose from DI container teardown following an
+        // explicit Dispose during shutdown.
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
+            return;
+
         try { _computer?.Close(); } catch { /* ignore */ }
         _computer = null;
     }

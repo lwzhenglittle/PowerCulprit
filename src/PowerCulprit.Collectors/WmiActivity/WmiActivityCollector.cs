@@ -48,7 +48,7 @@ public sealed class WmiActivityCollector : IWmiActivityCollector
                 TimestampUtc = DateTime.UtcNow,
                 SourceName = SourceName,
                 IsAvailable = true,
-                Status = "Available",
+                Status = SourceStatusStrings.Available,
                 Details = "WMI Activity event log will be read incrementally",
                 RequiresAdmin = false
             };
@@ -104,6 +104,77 @@ public sealed class WmiActivityCollector : IWmiActivityCollector
     public SourceStatus GetStatus()
     {
         lock (_lock) { return _status; }
+    }
+
+    /// <summary>
+    /// Cold probe of the WMI Activity event log for <c>--diagnose</c>. Unlike
+    /// <see cref="GetStatus"/> (which returns the running collector's cached
+    /// status), this never requires the collector to have been started: it
+    /// checks whether the Microsoft-Windows-WMI-Activity/Operational log exists
+    /// and is readable, and surfaces the latest 5858/5860 record id as proof.
+    /// </summary>
+    public static SourceStatus ProbeStatus()
+    {
+        try
+        {
+            using var config = new EventLogConfiguration(LogName);
+            var enabled = config.IsEnabled;
+
+            string details;
+            var status = enabled ? SourceStatusStrings.Available : SourceStatusStrings.Disabled;
+            try
+            {
+                var query = new EventLogQuery(LogName, PathType.LogName,
+                    "*[System[EventID=5858 or EventID=5860]]")
+                {
+                    ReverseDirection = true
+                };
+                using var reader = new EventLogReader(query);
+                using var latest = reader.ReadEvent();
+                details = latest is null
+                    ? "event log is readable; no recent WMI client events"
+                    : $"event log is readable; latest record {latest.RecordId}";
+            }
+            catch (Exception ex)
+            {
+                status = SourceStatusStrings.Unavailable;
+                details = ex.Message;
+            }
+
+            return new SourceStatus
+            {
+                TimestampUtc = DateTime.UtcNow,
+                SourceName = SourceName,
+                IsAvailable = status == SourceStatusStrings.Available,
+                Status = status,
+                Details = details,
+                RequiresAdmin = false
+            };
+        }
+        catch (EventLogNotFoundException)
+        {
+            return new SourceStatus
+            {
+                TimestampUtc = DateTime.UtcNow,
+                SourceName = SourceName,
+                IsAvailable = false,
+                Status = SourceStatusStrings.Unavailable,
+                Details = "Microsoft-Windows-WMI-Activity/Operational not found",
+                RequiresAdmin = null
+            };
+        }
+        catch (Exception ex)
+        {
+            return new SourceStatus
+            {
+                TimestampUtc = DateTime.UtcNow,
+                SourceName = SourceName,
+                IsAvailable = false,
+                Status = SourceStatusStrings.Unavailable,
+                Details = ex.Message,
+                RequiresAdmin = null
+            };
+        }
     }
 
     internal static WmiActivitySample? ParseEventXml(string xml)
@@ -202,7 +273,7 @@ public sealed class WmiActivityCollector : IWmiActivityCollector
 
             lock (_lock)
             {
-                if (_started && _status.Status != "Available")
+                if (_started && _status.Status != SourceStatusStrings.Available)
                     _status = BuildAvailableStatus(_lastCounters);
             }
         }
@@ -295,7 +366,7 @@ public sealed class WmiActivityCollector : IWmiActivityCollector
             TimestampUtc = DateTime.UtcNow,
             SourceName = SourceName,
             IsAvailable = true,
-            Status = counters.ParseErrors > 0 || counters.TruncatedReads > 0 ? "Partial" : "Available",
+            Status = counters.ParseErrors > 0 || counters.TruncatedReads > 0 ? SourceStatusStrings.Partial : SourceStatusStrings.Available,
             Details = details,
             RequiresAdmin = false
         };
@@ -307,7 +378,7 @@ public sealed class WmiActivityCollector : IWmiActivityCollector
             TimestampUtc = DateTime.UtcNow,
             SourceName = SourceName,
             IsAvailable = false,
-            Status = "Disabled",
+            Status = SourceStatusStrings.Disabled,
             Details = details,
             RequiresAdmin = false
         };
@@ -321,7 +392,7 @@ public sealed class WmiActivityCollector : IWmiActivityCollector
                 TimestampUtc = DateTime.UtcNow,
                 SourceName = SourceName,
                 IsAvailable = false,
-                Status = "Unavailable",
+                Status = SourceStatusStrings.Unavailable,
                 Details = details,
                 RequiresAdmin = null
             };
@@ -337,7 +408,7 @@ public sealed class WmiActivityCollector : IWmiActivityCollector
                 TimestampUtc = DateTime.UtcNow,
                 SourceName = SourceName,
                 IsAvailable = false,
-                Status = "Requires admin",
+                Status = SourceStatusStrings.RequiresAdmin,
                 Details = details,
                 RequiresAdmin = true
             };

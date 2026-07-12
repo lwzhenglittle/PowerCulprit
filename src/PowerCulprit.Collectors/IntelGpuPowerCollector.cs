@@ -134,9 +134,9 @@ public class IntelGpuPowerCollector
             TimestampUtc = DateTime.UtcNow,
             SourceName = "Intel_iGPU_Power",
             IsAvailable = hasGpuPower || hasGpuEngine,
-            Status = hasGpuPower ? "Available"
-                : (hasGpuEngine ? "Partial"
-                : (hasLevelZero ? "Requires admin" : "Unavailable")),
+            Status = hasGpuPower ? SourceStatusStrings.Available
+                : (hasGpuEngine ? SourceStatusStrings.Partial
+                : (hasLevelZero ? SourceStatusStrings.RequiresAdmin : SourceStatusStrings.Unavailable)),
             Details = hasGpuPower
                 ? $"Reading from LHM: {sensorCount} GPU sensors"
                 : (hasGpuEngine

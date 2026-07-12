@@ -85,7 +85,10 @@ public static class BatteryCycleBuilder
                 current = null;
             }
 
-            if (sample.IsAcOnline)
+            // null AC == "unknown": treat the same as on-battery (false) so a
+            // desktop with no battery / unknown AC does not get skipped out of
+            // the discharge timeline. Only an explicit true pauses the cycle.
+            if (sample.IsAcOnline == true)
             {
                 if (current is not null)
                 {
@@ -103,7 +106,7 @@ public static class BatteryCycleBuilder
 
             if (current is null)
             {
-                var partialStart = !sessionBoundary && (previous is null || !previous.IsAcOnline);
+                var partialStart = !sessionBoundary && (previous is null || previous.IsAcOnline != true);
                 var lowConfidence = !sessionBoundary && (partialStart || (largeGap && !knownGap));
                 var startedAtFullCharge = IsFullCharge(sample) ||
                     (previous?.IsAcOnline == true && IsFullCharge(previous)) ||

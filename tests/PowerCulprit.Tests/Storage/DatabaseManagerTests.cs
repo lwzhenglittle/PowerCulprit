@@ -60,7 +60,7 @@ public class DatabaseManagerTests : IDisposable
         Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_analysis_aggregates';"));
         Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='gpu_analysis_aggregates';"));
         Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='hardware_sensor_aggregates';"));
-        Assert.Equal(6, await ScalarLongAsync("PRAGMA user_version;"));
+        Assert.Equal(7, await ScalarLongAsync("PRAGMA user_version;"));
     }
 
     [Fact]
@@ -91,9 +91,12 @@ public class DatabaseManagerTests : IDisposable
 
         await _db.InitializeAsync();
 
-        Assert.Equal(6, await ScalarLongAsync("PRAGMA user_version;"));
+        Assert.Equal(7, await ScalarLongAsync("PRAGMA user_version;"));
         Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM system_power_samples;"));
         Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_analysis_aggregates';"));
+        // v7: is_ac_online is now nullable — the legacy NOT NULL column must
+        // have been relaxed during migration.
+        Assert.Equal(0, await ScalarLongAsync("SELECT COUNT(*) FROM pragma_table_info('system_power_samples') WHERE name='is_ac_online' AND \"notnull\"=1;"));
         var samples = await _db.GetSystemPowerSamplesAsync(ts.AddSeconds(-1), ts.AddSeconds(1));
         var sample = Assert.Single(samples);
         Assert.Equal(88.0, sample.BatteryPercent);
@@ -137,7 +140,7 @@ public class DatabaseManagerTests : IDisposable
         Assert.Equal(2, result.Count);
 
         var first = result.First(s => s.TimestampUtc == ts1);
-        Assert.False(first.IsAcOnline);
+        Assert.False(first.IsAcOnline ?? false);
         Assert.Equal(90.0, first.BatteryPercent);
         Assert.Equal(-12000.0, first.ChargeRateMilliwatts);
         Assert.Equal(12.0, first.EstimatedDischargeWatts);
@@ -1076,7 +1079,7 @@ public class DatabaseManagerTests : IDisposable
             using var legacyDb = new PowerCulprit.Storage.DatabaseManager(legacyPath);
             await legacyDb.InitializeAsync();
 
-            Assert.Equal(6, await ScalarLongAsync(legacyPath, "PRAGMA user_version;"));
+            Assert.Equal(7, await ScalarLongAsync(legacyPath, "PRAGMA user_version;"));
             Assert.Equal(0, await ScalarLongAsync(
                 legacyPath,
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_samples';"));

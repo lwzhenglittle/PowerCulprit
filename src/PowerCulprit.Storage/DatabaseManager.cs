@@ -42,7 +42,7 @@ public class DatabaseManager : IDisposable
     private readonly string _connectionString;
     private bool _initialized;
     private const int BusyTimeoutMilliseconds = 5000;
-    private const int CurrentSchemaVersion = 6;
+    private const int CurrentSchemaVersion = 7;
     private const string WmiActivityLastRecordIdMetadataKey = "wmi_activity_last_event_record_id";
     public static readonly TimeSpan DefaultRawRetention = TimeSpan.FromHours(24);
     public static readonly TimeSpan DefaultAggregationWindow = TimeSpan.FromMinutes(5);
@@ -130,6 +130,10 @@ public class DatabaseManager : IDisposable
         await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync();
 
         await CreateSystemPowerSamplesTableAsync(connection, transaction);
+        // v7: make is_ac_online nullable so "AC status unknown" can be stored
+        // as NULL instead of being fabricated to a default. Idempotent — a no-op
+        // for databases where the column is already nullable (fresh v7 tables).
+        await MigrateSystemPowerAcColumnToNullableAsync(connection, transaction);
         await CreateProcessSamplesTableAsync(connection, transaction);
         await CreateGpuProcessSamplesTableAsync(connection, transaction);
         await CreateHardwareSensorSamplesTableAsync(connection, transaction);
@@ -286,7 +290,7 @@ public class DatabaseManager : IDisposable
             CREATE TABLE IF NOT EXISTS system_power_samples (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp_utc   TEXT    NOT NULL,
-                is_ac_online    INTEGER NOT NULL,
+                is_ac_online    INTEGER,
                 battery_percent REAL,
                 charge_rate_milliwatts REAL,
                 remaining_capacity_mwh   REAL,
@@ -395,6 +399,65 @@ public class DatabaseManager : IDisposable
                 return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// v7 migration: relax <c>is_ac_online</c> from NOT NULL to nullable so the
+    /// "AC status unknown" state can be persisted as NULL. SQLite cannot drop a
+    /// NOT NULL constraint in place, so the column is relaxed via the standard
+    /// table-rebuild (create-copy-drop-rename). Idempotent: if the column is
+    /// already nullable (fresh v7 DB, or already migrated) it is a no-op.
+    /// </summary>
+    private static async Task MigrateSystemPowerAcColumnToNullableAsync(
+        SqliteConnection connection, SqliteTransaction transaction)
+    {
+        // PRAGMA table_info: cid, name, type, notnull(0/1), dflt_value, pk
+        var notnull = -1;
+        await using (var info = new SqliteCommand(
+            "PRAGMA table_info(system_power_samples);", connection, transaction))
+        await using (var reader = await info.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+            {
+                if (string.Equals(reader.GetString(1), "is_ac_online", StringComparison.OrdinalIgnoreCase))
+                {
+                    notnull = reader.GetInt32(3);
+                    break;
+                }
+            }
+        }
+
+        // notnull == 0 (or column missing) → already nullable, nothing to do.
+        if (notnull != 1)
+            return;
+
+        const string rebuild = """
+            CREATE TABLE _system_power_samples_v7 (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_utc   TEXT    NOT NULL,
+                is_ac_online    INTEGER,
+                battery_percent REAL,
+                charge_rate_milliwatts REAL,
+                remaining_capacity_mwh   REAL,
+                full_charge_capacity_mwh  REAL,
+                estimated_discharge_watts REAL,
+                power_mode      TEXT
+            );
+            INSERT INTO _system_power_samples_v7 (id, timestamp_utc, is_ac_online, battery_percent,
+                charge_rate_milliwatts, remaining_capacity_mwh, full_charge_capacity_mwh,
+                estimated_discharge_watts, power_mode)
+            SELECT id, timestamp_utc, is_ac_online, battery_percent,
+                charge_rate_milliwatts, remaining_capacity_mwh, full_charge_capacity_mwh,
+                estimated_discharge_watts, power_mode
+            FROM system_power_samples;
+            DROP TABLE system_power_samples;
+            ALTER TABLE _system_power_samples_v7 RENAME TO system_power_samples;
+            CREATE INDEX IF NOT EXISTS idx_system_power_ts
+                ON system_power_samples(timestamp_utc);
+            """;
+
+        await using var cmd = new SqliteCommand(rebuild, connection, transaction);
+        await cmd.ExecuteNonQueryAsync();
     }
 
     private static async Task CreateGpuProcessSamplesTableAsync(
@@ -745,7 +808,7 @@ public class DatabaseManager : IDisposable
             foreach (var sample in samples)
             {
                 tsParam.Value = SerializeTimestamp(sample.TimestampUtc);
-                acParam.Value = sample.IsAcOnline ? 1L : 0L;
+                acParam.Value = sample.IsAcOnline switch { true => 1L, false => 0L, _ => DBNull.Value };
                 bpParam.Value = (object?)sample.BatteryPercent ?? DBNull.Value;
                 crParam.Value = (object?)sample.ChargeRateMilliwatts ?? DBNull.Value;
                 rcParam.Value = (object?)sample.RemainingCapacityMWh ?? DBNull.Value;
@@ -1105,7 +1168,7 @@ public class DatabaseManager : IDisposable
 
         await using var cmd = new SqliteCommand(sql, connection, transaction);
         cmd.Parameters.AddWithValue("$ts", SerializeTimestamp(sample.TimestampUtc));
-        cmd.Parameters.AddWithValue("$ac", sample.IsAcOnline ? 1L : 0L);
+        cmd.Parameters.AddWithValue("$ac", sample.IsAcOnline switch { true => 1L, false => 0L, _ => DBNull.Value });
         cmd.Parameters.AddWithValue("$bp", (object?)sample.BatteryPercent ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$cr", (object?)sample.ChargeRateMilliwatts ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$rc", (object?)sample.RemainingCapacityMWh ?? DBNull.Value);
@@ -1515,7 +1578,7 @@ public class DatabaseManager : IDisposable
             results.Add(new SystemPowerSample
             {
                 TimestampUtc            = DeserializeTimestamp(reader.GetString(0)),
-                IsAcOnline              = reader.GetInt64(1) != 0,
+                IsAcOnline              = reader.IsDBNull(1) ? null : (bool?)(reader.GetInt64(1) != 0),
                 BatteryPercent          = reader.IsDBNull(2) ? null : reader.GetDouble(2),
                 ChargeRateMilliwatts    = reader.IsDBNull(3) ? null : reader.GetDouble(3),
                 RemainingCapacityMWh    = reader.IsDBNull(4) ? null : reader.GetDouble(4),

@@ -93,9 +93,9 @@ public class IntelCpuPowerCollector
             TimestampUtc = DateTime.UtcNow,
             SourceName = "CPU_Package_Power",
             IsAvailable = hasCpuPower,
-            Status = hasCpuPower ? "Available"
-                : (sensorCount > 0 ? "Partial"
-                : (hasPcm || hasPowerGadget ? "Requires admin" : "Unavailable")),
+            Status = hasCpuPower ? SourceStatusStrings.Available
+                : (sensorCount > 0 ? SourceStatusStrings.Partial
+                : (hasPcm || hasPowerGadget ? SourceStatusStrings.RequiresAdmin : SourceStatusStrings.Unavailable)),
             Details = hasCpuPower
                 ? $"Reading from LHM: {sensorCount} CPU sensors"
                 : (hasPcm ? "Intel PCM detected; may work with admin"

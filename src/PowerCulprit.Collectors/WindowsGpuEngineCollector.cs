@@ -18,6 +18,7 @@ public class WindowsGpuEngineCollector : IDisposable
     private bool _isAvailable;
     private readonly Dictionary<string, GpuCounterState> _counters = new(StringComparer.OrdinalIgnoreCase);
     private DateTime _lastCounterRefreshUtc = DateTime.MinValue;
+    private int _disposed;
 
     private static readonly TimeSpan CounterRefreshInterval = TimeSpan.FromSeconds(10);
 
@@ -156,6 +157,11 @@ public class WindowsGpuEngineCollector : IDisposable
 
     public void Dispose()
     {
+        // Guard against double-dispose from DI container teardown following an
+        // explicit Dispose during shutdown.
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
+            return;
+
         foreach (var counter in _counters.Values)
             counter.Dispose();
         _counters.Clear();
@@ -241,7 +247,7 @@ public class WindowsGpuEngineCollector : IDisposable
             TimestampUtc = DateTime.UtcNow,
             SourceName = "WindowsGpuEngine",
             IsAvailable = _isAvailable,
-            Status = _isAvailable ? "Available" : "Unavailable",
+            Status = _isAvailable ? SourceStatusStrings.Available : SourceStatusStrings.Unavailable,
             Details = _isAvailable
                 ? $"GPU Engine performance counter available"
                 : "GPU Engine performance counter not found on this system",

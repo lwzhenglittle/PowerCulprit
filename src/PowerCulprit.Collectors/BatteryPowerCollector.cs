@@ -26,7 +26,7 @@ public class BatteryPowerCollector
     public SystemPowerSample? Collect()
     {
         var timestampUtc = DateTime.UtcNow;
-        var isAcOnline = true;
+        bool? isAcOnline = null;
         string? powerMode = null;
         double? batteryPercent = null;
         double? chargeRateMilliwatts = null;
@@ -126,8 +126,8 @@ public class BatteryPowerCollector
                 SourceName = "BatteryAPI",
                 IsAvailable = hasBattery,
                 Status = hasBattery
-                    ? (hasChargeRate ? "Available" : "Partial")
-                    : "Unavailable",
+                    ? (hasChargeRate ? SourceStatusStrings.Available : SourceStatusStrings.Partial)
+                    : SourceStatusStrings.Unavailable,
                 Details = hasBattery && !hasChargeRate
                     ? "ChargeRateInMilliwatts not available; using capacity-change estimation"
                     : null,
@@ -141,7 +141,7 @@ public class BatteryPowerCollector
                 TimestampUtc = DateTime.UtcNow,
                 SourceName = "BatteryAPI",
                 IsAvailable = false,
-                Status = "Unavailable",
+                Status = SourceStatusStrings.Unavailable,
                 Details = $"Exception: {ex.Message}"
             };
         }

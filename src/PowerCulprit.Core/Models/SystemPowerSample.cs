@@ -8,8 +8,13 @@ public record SystemPowerSample
     /// <summary>UTC timestamp of the sample.</summary>
     public DateTime TimestampUtc { get; init; }
 
-    /// <summary>Whether the device is connected to AC power.</summary>
-    public bool IsAcOnline { get; init; }
+    /// <summary>
+    /// Whether the device is connected to AC power, or null when the AC status
+    /// could not be determined (e.g. no battery and the Win32 power-status API
+    /// failed). Null is never fabricated to a default — see the fallback
+    /// discipline in CLAUDE.md.
+    /// </summary>
+    public bool? IsAcOnline { get; init; }
 
     /// <summary>Battery charge percentage (0–100), or null if unavailable.</summary>
     public double? BatteryPercent { get; init; }
