@@ -4,6 +4,7 @@ using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using PowerCulprit.Collectors;
 using PowerCulprit.Core.Services;
+using PowerCulprit.Desktop.Logging;
 using PowerCulprit.Desktop.ViewModels;
 using PowerCulprit.Storage;
 
@@ -21,6 +22,33 @@ public partial class App : Application
     public App()
     {
         InitializeComponent();
+
+        // Install global crash handlers as early as possible. Desktop is a
+        // WinExe with no console and there are many fire-and-forget tasks
+        // (monitoring start, history load, tray menu actions) whose
+        // unobserved exceptions would otherwise vanish. Each writes to
+        // %LocalAppData%\PowerCulprit\logs\crash-*.log via CrashLog, which has
+        // no dependency on the DI logging pipeline and never throws.
+        this.UnhandledException += OnUnhandledException;
+        AppDomain.CurrentDomain.UnhandledException += OnDomainUnhandledException;
+        TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
+    }
+
+    private void OnUnhandledException(object sender, Microsoft.UI.Xaml.UnhandledExceptionEventArgs e)
+    {
+        CrashLog.Write(e.Exception, "UnhandledException");
+        e.Handled = true; // keep the app alive so the log actually flushes
+    }
+
+    private void OnDomainUnhandledException(object sender, System.UnhandledExceptionEventArgs e)
+    {
+        CrashLog.Write(e.ExceptionObject as Exception, "AppDomain.UnhandledException");
+    }
+
+    private void OnUnobservedTaskException(object? sender, System.Threading.Tasks.UnobservedTaskExceptionEventArgs e)
+    {
+        CrashLog.Write(e.Exception, "TaskScheduler.UnobservedTaskException");
+        e.SetObserved(); // do not crash the process over a forgotten task
     }
 
     protected override void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs args)
@@ -219,6 +247,11 @@ public partial class App : Application
         services.AddLogging(builder =>
         {
             builder.AddConsole();
+            // Desktop is a WinExe with no console, so AddConsole() alone writes
+            // nowhere. The file provider persists everything to
+            // %LocalAppData%\PowerCulprit\logs\desktop-YYYYMMDD.log so crashes
+            // and sampling failures leave a trail.
+            builder.AddProvider(new FileLoggerProvider(DatabaseManager.GetDefaultLogPath()));
 #if DEBUG
             builder.SetMinimumLevel(LogLevel.Debug);
 #else

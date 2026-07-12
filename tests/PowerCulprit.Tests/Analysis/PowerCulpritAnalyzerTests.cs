@@ -707,4 +707,105 @@ public class PowerCulpritAnalyzerTests
         // Sums across both pids at each timestamp (ProcessName mode aggregates by-ts).
         Assert.Equal(8.0, item.AvgCpuPercent);
     }
+
+    // ── AnalyzeAggregates (historical path) ──────────────────────────────
+
+    [Fact]
+    public void AnalyzeAggregates_WithDischargeData_ReasonDoesNotClaimUnavailable()
+    {
+        var powerSamples = new List<SystemPowerSample>
+        {
+            new() { TimestampUtc = _baseTime, ChargeRateMilliwatts = -5000 },
+            new() { TimestampUtc = _baseTime.AddSeconds(2), ChargeRateMilliwatts = -15000 },
+            new() { TimestampUtc = _baseTime.AddSeconds(4), ChargeRateMilliwatts = -10000 }
+        };
+
+        var aggregates = new List<ProcessAnalysisAggregate>
+        {
+            new() { ProcessName = "app.exe", AvgCpuPercent = 30.0, MaxCpuPercent = 40.0 }
+        };
+
+        var result = _analyzer.AnalyzeAggregates(
+            TimeSpan.FromMinutes(30), 10,
+            powerSamples,
+            aggregates,
+            Array.Empty<GpuProcessAnalysisAggregate>());
+
+        var item = Assert.Single(result);
+        // Discharge data IS present — the reason must not falsely say it is
+        // unavailable, and must explain that correlation needs raw samples.
+        Assert.DoesNotContain("discharge data unavailable", item.Reason);
+        Assert.Contains("raw samples", item.Reason);
+        // The aggregate path never computes a per-process correlation.
+        Assert.Null(item.PowerCorrelation);
+    }
+
+    [Fact]
+    public void AnalyzeAggregates_WithoutDischargeData_ReasonSaysUnavailable()
+    {
+        var aggregates = new List<ProcessAnalysisAggregate>
+        {
+            new() { ProcessName = "app.exe", AvgCpuPercent = 30.0, MaxCpuPercent = 40.0 }
+        };
+
+        var result = _analyzer.AnalyzeAggregates(
+            TimeSpan.FromMinutes(30), 10,
+            Array.Empty<SystemPowerSample>(),
+            aggregates,
+            Array.Empty<GpuProcessAnalysisAggregate>());
+
+        var item = Assert.Single(result);
+        Assert.Contains("discharge data unavailable", item.Reason);
+    }
+
+    [Fact]
+    public void AnalyzeAggregates_LowActivityButShortLived_NotLimitedImpact()
+    {
+        var aggregates = new List<ProcessAnalysisAggregate>
+        {
+            new() { ProcessName = "spawner.exe", AvgCpuPercent = 0.2, ShortLivedProcessCount = 50 }
+        };
+
+        var result = _analyzer.AnalyzeAggregates(
+            TimeSpan.FromMinutes(30), 10,
+            Array.Empty<SystemPowerSample>(),
+            aggregates,
+            Array.Empty<GpuProcessAnalysisAggregate>());
+
+        var item = Assert.Single(result);
+        // Low avg CPU, but 50 short-lived instances drove the score up — the
+        // reason must surface that, not dismiss the process as "limited impact".
+        Assert.DoesNotContain("limited power impact", item.Reason);
+        Assert.Contains("short-lived", item.Reason);
+        Assert.True(item.Score >= 100, $"Expected score driven by short-lived instances, got {item.Score}");
+    }
+
+    [Fact]
+    public void Analyze_LowActivityWithShortLived_DoesNotShortCircuit()
+    {
+        var processes = new List<ProcessSample>
+        {
+            new() { TimestampUtc = _baseTime, Pid = 1, ProcessName = "spawner.exe",
+                    CpuPercent = 0.2, ShortLivedProcessCount = 50 }
+        };
+        // A tiny GPU sample keeps avgGpu populated and below 0.5, which used to
+        // trigger the old low-activity guard even though short-lived spawns
+        // dominated the score.
+        var gpu = new List<GpuProcessSample>
+        {
+            new() { TimestampUtc = _baseTime, Pid = 1, ProcessName = "spawner.exe",
+                    EngineType = GpuEngineType.Other, UtilizationPercent = 0.3 }
+        };
+
+        var result = _analyzer.Analyze(
+            TimeSpan.FromMinutes(30), 10,
+            Array.Empty<SystemPowerSample>(),
+            processes,
+            gpu);
+
+        var item = Assert.Single(result);
+        Assert.Contains("short-lived", item.Reason);
+        Assert.DoesNotContain("limited power impact", item.Reason);
+        Assert.True(item.Score >= 100, $"Expected score driven by short-lived instances, got {item.Score}");
+    }
 }

@@ -118,8 +118,15 @@ public class PowerCulpritAnalyzer
                 reasons.Add($"{aggregate.ProcessStartCount.Value} process starts");
             }
 
+            // The aggregate path carries no per-timestamp CPU series, so a real
+            // Pearson correlation against the discharge timeline cannot be
+            // computed (unlike the Analyze path). Say so honestly instead of
+            // claiming the discharge data itself is missing.
             double? powerCorr = null;
-            var reason = BuildReason(name, reasons, avgCpu, avgGpu, bgSeconds, powerCorr, avgMem);
+            var dischargeState = dischargeTimeline.Count > 0
+                ? DischargeCorrelationState.AggregatedCannotCompute
+                : DischargeCorrelationState.NoData;
+            var reason = BuildReason(name, reasons, avgCpu, avgGpu, bgSeconds, powerCorr, avgMem, dischargeState);
 
             scored.Add(new CulpritReportItem
             {
@@ -139,7 +146,7 @@ public class PowerCulpritAnalyzer
                 ShortLivedProcessCount = aggregate.ShortLivedProcessCount,
                 BackgroundActiveSeconds = bgSeconds > 0 ? Math.Round(bgSeconds, 1) : null,
                 ForegroundActiveSeconds = fgSeconds > 0 ? Math.Round(fgSeconds, 1) : null,
-                PowerCorrelation = dischargeTimeline.Count >= 3 ? powerCorr : null,
+                PowerCorrelation = null,
                 CpuPowerCorrelation = null,
                 GpuActivityCorrelation = avgGpu.HasValue ? avgGpu.Value / 100.0 : null,
                 Reason = reason
@@ -330,7 +337,13 @@ public class PowerCulpritAnalyzer
                     score += powerCorr.Value * 10.0;
             }
 
-            var reason = BuildReason(name, reasons, avgCpu, avgGpu, bgSeconds, powerCorr, avgMem);
+            var dischargeState = powerCorr.HasValue
+                ? DischargeCorrelationState.HasValue
+                : dischargeTimeline.Count > 0
+                    ? DischargeCorrelationState.InsufficientData
+                    : DischargeCorrelationState.NoData;
+
+            var reason = BuildReason(name, reasons, avgCpu, avgGpu, bgSeconds, powerCorr, avgMem, dischargeState);
 
             scored.Add(new CulpritReportItem
             {
@@ -659,6 +672,24 @@ public class PowerCulpritAnalyzer
         return t < 0 ? -t : t;
     }
 
+    /// <summary>
+    /// How much discharge-correlation information is available for a reason.
+    /// Lets BuildReason distinguish "no discharge data at all" from "data is
+    /// present but a per-process correlation could not be computed" so the
+    /// reason text never falsely claims the discharge data itself is missing.
+    /// </summary>
+    private enum DischargeCorrelationState
+    {
+        /// <summary>A Pearson correlation was computed (Analyze path only).</summary>
+        HasValue,
+        /// <summary>Discharge data exists, but the aggregate path has no per-timestamp CPU series to correlate.</summary>
+        AggregatedCannotCompute,
+        /// <summary>Discharge data exists, but too few points / zero variance prevented a correlation.</summary>
+        InsufficientData,
+        /// <summary>No discharge data at all.</summary>
+        NoData,
+    }
+
     private static string BuildReason(
         string processName,
         List<string> reasons,
@@ -666,22 +697,28 @@ public class PowerCulpritAnalyzer
         double? avgGpu,
         double bgSeconds,
         double? powerCorr,
-        double avgMem)
+        double avgMem,
+        DischargeCorrelationState dischargeState)
     {
-        if (avgCpu.HasValue && avgCpu.Value < 0.5 &&
-            avgGpu.HasValue && avgGpu.Value < 0.5 &&
-            bgSeconds < 60)
+        // Only short-circuit to "limited power impact" when there is genuinely
+        // nothing contributing to the score — no CPU/GPU/video/background/disk
+        // or lifecycle reasons. A process with low avg CPU but many short-lived
+        // spawns or process starts still has reasons populated, so it must fall
+        // through to the parts list rather than being dismissed as harmless.
+        if (reasons.Count == 0)
         {
             return $"{processName}: low activity (avg CPU {avgCpu:F1}%, mem {avgMem:F0} MB) - limited power impact";
         }
 
-        var parts = reasons.Count > 0
-            ? reasons
-            : new List<string> { "low activity" };
+        var parts = reasons;
 
-        var hasDischarge = powerCorr.HasValue
-            ? $"; discharge correlation {powerCorr.Value:F2}"
-            : "; discharge data unavailable";
+        var hasDischarge = dischargeState switch
+        {
+            DischargeCorrelationState.HasValue => $"; discharge correlation {powerCorr!.Value:F2}",
+            DischargeCorrelationState.AggregatedCannotCompute => "; discharge data present (per-process correlation needs raw samples, not aggregates)",
+            DischargeCorrelationState.InsufficientData => "; discharge data present but correlation could not be computed",
+            _ => "; discharge data unavailable",
+        };
 
         return $"{processName}: {string.Join(", ", parts)}{hasDischarge}";
     }

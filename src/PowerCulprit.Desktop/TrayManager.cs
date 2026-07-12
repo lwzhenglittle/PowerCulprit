@@ -24,10 +24,18 @@ public sealed class TrayManager : IDisposable
     private uint _taskbarRestartMsg;
     private volatile bool _running;
     private bool _disposed;
+    private IntPtr _trayIconHandle;
+    private volatile bool _ownsTrayIcon;
 
     private const int WM_TRAYICON = 0x8000;
     private const int WM_DESTROY = 0x0002;
     private const int WM_CREATE = 0x0001;
+
+    // NOTIFYICONDATAW.uFlags bits. 0x10 is NIF_INFO (balloon), NOT NIF_TIP —
+    // the old code set NIF_INFO instead of NIF_TIP, so the tooltip never showed.
+    private const uint NIF_MESSAGE = 0x0001;
+    private const uint NIF_ICON = 0x0002;
+    private const uint NIF_TIP = 0x0004;
 
     public TrayManager(
         IMonitoringService monitor,
@@ -159,16 +167,30 @@ public sealed class TrayManager : IDisposable
     private unsafe void AddTrayIcon()
     {
         var iconPath = Path.Combine(AppContext.BaseDirectory, "Assets", "AppIcon.ico");
-        var hIcon = File.Exists(iconPath)
-            ? Native.ExtractIconW(IntPtr.Zero, iconPath, 0)
-            : Native.LoadIconW(IntPtr.Zero, new IntPtr(32512)); // IDI_APPLICATION
+        IntPtr hIcon;
+        if (File.Exists(iconPath))
+        {
+            // ExtractIconW transfers ownership of the HICON to the caller —
+            // it must be DestroyIcon'd when the icon is removed/replaced.
+            hIcon = Native.ExtractIconW(IntPtr.Zero, iconPath, 0);
+            _ownsTrayIcon = true;
+        }
+        else
+        {
+            // LoadIconW with IDI_APPLICATION returns a shared resource — must
+            // NOT be DestroyIcon'd.
+            hIcon = Native.LoadIconW(IntPtr.Zero, new IntPtr(32512)); // IDI_APPLICATION
+            _ownsTrayIcon = false;
+        }
+
+        _trayIconHandle = hIcon;
 
         var nid = new Native.NOTIFYICONDATAW
         {
             cbSize = (uint)Marshal.SizeOf<Native.NOTIFYICONDATAW>(),
             hWnd = _trayHwnd,
             uID = 1,
-            uFlags = 0x01 | 0x02 | 0x10,
+            uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP,
             uCallbackMessage = (uint)WM_TRAYICON,
             hIcon = hIcon,
             szTip = "PowerCulprit"
@@ -186,6 +208,12 @@ public sealed class TrayManager : IDisposable
             uID = 1
         };
         Native.Shell_NotifyIconW(2, ref nid);
+
+        // Destroy the HICON we own exactly once: whoever swaps the handle to
+        // Zero first (here, or the Dispose safety net) destroys it.
+        var handle = Interlocked.Exchange(ref _trayIconHandle, IntPtr.Zero);
+        if (_ownsTrayIcon && handle != IntPtr.Zero)
+            Native.DestroyIcon(handle);
     }
 
     public event Action? OnExportRequested;
@@ -197,6 +225,18 @@ public sealed class TrayManager : IDisposable
         _running = false;
         if (_trayHwnd != IntPtr.Zero)
             Native.PostMessageW(_trayHwnd, WM_DESTROY, IntPtr.Zero, IntPtr.Zero);
+
+        // Give the tray's STA thread a moment to pump WM_DESTROY, run
+        // RemoveTrayIcon (NIM_DELETE + DestroyIcon) and DestroyWindow before
+        // the process tears down. Without this, the background thread can be
+        // killed mid-cleanup and leave a ghost icon in the tray.
+        _msgThread?.Join(TimeSpan.FromSeconds(2));
+
+        // Safety net in case the tray thread did not get to RemoveTrayIcon
+        // (e.g. it was stuck): still release the owned HICON so we never leak.
+        var handle = Interlocked.Exchange(ref _trayIconHandle, IntPtr.Zero);
+        if (_ownsTrayIcon && handle != IntPtr.Zero)
+            Native.DestroyIcon(handle);
     }
 
     // ── Native API ────────────────────────────────
@@ -276,6 +316,10 @@ public sealed class TrayManager : IDisposable
 
         [DllImport("user32.dll")]
         public static extern IntPtr LoadIconW(IntPtr hInstance, IntPtr lpIconName);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool DestroyIcon(IntPtr hIcon);
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         public struct WNDCLASSEXW

@@ -292,74 +292,132 @@ public class MonitoringService : IMonitoringService
 
     private async Task RunLoopAsync(CancellationToken cancellationToken)
     {
-        await _databaseManager.InitializeAsync();
-        await _databaseManager.InsertSessionStartMarkerAsync(DateTime.UtcNow);
+        // Database initialization is the one startup step that must succeed for
+        // monitoring to be useful. If it fails (disk full, locked DB file,
+        // permissions), bail out and flip IsRunning to false so the UI does not
+        // sit showing "running" with no data ever arriving. Every other startup
+        // step below degrades independently.
         try
         {
-            var deduplicated = await _databaseManager.DeduplicateSourceStatusTimestampTiesAsync();
-            if (deduplicated > 0)
-                _logger.LogInformation("Removed {Count} duplicate source status rows", deduplicated);
+            await _databaseManager.InitializeAsync();
+            await _databaseManager.InsertSessionStartMarkerAsync(DateTime.UtcNow);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Source status deduplication failed — continuing");
+            _logger.LogError(ex, "Database initialization failed — monitoring cannot start");
+            TransitionToStopped();
+            return;
         }
 
         try
         {
-            var lastWmiRecordId = await _databaseManager.GetLatestWmiActivityEventRecordIdAsync();
-            if (lastWmiRecordId.HasValue)
-                _wmiActivityCollector.SetLastRecordId(lastWmiRecordId.Value);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to initialize WMI Activity event-log cursor");
-        }
-
-        await CleanupOldDataIfDueAsync(force: true);
-
-        // Optional ETW collection starts a background consumer and degrades on failure.
-        try { await _etwCollector.StartAsync(cancellationToken); }
-        catch (Exception ex) { _logger.LogWarning(ex, "Windows ETW activity collector failed to start"); }
-
-        // Optional WMI Activity collection reads the Operational event log incrementally.
-        try { await _wmiActivityCollector.StartAsync(cancellationToken); }
-        catch (Exception ex) { _logger.LogWarning(ex, "WMI Activity collector failed to start"); }
-
-        // One-time hardware init (must be done on startup)
-        _lhmCollector.Initialize();
-
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            var cycleStart = DateTime.UtcNow;
             try
             {
-                await CleanupOldDataIfDueAsync(force: false);
-                await CompactRawDataIfDueAsync(force: false);
-                await RunSingleCycleAsync();
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                break;
+                var deduplicated = await _databaseManager.DeduplicateSourceStatusTimestampTiesAsync();
+                if (deduplicated > 0)
+                    _logger.LogInformation("Removed {Count} duplicate source status rows", deduplicated);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Unhandled error in monitoring cycle — continuing");
+                _logger.LogWarning(ex, "Source status deduplication failed — continuing");
             }
 
-            var elapsed = (DateTime.UtcNow - cycleStart).TotalMilliseconds;
-            var delayMs = Math.Max(0, _intervalSeconds * 1000 - elapsed);
             try
             {
-                await Task.Delay((int)delayMs, cancellationToken);
+                var lastWmiRecordId = await _databaseManager.GetLatestWmiActivityEventRecordIdAsync();
+                if (lastWmiRecordId.HasValue)
+                    _wmiActivityCollector.SetLastRecordId(lastWmiRecordId.Value);
             }
-            catch (OperationCanceledException)
+            catch (Exception ex)
             {
-                break;
+                _logger.LogWarning(ex, "Failed to initialize WMI Activity event-log cursor");
             }
+
+            await CleanupOldDataIfDueAsync(force: true);
+
+            // Optional ETW collection starts a background consumer and degrades on failure.
+            try { await _etwCollector.StartAsync(cancellationToken); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Windows ETW activity collector failed to start"); }
+
+            // Optional WMI Activity collection reads the Operational event log incrementally.
+            try { await _wmiActivityCollector.StartAsync(cancellationToken); }
+            catch (Exception ex) { _logger.LogWarning(ex, "WMI Activity collector failed to start"); }
+
+            // One-time hardware init (must be done on startup)
+            _lhmCollector.Initialize();
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                var cycleStart = DateTime.UtcNow;
+                try
+                {
+                    await CleanupOldDataIfDueAsync(force: false);
+                    await CompactRawDataIfDueAsync(force: false);
+                    await RunSingleCycleAsync();
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Unhandled error in monitoring cycle — continuing");
+                }
+
+                var elapsed = (DateTime.UtcNow - cycleStart).TotalMilliseconds;
+                var delayMs = Math.Max(0, _intervalSeconds * 1000 - elapsed);
+                try
+                {
+                    await Task.Delay((int)delayMs, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+
+            _logger.LogInformation("Monitoring loop exited");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Normal shutdown via StopAsync cancellation — do not transition,
+            // StopAsync owns the final IsRunning=false.
+            _logger.LogInformation("Monitoring loop cancelled");
+        }
+        catch (Exception ex)
+        {
+            // A fault that escaped the per-cycle guard would otherwise leave
+            // IsRunning stuck at true with the loop dead. Flip to stopped so the
+            // UI reflects reality. _loopTask never enters the Faulted state, so
+            // there is no unobserved-task window.
+            _logger.LogError(ex, "Monitoring loop terminated unexpectedly");
+            TransitionToStopped();
+        }
+    }
+
+    /// <summary>
+    /// Flips IsRunning to false and signals the writer loop to exit, without
+    /// awaiting the loop/writer tasks (the caller is the loop task itself, so
+    /// awaiting would deadlock). Used when the loop dies on its own — startup
+    /// failure or an unexpected exception — so the UI does not report "running"
+    /// while nothing is sampling. Idempotent: StopAsync calling it later is a
+    /// no-op. Does not dispose _cts or stop ETW/WMI — that remains StopAsync's
+    /// job.
+    /// </summary>
+    private void TransitionToStopped()
+    {
+        Channel<MonitoringWriteBatch>? writeQueue;
+        lock (_lock)
+        {
+            if (!IsRunning)
+                return;
+            IsRunning = false;
+            writeQueue = _writeQueue;
         }
 
-        _logger.LogInformation("Monitoring loop exited");
+        // Let the writer drain and exit rather than blocking on a full queue.
+        writeQueue?.Writer.TryComplete();
+        RaiseRunningChanged(false);
     }
 
     private async Task CleanupOldDataIfDueAsync(bool force)
@@ -420,22 +478,33 @@ public class MonitoringService : IMonitoringService
         if (queue is null)
             return;
 
-        await foreach (var batch in queue.Reader.ReadAllAsync())
+        try
         {
-            try
+            await foreach (var batch in queue.Reader.ReadAllAsync())
             {
-                await _databaseManager.InsertMonitoringCycleAsync(
-                    batch.PowerSample,
-                    batch.ProcessSamples,
-                    batch.GpuSamples,
-                    batch.HardwareSamples,
-                    batch.SourceStatuses,
-                    batch.WmiActivitySamples);
+                try
+                {
+                    await _databaseManager.InsertMonitoringCycleAsync(
+                        batch.PowerSample,
+                        batch.ProcessSamples,
+                        batch.GpuSamples,
+                        batch.HardwareSamples,
+                        batch.SourceStatuses,
+                        batch.WmiActivitySamples);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Database write failed");
+                }
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Database write failed");
-            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Channel completion during shutdown — expected.
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Database writer loop terminated unexpectedly");
         }
     }
 
@@ -450,6 +519,21 @@ public class MonitoringService : IMonitoringService
         IReadOnlyList<WmiActivitySample> wmiActivitySamples = Array.Empty<WmiActivitySample>();
         var gpuSamplesAreFresh = false;
         var gpuSamplingEnabled = IsGpuSamplingEnabled;
+
+        // Snapshot the GPU-sampling bookkeeping fields under the same lock that
+        // SetGpuSamplingEnabled mutates them under. This avoids racing the UI
+        // thread toggling GPU sampling mid-cycle: reads below use the locals,
+        // and writes below also take the lock so a disable cannot leave stale
+        // values behind for the next cycle.
+        DateTime lastGpuEngineCollectUtc;
+        IReadOnlyList<GpuProcessSample> lastGpuSamples;
+        DateTime lastSourceStatusRefresh;
+        lock (_lock)
+        {
+            lastGpuEngineCollectUtc = _lastGpuEngineCollectUtc;
+            lastGpuSamples = _lastGpuSamples;
+            lastSourceStatusRefresh = _lastSourceStatusRefresh;
+        }
 
         // ── Collect battery ────────────────────────
         try { batterySample = _batteryCollector.Collect(); }
@@ -478,24 +562,29 @@ public class MonitoringService : IMonitoringService
         catch (Exception ex) { _logger.LogError(ex, "WMI Activity collector snapshot threw"); }
 
         // ── Collect GPU Engine ────────────────────
-        if (gpuSamplingEnabled && now - _lastGpuEngineCollectUtc >= GpuEngineCollectInterval)
+        if (gpuSamplingEnabled && now - lastGpuEngineCollectUtc >= GpuEngineCollectInterval)
         {
             try
             {
                 gpuSamples = _gpuEngineCollector.Collect();
-                _lastGpuSamples = gpuSamples;
-                _lastGpuEngineCollectUtc = now;
+                lastGpuSamples = gpuSamples;
+                lastGpuEngineCollectUtc = now;
+                lock (_lock)
+                {
+                    _lastGpuSamples = lastGpuSamples;
+                    _lastGpuEngineCollectUtc = lastGpuEngineCollectUtc;
+                }
                 gpuSamplesAreFresh = true;
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "WindowsGpuEngineCollector threw");
-                gpuSamples = _lastGpuSamples;
+                gpuSamples = lastGpuSamples;
             }
         }
         else if (gpuSamplingEnabled)
         {
-            gpuSamples = _lastGpuSamples;
+            gpuSamples = lastGpuSamples;
         }
         else
         {
@@ -506,7 +595,7 @@ public class MonitoringService : IMonitoringService
         try { hwSamples = _lhmCollector.Collect(); }
         catch (Exception ex) { _logger.LogError(ex, "LHMCollector threw"); }
 
-        // ── Derive CPU / iGPU power ────────������──
+        // ── Derive CPU / iGPU power ─────────────────
         double? cpuPkgWatts = null;
         double? igpuValue = null;
         double? igpuActivityPct = null;
@@ -529,10 +618,11 @@ public class MonitoringService : IMonitoringService
         catch (Exception ex) { _logger.LogError(ex, "IntelGpuPowerCollector threw"); }
 
         // ── Refresh source statuses ───────────────
-        if (now - _lastSourceStatusRefresh >= SourceStatusRefreshInterval)
+        if (now - lastSourceStatusRefresh >= SourceStatusRefreshInterval)
         {
             sourceStatuses = RefreshSourceStatuses(now, hwSamples, gpuSamples, gpuSamplingEnabled);
-            _lastSourceStatusRefresh = now;
+            lastSourceStatusRefresh = now;
+            lock (_lock) { _lastSourceStatusRefresh = lastSourceStatusRefresh; }
         }
 
         // ── Write to database ─────────────────────

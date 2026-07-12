@@ -49,12 +49,14 @@ public class CpuTimelineBuilderTests
     [Fact]
     public void Analyze_ComputesCpuEnergyAndCorrelation()
     {
+        // Samples 1 minute apart — contiguous sampling (under the 10-minute
+        // gap threshold), so CPU energy integrates across all segments.
         var samples = new[]
         {
             new CpuTimelineSample(_baseTime, 90, 0.0, 3000, 10, 10),
-            new CpuTimelineSample(_baseTime.AddHours(1), 88, 20.0, 3500, 20, 20),
-            new CpuTimelineSample(_baseTime.AddHours(2), 85, 50.0, 4000, 30, 30),
-            new CpuTimelineSample(_baseTime.AddHours(3), 81, 90.0, 4500, 40, 40)
+            new CpuTimelineSample(_baseTime.AddMinutes(1), 88, 20.0, 3500, 20, 20),
+            new CpuTimelineSample(_baseTime.AddMinutes(2), 85, 50.0, 4000, 30, 30),
+            new CpuTimelineSample(_baseTime.AddMinutes(3), 81, 90.0, 4500, 40, 40)
         };
 
         var result = CpuAttributionAnalyzer.Analyze(samples);
@@ -63,9 +65,33 @@ public class CpuTimelineBuilderTests
         Assert.Equal(90, result.EnergyUsedWh);
         Assert.Equal(25, result.AvgCpuPackagePowerWatts);
         Assert.Equal(40, result.MaxCpuPackagePowerWatts);
-        Assert.Equal(75, result.CpuPackageEnergyWh);
+        // Trapezoidal: (15 + 25 + 35) W × (1/60) h = 75/60 = 1.25 Wh.
+        Assert.Equal(1.25, result.CpuPackageEnergyWh);
         Assert.True(result.CpuPowerDischargeCorrelation > 0.9);
         Assert.Contains("CPU package", result.Summary);
+    }
+
+    [Fact]
+    public void Analyze_GapLargerThanMaxSampleGap_DoesNotExtrapolateCpuEnergy()
+    {
+        // Constant 25 W CPU package power, but a 2-hour gap (suspend) sits
+        // between the second and third samples. CumulativeEnergyWh is frozen
+        // across the gap (mirroring CpuTimelineBuilder). The CPU energy total
+        // must reflect only the awake segments, not 25 W × 2 h.
+        var samples = new[]
+        {
+            new CpuTimelineSample(_baseTime, 90, 0.0, 3000, 10, 25),
+            new CpuTimelineSample(_baseTime.AddMinutes(1), 88, 25.0 / 60.0, 3500, 20, 25),
+            new CpuTimelineSample(_baseTime.AddHours(2).AddMinutes(1), 88, 25.0 / 60.0, 3500, 20, 25),
+            new CpuTimelineSample(_baseTime.AddHours(2).AddMinutes(2), 85, 50.0 / 60.0, 4000, 30, 25)
+        };
+
+        var result = CpuAttributionAnalyzer.Analyze(samples);
+
+        // Only two 1-minute awake segments at 25 W ≈ 0.833 Wh. Pre-fix this was
+        // ~50 Wh because the 2-hour gap was integrated at 25 W.
+        Assert.True(result.CpuPackageEnergyWh < 1.0,
+            $"Expected gap to be skipped, got {result.CpuPackageEnergyWh} Wh");
     }
 
     [Fact]

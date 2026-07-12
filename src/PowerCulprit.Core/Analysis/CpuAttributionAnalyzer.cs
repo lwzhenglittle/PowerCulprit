@@ -74,10 +74,21 @@ public static class CpuAttributionAnalyzer
         {
             var previous = samples[i - 1];
             var current = samples[i];
-            var elapsedHours = (current.TimestampUtc - previous.TimestampUtc).TotalHours;
-            if (elapsedHours <= 0)
+            var span = current.TimestampUtc - previous.TimestampUtc;
+            if (span <= TimeSpan.Zero)
                 continue;
 
+            // Skip unobserved intervals (sleep / hibernate / monitoring gap) —
+            // never extrapolate boundary wattage across a gap. Reusing
+            // GapDetector.MaxSampleGap keeps the "what counts as a gap" notion
+            // identical to DischargeEnergyCalculator and CpuTimelineBuilder, so
+            // the CPU energy total agrees with the battery energy total on what
+            // was awake. Without this, a 2-hour suspend would be integrated as
+            // boundary watts × 2h and massively over-count CPU energy.
+            if (span > GapDetector.MaxSampleGap)
+                continue;
+
+            var elapsedHours = span.TotalHours;
             var previousWatts = previous.CpuPackagePowerWatts;
             var currentWatts = current.CpuPackagePowerWatts;
             if (!previousWatts.HasValue && !currentWatts.HasValue)
@@ -107,9 +118,18 @@ public static class CpuAttributionAnalyzer
                 continue;
             }
 
-            var elapsedHours = (current.TimestampUtc - previous.TimestampUtc).TotalHours;
-            if (elapsedHours <= 0)
+            var span = current.TimestampUtc - previous.TimestampUtc;
+            if (span <= TimeSpan.Zero)
                 continue;
+
+            // Skip unobserved intervals — a span larger than GapDetector.MaxSampleGap
+            // is a sleep/hibernate/monitoring gap. Pairing boundary power with the
+            // near-zero cumulative-energy delta across hours would inject bogus
+            // zero-rate points and distort the Pearson coefficient.
+            if (span > GapDetector.MaxSampleGap)
+                continue;
+
+            var elapsedHours = span.TotalHours;
 
             power.Add(current.CpuPackagePowerWatts.Value);
             energyDelta.Add((current.CumulativeEnergyWh.Value - previous.CumulativeEnergyWh.Value) / elapsedHours);
