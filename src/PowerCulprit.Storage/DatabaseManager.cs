@@ -867,32 +867,7 @@ public class DatabaseManager : IDisposable
             var connection = await GetOrOpenWriteConnectionAsync();
             await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync();
 
-            const string sql = """
-                INSERT INTO gpu_process_samples
-                    (timestamp_utc, pid, process_name, engine_name, engine_type, utilization_percent)
-                VALUES
-                    ($ts, $pid, $pn, $en, $et, $up);
-                """;
-
-            await using var cmd = new SqliteCommand(sql, connection, transaction);
-            var p_ts = cmd.Parameters.Add("$ts", SqliteType.Text);
-            var p_pid = cmd.Parameters.Add("$pid", SqliteType.Integer);
-            var p_pn = cmd.Parameters.Add("$pn", SqliteType.Text);
-            var p_en = cmd.Parameters.Add("$en", SqliteType.Text);
-            var p_et = cmd.Parameters.Add("$et", SqliteType.Text);
-            var p_up = cmd.Parameters.Add("$up", SqliteType.Real);
-
-            foreach (var sample in samples)
-            {
-                p_ts.Value = SerializeTimestamp(sample.TimestampUtc);
-                p_pid.Value = (object?)sample.Pid ?? DBNull.Value;
-                p_pn.Value = (object?)sample.ProcessName ?? DBNull.Value;
-                p_en.Value = sample.EngineName;
-                p_et.Value = sample.EngineType.ToString();
-                p_up.Value = sample.UtilizationPercent;
-
-                await cmd.ExecuteNonQueryAsync();
-            }
+            await InsertGpuProcessSamplesInTransactionAsync(connection, transaction, samples);
 
             await transaction.CommitAsync();
         }
@@ -917,34 +892,7 @@ public class DatabaseManager : IDisposable
             var connection = await GetOrOpenWriteConnectionAsync();
             await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync();
 
-            const string sql = """
-                INSERT INTO hardware_sensor_samples
-                    (timestamp_utc, source, device_name, sensor_name, metric_name, value, unit)
-                VALUES
-                    ($ts, $src, $dn, $sn, $mn, $val, $u);
-                """;
-
-            await using var cmd = new SqliteCommand(sql, connection, transaction);
-            var p_ts  = cmd.Parameters.Add("$ts",  SqliteType.Text);
-            var p_src = cmd.Parameters.Add("$src", SqliteType.Text);
-            var p_dn  = cmd.Parameters.Add("$dn",  SqliteType.Text);
-            var p_sn  = cmd.Parameters.Add("$sn",  SqliteType.Text);
-            var p_mn  = cmd.Parameters.Add("$mn",  SqliteType.Text);
-            var p_val = cmd.Parameters.Add("$val", SqliteType.Real);
-            var p_u   = cmd.Parameters.Add("$u",   SqliteType.Text);
-
-            foreach (var sample in samples)
-            {
-                p_ts.Value  = SerializeTimestamp(sample.TimestampUtc);
-                p_src.Value = sample.Source;
-                p_dn.Value  = sample.DeviceName;
-                p_sn.Value  = sample.SensorName;
-                p_mn.Value  = sample.MetricName;
-                p_val.Value = sample.Value;
-                p_u.Value   = sample.Unit;
-
-                await cmd.ExecuteNonQueryAsync();
-            }
+            await InsertHardwareSensorSamplesInTransactionAsync(connection, transaction, samples);
 
             await transaction.CommitAsync();
         }
@@ -1386,6 +1334,13 @@ public class DatabaseManager : IDisposable
 
         foreach (var sample in samples)
         {
+            // SQLite binds double.NaN/Infinity as NULL, which would violate the
+            // NOT NULL constraint on utilization_percent and roll back the whole
+            // monitoring-cycle transaction. Skip the bad row instead of losing
+            // every sample in the cycle.
+            if (!double.IsFinite(sample.UtilizationPercent))
+                continue;
+
             p_ts.Value = SerializeTimestamp(sample.TimestampUtc);
             p_pid.Value = (object?)sample.Pid ?? DBNull.Value;
             p_pn.Value = (object?)sample.ProcessName ?? DBNull.Value;
@@ -1419,6 +1374,12 @@ public class DatabaseManager : IDisposable
 
         foreach (var sample in samples)
         {
+            // Same NaN guard as the GPU insert above: a non-finite value would
+            // bind as NULL, violate NOT NULL on value, and roll back the whole
+            // monitoring-cycle transaction.
+            if (!double.IsFinite(sample.Value))
+                continue;
+
             p_ts.Value  = SerializeTimestamp(sample.TimestampUtc);
             p_src.Value = sample.Source;
             p_dn.Value  = sample.DeviceName;
@@ -2028,7 +1989,10 @@ public class DatabaseManager : IDisposable
             SELECT process_name,
                    CASE WHEN SUM(sample_count) = 0 THEN 0 ELSE SUM(util_sum) / SUM(sample_count) END AS avg_util,
                    MAX(max_util) AS max_util,
-                   SUM(video_activity) AS video_activity
+                   -- Per-engine-row average, same convention as avg_util: video_activity
+                   -- is stored as a SUM, so divide by the row count to keep the result
+                   -- a true percentage that does not grow with the window length.
+                   CASE WHEN SUM(sample_count) = 0 THEN 0 ELSE SUM(video_activity) / SUM(sample_count) END AS video_activity
             FROM combined
             GROUP BY process_name;
             """;

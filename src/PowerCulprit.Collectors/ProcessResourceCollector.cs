@@ -274,6 +274,9 @@ public class ProcessResourceCollector
                     {
                         Pid = (int)pid,
                         ProcessName = cachedInfo.ProcessName,
+                        // Carried into the next cycle's delta computation so PID
+                        // reuse can be detected — see IsSameProcessForDelta.
+                        CreateTimeUtc = cachedInfo.CreationTimeUtc,
                         ExecutablePath = cachedInfo.ExecutablePath,
                         CommandLine = cachedInfo.CommandLine,
                         ParentPid = cachedInfo.ParentPid ?? ToNullablePid(info.InheritedFromUniqueProcessId),
@@ -504,11 +507,29 @@ public class ProcessResourceCollector
         };
     }
 
+    /// <summary>
+    /// Guards CPU/IO deltas against PID reuse: two snapshot entries sharing a PID
+    /// but having different process creation times are different processes, so a
+    /// delta between their cumulative counters would blend the exited process's
+    /// history into the new one's sample. When either timestamp is unknown we
+    /// cannot tell the entries apart and conservatively keep PID-only matching.
+    /// </summary>
+    internal static bool IsSameProcessForDelta(DateTime? previousCreateTimeUtc, DateTime? currentCreateTimeUtc)
+    {
+        if (previousCreateTimeUtc.HasValue && currentCreateTimeUtc.HasValue)
+            return previousCreateTimeUtc.Value == currentCreateTimeUtc.Value;
+
+        return true;
+    }
+
     private ProcessSample ApplyCpuDelta(
         ProcessSample sample, ProcessEntry entry, int pid, double deltaSeconds)
     {
         var previousSnapshot = _previousSnapshot;
         if (previousSnapshot is null || !previousSnapshot.Entries.TryGetValue(pid, out var prevEntry))
+            return sample;
+
+        if (!IsSameProcessForDelta(prevEntry.CreateTimeUtc, entry.CreateTimeUtc))
             return sample;
 
         if (entry.TotalCpuTime.HasValue && prevEntry.TotalCpuTime.HasValue)
@@ -532,6 +553,9 @@ public class ProcessResourceCollector
     {
         var previousSnapshot = _previousSnapshot;
         if (previousSnapshot is null || !previousSnapshot.Entries.TryGetValue(pid, out var prevEntry))
+            return sample;
+
+        if (!IsSameProcessForDelta(prevEntry.CreateTimeUtc, entry.CreateTimeUtc))
             return sample;
 
         if (entry.ReadTransferBytes.HasValue && prevEntry.ReadTransferBytes.HasValue)
@@ -575,6 +599,7 @@ public class ProcessResourceCollector
     {
         public int Pid { get; init; }
         public string? ProcessName { get; init; }
+        public DateTime? CreateTimeUtc { get; init; }
         public string? ExecutablePath { get; set; }
         public string? CommandLine { get; set; }
         public int? ParentPid { get; set; }

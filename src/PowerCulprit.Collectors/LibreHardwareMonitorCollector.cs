@@ -21,13 +21,17 @@ public class LibreHardwareMonitorCollector : IDisposable
     private DateTime _lastSensorBindingRefreshUtc = DateTime.MinValue;
     private static readonly TimeSpan SensorBindingRefreshInterval = TimeSpan.FromSeconds(30);
 
+    private DateTime _nextInitRetryUtc = DateTime.MinValue;
+    private static readonly TimeSpan InitRetryInterval = TimeSpan.FromSeconds(30);
+
     public LibreHardwareMonitorCollector(ILogger<LibreHardwareMonitorCollector> logger)
     {
         _logger = logger;
     }
 
     /// <summary>
-    /// Initializes and opens the LHM computer. Call once before collecting.
+    /// Initializes and opens the LHM computer. Idempotent: a failed attempt
+    /// resets the latch so a later call retries from scratch.
     /// </summary>
     public void Initialize()
     {
@@ -61,7 +65,13 @@ public class LibreHardwareMonitorCollector : IDisposable
         }
         catch (Exception ex)
         {
+            // Do not stay latched on a transient failure (driver not ready,
+            // first non-admin run): reset the latch and drop the half-opened
+            // computer so a later Initialize() can retry from scratch.
+            _initialized = false;
             _isAvailable = false;
+            try { _computer?.Close(); } catch { /* best effort */ }
+            _computer = null;
             _logger.LogWarning(ex, "LibreHardwareMonitor initialization failed");
         }
     }
@@ -75,7 +85,18 @@ public class LibreHardwareMonitorCollector : IDisposable
         var now = DateTime.UtcNow;
 
         if (_computer is null || !_isAvailable)
-            return samples;
+        {
+            // A failed/absent initialization must not blind the collector for
+            // the rest of the process lifetime — retry with backoff.
+            if (ShouldRetryInit(_initialized, _isAvailable, now, _nextInitRetryUtc))
+            {
+                _nextInitRetryUtc = now + InitRetryInterval;
+                Initialize();
+            }
+
+            if (_computer is null || !_isAvailable)
+                return samples;
+        }
 
         try
         {
@@ -226,6 +247,13 @@ public class LibreHardwareMonitorCollector : IDisposable
     }
 
     // ── Helpers ──────────────────────────────────
+
+    // Pure decision for the lazy init retry in Collect(): retry when init was
+    // never run or did not succeed, once the backoff deadline has passed.
+    internal static bool ShouldRetryInit(bool initialized, bool isAvailable, DateTime now, DateTime nextRetryUtc)
+    {
+        return (!initialized || !isAvailable) && now >= nextRetryUtc;
+    }
 
     private static bool IsRelevantSensor(LibreHardwareMonitor.Hardware.SensorType type)
     {

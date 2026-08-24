@@ -11,10 +11,13 @@ namespace PowerCulprit.Desktop.ViewModels;
 public partial class CpuAttributionViewModel : ObservableObject
 {
     private static readonly TimeSpan DefaultHistoryWindow = TimeSpan.FromHours(6);
+    private static readonly TimeSpan SelectionDebounce = TimeSpan.FromMilliseconds(400);
 
     private readonly DatabaseManager _database;
     private readonly ILogger<CpuAttributionViewModel> _logger;
+    private readonly DispatcherQueue _dispatcher;
     private CancellationTokenSource? _loadCts;
+    private DispatcherQueueTimer? _rangeDebounceTimer;
     private int _powerSampleCount;
     private int _hardwareSampleCount;
 
@@ -30,6 +33,7 @@ public partial class CpuAttributionViewModel : ObservableObject
     {
         _database = database;
         _logger = logger;
+        _dispatcher = dispatcher;
     }
 
     [ObservableProperty]
@@ -116,15 +120,41 @@ public partial class CpuAttributionViewModel : ObservableObject
             return;
 
         var clamped = ClampRange(fromUtc, toUtc);
-        ApplySelectedRange(clamped.FromUtc, clamped.ToUtc);
+
+        // Cheap feedback (selected-range text + axis sync) applies immediately;
+        // the O(n) attribution recompute is debounced so wheel/drag interaction
+        // does not run a full analysis per tick.
+        _selectedFromUtc = clamped.FromUtc;
+        _selectedToUtc = clamped.ToUtc;
+        ChartVisibleFromUtc = clamped.FromUtc;
+        ChartVisibleToUtc = clamped.ToUtc;
+        SelectedRangeText = FormatRangeWithDuration(clamped.FromUtc, clamped.ToUtc);
+
+        ScheduleRangeAttribution();
+    }
+
+    private void ScheduleRangeAttribution()
+    {
+        _rangeDebounceTimer ??= CreateRangeDebounceTimer();
+        _rangeDebounceTimer.Stop();
+        _rangeDebounceTimer.Start();
+    }
+
+    private DispatcherQueueTimer CreateRangeDebounceTimer()
+    {
+        var timer = _dispatcher.CreateTimer();
+        timer.Interval = SelectionDebounce;
+        timer.IsRepeating = false;
+        timer.Tick += (_, _) => UpdateRangeAttribution(_selectedFromUtc, _selectedToUtc);
+        return timer;
     }
 
     private async Task LoadLatestCycleAsync()
     {
         try
         {
-            await _database.RebuildBatteryCyclesAsync();
-            var cycles = await _database.GetLatestBatteryDisplayCyclesAsync(1);
+            await Task.Run(() => _database.RebuildBatteryCyclesAsync());
+            var cycles = await Task.Run(() => _database.GetLatestBatteryDisplayCyclesAsync(1));
             var cycle = cycles.FirstOrDefault();
             if (cycle is null)
             {
@@ -158,14 +188,16 @@ public partial class CpuAttributionViewModel : ObservableObject
             ErrorText = "";
             HistoryStatusText = "Loading CPU attribution...";
 
-            var powerTask = _database.GetSystemPowerSamplesAsync(fromUtc, toUtc);
-            var hardwareTask = _database.GetHardwareSensorSamplesAsync(fromUtc, toUtc);
+            var powerTask = Task.Run(() => _database.GetSystemPowerSamplesAsync(fromUtc, toUtc));
+            var hardwareTask = Task.Run(() => _database.GetHardwareSensorSamplesAsync(fromUtc, toUtc));
             await Task.WhenAll(powerTask, hardwareTask);
             token.ThrowIfCancellationRequested();
 
             var powerSamples = await powerTask;
             var hardwareSamples = await hardwareTask;
-            var timeline = CpuTimelineBuilder.Build(powerSamples, hardwareSamples);
+            var timeline = await Task.Run(
+                () => CpuTimelineBuilder.Build(powerSamples, hardwareSamples),
+                token);
 
             ApplyLoadedRange(fromUtc, toUtc, timeline, powerSamples.Count, hardwareSamples.Count);
         }
@@ -221,6 +253,11 @@ public partial class CpuAttributionViewModel : ObservableObject
         ChartVisibleToUtc = toUtc;
         SelectedRangeText = FormatRangeWithDuration(fromUtc, toUtc);
 
+        UpdateRangeAttribution(fromUtc, toUtc);
+    }
+
+    private void UpdateRangeAttribution(DateTime fromUtc, DateTime toUtc)
+    {
         var selectedTimeline = ChartSamples
             .Where(sample => sample.TimestampUtc >= fromUtc && sample.TimestampUtc <= toUtc)
             .ToList();

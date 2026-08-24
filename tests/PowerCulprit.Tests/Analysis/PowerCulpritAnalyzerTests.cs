@@ -808,4 +808,115 @@ public class PowerCulpritAnalyzerTests
         Assert.DoesNotContain("limited power impact", item.Reason);
         Assert.True(item.Score >= 100, $"Expected score driven by short-lived instances, got {item.Score}");
     }
+
+    // ──────────────────────────────────────────────
+    // GPU video decode activity — per-engine-row average, not a raw sum.
+    // Pre-fix the activity was summed over every sample in the window, so the
+    // score contribution (and the printed percentage) grew without bound as
+    // the window got longer.
+    // ──────────────────────────────────────────────
+
+    [Fact]
+    public void VideoDecodeActivity_DoesNotScaleWithSampleCount()
+    {
+        // 10 sampling cycles of constant 20% video decode. The reported video
+        // activity must stay ~20% no matter how many samples the window holds
+        // (pre-fix this came out as the raw sum: 10 × 20 = 200).
+        var processes = new List<ProcessSample>();
+        var gpuSamples = new List<GpuProcessSample>();
+        for (int i = 0; i < 10; i++)
+        {
+            var ts = _baseTime.AddSeconds(i * 2);
+            processes.Add(new ProcessSample
+            {
+                TimestampUtc = ts, Pid = 1, ProcessName = "player.exe", CpuPercent = 2.0
+            });
+            gpuSamples.Add(new GpuProcessSample
+            {
+                TimestampUtc = ts, Pid = 1, ProcessName = "player.exe",
+                EngineName = "eng_vdec", EngineType = GpuEngineType.VideoDecode,
+                UtilizationPercent = 20.0
+            });
+        }
+
+        var result = _analyzer.Analyze(
+            TimeSpan.FromMinutes(30), 10,
+            Array.Empty<SystemPowerSample>(),
+            processes,
+            gpuSamples);
+
+        var item = Assert.Single(result);
+        Assert.Contains("GPU Video 20.0% active", item.Reason);
+        // Pre-fix the raw sum pushed the score past 380; with a bounded
+        // percentage the total stays modest.
+        Assert.True(item.Score < 150, $"Expected bounded score, got {item.Score}");
+    }
+
+    [Fact]
+    public void VideoDecodeActivity_OnlyCountsVideoEngines()
+    {
+        // 3D and VideoDecode rows interleave. The video component must cover
+        // only video-engine rows: 5 × 20 summed over video rows, averaged over
+        // all 10 engine rows (same per-row convention as AvgGpuPercent) → 10.0.
+        var processes = new List<ProcessSample>();
+        var gpuSamples = new List<GpuProcessSample>();
+        for (int i = 0; i < 5; i++)
+        {
+            var ts = _baseTime.AddSeconds(i * 2);
+            processes.Add(new ProcessSample
+            {
+                TimestampUtc = ts, Pid = 1, ProcessName = "player.exe", CpuPercent = 2.0
+            });
+            gpuSamples.Add(new GpuProcessSample
+            {
+                TimestampUtc = ts, Pid = 1, ProcessName = "player.exe",
+                EngineName = "eng_3d", EngineType = GpuEngineType.ThreeD,
+                UtilizationPercent = 50.0
+            });
+            gpuSamples.Add(new GpuProcessSample
+            {
+                TimestampUtc = ts, Pid = 1, ProcessName = "player.exe",
+                EngineName = "eng_vdec", EngineType = GpuEngineType.VideoDecode,
+                UtilizationPercent = 20.0
+            });
+        }
+
+        var result = _analyzer.Analyze(
+            TimeSpan.FromMinutes(30), 10,
+            Array.Empty<SystemPowerSample>(),
+            processes,
+            gpuSamples);
+
+        var item = Assert.Single(result);
+        Assert.Equal(35.0, item.AvgGpuPercent); // (5×50 + 5×20) / 10
+        Assert.Contains("GPU Video 10.0% active", item.Reason);
+    }
+
+    [Fact]
+    public void AnalyzeAggregates_VideoActivity_IsAveragedNotSummed()
+    {
+        // Defensive convention: even if a caller hands more than one GPU
+        // aggregate row per process name, the analyzer must average the
+        // per-row averages instead of summing them. (Current SQL returns one
+        // row per process name, where Average is the identity.)
+        var aggregates = new List<ProcessAnalysisAggregate>
+        {
+            new() { ProcessName = "player.exe", AvgCpuPercent = 2.0, MaxCpuPercent = 2.0 }
+        };
+        var gpuAggregates = new List<GpuProcessAnalysisAggregate>
+        {
+            new() { ProcessName = "player.exe", AvgUtilizationPercent = 20.0, MaxUtilizationPercent = 20.0, VideoActivityPercent = 40.0 },
+            new() { ProcessName = "player.exe", AvgUtilizationPercent = 20.0, MaxUtilizationPercent = 20.0, VideoActivityPercent = 20.0 }
+        };
+
+        var result = _analyzer.AnalyzeAggregates(
+            TimeSpan.FromMinutes(30), 10,
+            Array.Empty<SystemPowerSample>(),
+            aggregates,
+            gpuAggregates);
+
+        var item = Assert.Single(result);
+        Assert.Contains("GPU Video 30.0% active", item.Reason);
+        Assert.True(item.Score < 150, $"Expected bounded score, got {item.Score}");
+    }
 }

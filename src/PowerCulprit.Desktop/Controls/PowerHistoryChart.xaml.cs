@@ -238,7 +238,7 @@ public sealed partial class PowerHistoryChart : UserControl
         ds.DrawText("Battery %", (float)plot.Left + 22, legendY, colors.BatteryLine, AxisTextFormat);
 
         ds.FillCircle(new Vector2((float)plot.Left + 102, legendY + 6), 4, colors.DischargeLine);
-        ds.DrawText("Discharge W", (float)plot.Left + 112, legendY, colors.DischargeLine, AxisTextFormat);
+        ds.DrawText("Est. discharge W", (float)plot.Left + 112, legendY, colors.DischargeLine, AxisTextFormat);
     }
 
     private IReadOnlyList<Vector2> BuildDisplayPoints(
@@ -338,7 +338,7 @@ public sealed partial class PowerHistoryChart : UserControl
         var x = MapX(nearest.TimestampUtc, fromUtc, toUtc, plot);
         ds.DrawLine(x, (float)plot.Top, x, (float)plot.Bottom, colors.HoverLine, 1);
 
-        var text = $"{nearest.TimestampUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}\nBattery: {FormatOptional(nearest.BatteryPercent, "%")}\nDischarge: {FormatOptional(nearest.DischargeWatts, " W")}";
+        var text = $"{nearest.TimestampUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}\nBattery: {FormatOptional(nearest.BatteryPercent, "%")}\nEst. discharge: {FormatOptional(nearest.DischargeWatts, " W")}";
         var boxX = Math.Min((float)plot.Right - 180, Math.Max((float)plot.Left + 8, x + 10));
         var boxY = (float)plot.Top + 10;
         ds.FillRoundedRectangle(boxX, boxY, 170, 64, 6, 6, colors.TooltipBackground);

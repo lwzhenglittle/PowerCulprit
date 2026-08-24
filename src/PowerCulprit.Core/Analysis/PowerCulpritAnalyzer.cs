@@ -34,7 +34,10 @@ public class PowerCulpritAnalyzer
                 g => new GpuAggregate(
                     g.Average(x => x.AvgUtilizationPercent),
                     g.Max(x => x.MaxUtilizationPercent),
-                    g.Sum(x => x.VideoActivityPercent)),
+                    // VideoActivityPercent arrives as a per-engine-row average from
+                    // SQL (one row per process name), so Average — not Sum — keeps
+                    // it a true percentage.
+                    g.Average(x => x.VideoActivityPercent)),
                 StringComparer.OrdinalIgnoreCase);
 
         var scored = new List<CulpritReportItem>();
@@ -517,8 +520,12 @@ public class PowerCulpritAnalyzer
         return new GpuAggregate(
             list.Average(x => x.UtilizationPercent),
             list.Max(x => x.UtilizationPercent),
+            // Per-engine-row average video contribution — the same convention as
+            // AvgUtil, so the value stays a true percentage instead of growing
+            // with the number of samples in the window (list.Count >= 1 here
+            // because the input comes out of a GroupBy).
             list.Where(x => x.EngineType is GpuEngineType.VideoDecode or GpuEngineType.VideoEncode)
-                .Sum(x => x.UtilizationPercent));
+                .Sum(x => x.UtilizationPercent) / list.Count);
     }
 
     private static DateTime MaxT(DateTime a, DateTime b) => a > b ? a : b;

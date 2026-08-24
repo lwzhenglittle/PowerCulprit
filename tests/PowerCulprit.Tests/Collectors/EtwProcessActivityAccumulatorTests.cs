@@ -93,4 +93,44 @@ public class EtwProcessActivityAccumulatorTests
         Assert.False(activity.IsShortLived);
         Assert.True(activity.WasObservedInPoll);
     }
+
+    [Fact]
+    public void RecordLostEvents_AccumulatesIntoSnapshotCounters()
+    {
+        var accumulator = new EtwProcessActivityAccumulator();
+        var t0 = new DateTime(2026, 06, 25, 12, 0, 0, DateTimeKind.Utc);
+
+        accumulator.RecordLostEvents(3);
+        accumulator.RecordLostEvents(4);
+
+        var snapshot = accumulator.SnapshotAndReset(t0);
+
+        Assert.Equal(7, snapshot.Counters.LostEventCount);
+        Assert.Equal(7, snapshot.LostEventCount);
+        Assert.True(snapshot.HadLostEvents);
+    }
+
+    [Fact]
+    public void RecordLostEvents_IgnoresNonPositiveCountsAndResetsWithSnapshot()
+    {
+        var accumulator = new EtwProcessActivityAccumulator();
+        var t0 = new DateTime(2026, 06, 25, 12, 0, 0, DateTimeKind.Utc);
+        var t1 = t0.AddSeconds(2);
+
+        accumulator.RecordLostEvents(0);
+        accumulator.RecordLostEvents(-5);
+        var first = accumulator.SnapshotAndReset(t0);
+        Assert.Equal(0, first.Counters.LostEventCount);
+        Assert.False(first.HadLostEvents);
+
+        accumulator.RecordLostEvents(2);
+        var second = accumulator.SnapshotAndReset(t1);
+        Assert.Equal(2, second.Counters.LostEventCount);
+
+        // Lost events are per-period like every other counter: a snapshot
+        // resets the count for the next period.
+        var third = accumulator.SnapshotAndReset(t1.AddSeconds(2));
+        Assert.Equal(0, third.Counters.LostEventCount);
+        Assert.False(third.HadLostEvents);
+    }
 }

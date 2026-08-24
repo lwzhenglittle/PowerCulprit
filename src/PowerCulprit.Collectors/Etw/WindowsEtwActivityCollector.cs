@@ -24,6 +24,7 @@ public sealed class WindowsEtwActivityCollector : IWindowsEtwActivityCollector, 
     private bool _udpProviderEnabled;
     private long _parseErrors;
     private EtwActivityCounters _lastCounters = new();
+    private long? _lastEventsLost;
     private int _disposed;
 
     public WindowsEtwActivityCollector(ILogger<WindowsEtwActivityCollector> logger)
@@ -87,6 +88,7 @@ public sealed class WindowsEtwActivityCollector : IWindowsEtwActivityCollector, 
     {
         try
         {
+            FeedSessionLostEvents();
             var snapshot = _accumulator.SnapshotAndReset(nowUtc);
             lock (_lock)
             {
@@ -106,6 +108,45 @@ public sealed class WindowsEtwActivityCollector : IWindowsEtwActivityCollector, 
     public void RecordPolledProcess(int pid)
     {
         _accumulator.RecordPolledProcess(pid);
+    }
+
+    /// <summary>
+    /// Feeds session lost events into the accumulator. TraceEvent raises no
+    /// lost-events callback for real-time sessions, so the cumulative
+    /// <see cref="TraceEventSession.EventsLost"/> count (up-to-date for
+    /// real-time sessions; TraceEventSource.EventsLost is not) is diffed
+    /// against the previous reading. The first reading only sets the baseline.
+    /// </summary>
+    private void FeedSessionLostEvents()
+    {
+        long delta = 0;
+        try
+        {
+            lock (_lock)
+            {
+                // The session can be disposed concurrently just before
+                // _session is cleared, so the read itself may throw — never
+                // let lost-event polling break the snapshot path.
+                var totalLost = _session?.EventsLost;
+                if (totalLost is null)
+                {
+                    _lastEventsLost = null;
+                    return;
+                }
+
+                if (_lastEventsLost is long baseline && totalLost.Value > baseline)
+                    delta = totalLost.Value - baseline;
+                _lastEventsLost = totalLost.Value;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to read ETW session lost-event count");
+            return;
+        }
+
+        if (delta > 0)
+            _accumulator.RecordLostEvents(delta);
     }
 
     public SourceStatus GetStatus()

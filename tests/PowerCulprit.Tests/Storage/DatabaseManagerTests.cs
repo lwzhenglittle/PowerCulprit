@@ -1241,6 +1241,154 @@ public class DatabaseManagerTests : IDisposable
         Assert.Empty(await _db.GetWmiCallerAggregatesAsync(ts.AddSeconds(-1), ts.AddSeconds(1), 10));
     }
 
+    // ── Non-finite sensor values (NaN / ±Infinity) ─────────────
+    // SQLite binds double.NaN as NULL, which would hit the NOT NULL constraint
+    // on hardware_sensor_samples.value / gpu_process_samples.utilization_percent
+    // and roll back the whole monitoring-cycle transaction. The inserts must
+    // skip the bad rows and commit everything else.
+
+    [Fact]
+    public async Task InsertMonitoringCycle_NaNSensorValue_SkipsRowAndCommitsRest()
+    {
+        var ts = new DateTime(2026, 6, 23, 12, 0, 0, DateTimeKind.Utc);
+
+        await _db.InsertMonitoringCycleAsync(
+            new SystemPowerSample { TimestampUtc = ts, IsAcOnline = false, BatteryPercent = 90 },
+            new[]
+            {
+                new ProcessSample { TimestampUtc = ts, Pid = 100, ProcessName = "app.exe", CpuPercent = 5.0 }
+            },
+            Array.Empty<GpuProcessSample>(),
+            new[]
+            {
+                new HardwareSensorSample
+                {
+                    TimestampUtc = ts, Source = "LibreHardwareMonitor", DeviceName = "Intel Core Ultra X7 358H",
+                    SensorName = "CPU Package", MetricName = "Power", Value = 12.3, Unit = "W"
+                },
+                new HardwareSensorSample
+                {
+                    TimestampUtc = ts, Source = "LibreHardwareMonitor", DeviceName = "Intel Core Ultra X7 358H",
+                    SensorName = "CPU Core", MetricName = "Temperature", Value = double.NaN, Unit = "°C"
+                },
+                new HardwareSensorSample
+                {
+                    TimestampUtc = ts, Source = "LibreHardwareMonitor", DeviceName = "Intel Core Ultra X7 358H",
+                    SensorName = "CPU Total", MetricName = "Load", Value = 42.5, Unit = "%"
+                }
+            },
+            Array.Empty<SourceStatus>());
+
+        // The NaN row is skipped; the other sensor rows and the rest of the
+        // cycle (power + process) must still be committed.
+        Assert.Equal(2, await ScalarLongAsync("SELECT COUNT(*) FROM hardware_sensor_samples;"));
+        Assert.Equal(0, await ScalarLongAsync("SELECT COUNT(*) FROM hardware_sensor_samples WHERE sensor_name = 'CPU Core';"));
+        Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM system_power_samples;"));
+        Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM process_sample_facts;"));
+    }
+
+    [Fact]
+    public async Task InsertMonitoringCycle_NonFiniteGpuUtilization_SkipsRowsAndCommitsRest()
+    {
+        var ts = new DateTime(2026, 6, 23, 12, 0, 0, DateTimeKind.Utc);
+
+        await _db.InsertMonitoringCycleAsync(
+            new SystemPowerSample { TimestampUtc = ts, IsAcOnline = false, BatteryPercent = 90 },
+            new[]
+            {
+                new ProcessSample { TimestampUtc = ts, Pid = 100, ProcessName = "app.exe", CpuPercent = 5.0 }
+            },
+            new[]
+            {
+                new GpuProcessSample
+                {
+                    TimestampUtc = ts, Pid = 100, ProcessName = "app.exe",
+                    EngineName = "eng_3d", EngineType = GpuEngineType.ThreeD, UtilizationPercent = 35.0
+                },
+                new GpuProcessSample
+                {
+                    TimestampUtc = ts, Pid = 100, ProcessName = "app.exe",
+                    EngineName = "eng_compute", EngineType = GpuEngineType.Compute, UtilizationPercent = double.NaN
+                },
+                new GpuProcessSample
+                {
+                    TimestampUtc = ts, Pid = 100, ProcessName = "app.exe",
+                    EngineName = "eng_copy", EngineType = GpuEngineType.Copy, UtilizationPercent = double.PositiveInfinity
+                }
+            },
+            Array.Empty<HardwareSensorSample>(),
+            Array.Empty<SourceStatus>());
+
+        // Only the finite row survives; power and process rows still commit.
+        Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM gpu_process_samples;"));
+        Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM gpu_process_samples WHERE engine_type = 'ThreeD';"));
+        Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM system_power_samples;"));
+        Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM process_sample_facts;"));
+    }
+
+    [Fact]
+    public async Task InsertHardwareSensorSamplesAsync_NonFiniteValues_AreSkipped()
+    {
+        var ts = new DateTime(2026, 6, 23, 12, 0, 0, DateTimeKind.Utc);
+
+        await _db.InsertHardwareSensorSamplesAsync(new[]
+        {
+            new HardwareSensorSample
+            {
+                TimestampUtc = ts, Source = "LibreHardwareMonitor", DeviceName = "Intel Core Ultra X7 358H",
+                SensorName = "CPU Package", MetricName = "Power", Value = 12.3, Unit = "W"
+            },
+            new HardwareSensorSample
+            {
+                TimestampUtc = ts, Source = "LibreHardwareMonitor", DeviceName = "Intel Core Ultra X7 358H",
+                SensorName = "CPU Core", MetricName = "Temperature", Value = double.NaN, Unit = "°C"
+            },
+            new HardwareSensorSample
+            {
+                TimestampUtc = ts, Source = "LibreHardwareMonitor", DeviceName = "Intel Core Ultra X7 358H",
+                SensorName = "CPU Total", MetricName = "Load", Value = double.NegativeInfinity, Unit = "%"
+            }
+        });
+
+        var result = await _db.GetHardwareSensorSamplesAsync(ts.AddSeconds(-1), ts.AddSeconds(1));
+        var sample = Assert.Single(result);
+        Assert.Equal("CPU Package", sample.SensorName);
+        Assert.Equal(12.3, sample.Value);
+    }
+
+    [Fact]
+    public async Task GetGpuProcessAggregates_VideoActivity_IsPerRowAverageNotSum()
+    {
+        var ts = new DateTime(2026, 6, 23, 12, 0, 0, DateTimeKind.Utc);
+        var samples = new List<GpuProcessSample>();
+        // 5 sampling cycles, each with one 3D row at 50% and one VideoDecode row
+        // at 20% — 10 engine rows in total.
+        for (var i = 0; i < 5; i++)
+        {
+            samples.Add(new GpuProcessSample
+            {
+                TimestampUtc = ts.AddSeconds(i * 2), Pid = 100, ProcessName = "player.exe",
+                EngineName = "eng_3d", EngineType = GpuEngineType.ThreeD, UtilizationPercent = 50.0
+            });
+            samples.Add(new GpuProcessSample
+            {
+                TimestampUtc = ts.AddSeconds(i * 2), Pid = 100, ProcessName = "player.exe",
+                EngineName = "eng_vdec", EngineType = GpuEngineType.VideoDecode, UtilizationPercent = 20.0
+            });
+        }
+
+        await _db.InsertGpuProcessSamplesAsync(samples);
+
+        var result = await _db.GetGpuProcessAggregatesAsync(new[] { (ts.AddSeconds(-1), ts.AddSeconds(20)) });
+
+        var aggregate = Assert.Single(result);
+        // Video sum is 5 × 20 = 100 over 10 engine rows → per-row average 10.
+        // Pre-fix the raw sum (100) came back, scaling with the window length.
+        Assert.Equal(10.0, aggregate.VideoActivityPercent, 6);
+        Assert.Equal(35.0, aggregate.AvgUtilizationPercent, 6); // (5×50 + 5×20) / 10
+        Assert.Equal(50.0, aggregate.MaxUtilizationPercent);
+    }
+
     private async Task<long> ScalarLongAsync(string sql)
         => await ScalarLongAsync(_testDbPath, sql);
 

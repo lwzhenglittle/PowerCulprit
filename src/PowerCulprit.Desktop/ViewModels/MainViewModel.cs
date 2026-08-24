@@ -87,13 +87,21 @@ public partial class MainViewModel : ObservableObject
     public partial bool IsGpuSamplingEnabled { get; set; }
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsBusy))]
     public partial bool IsHistoryLoading { get; set; }
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsBusy))]
     public partial bool IsAnalyzing { get; set; }
+
+    /// <summary>True while history is loading or analysis is running — drives the busy indicator.</summary>
+    public bool IsBusy => IsHistoryLoading || IsAnalyzing;
 
     [ObservableProperty]
     public partial string ExcludedIntervalsSummary { get; set; } = "";
+
+    [ObservableProperty]
+    public partial string LastSampleTimeText { get; set; } = "--";
 
     [ObservableProperty]
     public partial BatteryDisplayCycleRow? SelectedCycleRow { get; set; }
@@ -184,7 +192,7 @@ public partial class MainViewModel : ObservableObject
             HistoryStatusText = "Clearing history...";
             AnalysisStatusText = "Clearing history...";
 
-            var deleted = await _database.ClearHistoricalDataAsync();
+            var deleted = await Task.Run(() => _database.ClearHistoricalDataAsync());
 
             ClearHistoricalView();
             HistoryStatusText = $"Cleared {deleted} historical rows";
@@ -209,8 +217,8 @@ public partial class MainViewModel : ObservableObject
         {
             var (fromUtc, toUtc) = GetSelectedOrDefaultRange();
             var intervals = GetSelectedAnalysisIntervals(fromUtc, toUtc);
-            var powerSamples = await _database.GetSystemPowerSamplesAsync(fromUtc, toUtc);
-            var processSamples = await _database.GetProcessSamplesForAnalysisAsync(fromUtc, toUtc);
+            var powerSamples = await Task.Run(() => _database.GetSystemPowerSamplesAsync(fromUtc, toUtc));
+            var processSamples = await Task.Run(() => _database.GetProcessSamplesForAnalysisAsync(fromUtc, toUtc));
 
             powerSamples = FilterByIntervals(powerSamples, s => s.TimestampUtc, intervals)
                 .Where(s => !_isCycleMode || s.IsAcOnline != true)
@@ -220,7 +228,8 @@ public partial class MainViewModel : ObservableObject
             var desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
             var filePath = Path.Combine(desktopPath, $"powerculprit_export_{DateTime.UtcNow:yyyyMMdd_HHmmss}.csv");
 
-            await WriteCsvFileAsync(filePath, powerSamples, processSamples, _selectedDisplayCycle);
+            var displayCycle = _selectedDisplayCycle;
+            await Task.Run(() => WriteCsvFileAsync(filePath, powerSamples, processSamples, displayCycle));
             _logger.LogInformation("Exported CSV to {Path}", filePath);
         }
         catch (Exception ex)
@@ -246,11 +255,11 @@ public partial class MainViewModel : ObservableObject
                 HistoryStatusText = "Rebuilding battery cycles...";
             });
 
-            await _database.RebuildBatteryCyclesAsync();
+            await Task.Run(() => _database.RebuildBatteryCyclesAsync());
             token.ThrowIfCancellationRequested();
 
-            var cyclesTask = _database.GetLatestBatteryDisplayCyclesAsync(DisplayCycleListLimit);
-            var statusTask = _database.GetLatestSourceStatusesAsync();
+            var cyclesTask = Task.Run(() => _database.GetLatestBatteryDisplayCyclesAsync(DisplayCycleListLimit));
+            var statusTask = Task.Run(() => _database.GetLatestSourceStatusesAsync());
             await Task.WhenAll(cyclesTask, statusTask);
             token.ThrowIfCancellationRequested();
 
@@ -317,11 +326,11 @@ public partial class MainViewModel : ObservableObject
                 HistoryStatusText = "Loading last 6 hours...";
             });
 
-            await _database.RebuildBatteryCyclesAsync();
+            await Task.Run(() => _database.RebuildBatteryCyclesAsync());
             token.ThrowIfCancellationRequested();
 
-            var cyclesTask = _database.GetLatestBatteryDisplayCyclesAsync(DisplayCycleListLimit);
-            var statusTask = _database.GetLatestSourceStatusesAsync();
+            var cyclesTask = Task.Run(() => _database.GetLatestBatteryDisplayCyclesAsync(DisplayCycleListLimit));
+            var statusTask = Task.Run(() => _database.GetLatestSourceStatusesAsync());
             await Task.WhenAll(cyclesTask, statusTask);
             token.ThrowIfCancellationRequested();
 
@@ -371,7 +380,7 @@ public partial class MainViewModel : ObservableObject
                 HistoryStatusText = "Loading battery cycle...";
             });
 
-            var statuses = await _database.GetLatestSourceStatusesAsync();
+            var statuses = await Task.Run(() => _database.GetLatestSourceStatusesAsync());
             token.ThrowIfCancellationRequested();
             await LoadDisplayCycleCoreAsync(displayCycle, resetRange, token, statuses);
         }
@@ -409,9 +418,9 @@ public partial class MainViewModel : ObservableObject
         if (toUtc <= fromUtc)
             toUtc = fromUtc.AddMinutes(1);
 
-        var powerTask = _database.GetSystemPowerSamplesAsync(fromUtc, toUtc);
-        var rawCyclesTask = _database.GetBatteryCyclesForDisplayCycleAsync(displayCycle.Id);
-        var statusTask = statuses is null ? _database.GetLatestSourceStatusesAsync() : Task.FromResult(statuses);
+        var powerTask = Task.Run(() => _database.GetSystemPowerSamplesAsync(fromUtc, toUtc));
+        var rawCyclesTask = Task.Run(() => _database.GetBatteryCyclesForDisplayCycleAsync(displayCycle.Id));
+        var statusTask = statuses is null ? Task.Run(() => _database.GetLatestSourceStatusesAsync()) : Task.FromResult(statuses);
         await Task.WhenAll(powerTask, rawCyclesTask, statusTask);
         token.ThrowIfCancellationRequested();
 
@@ -454,8 +463,8 @@ public partial class MainViewModel : ObservableObject
         var toUtc = DateTime.UtcNow;
         var fromUtc = toUtc - DefaultHistoryWindow;
 
-        var powerTask = _database.GetSystemPowerSamplesAsync(fromUtc, toUtc);
-        var statusTask = _database.GetLatestSourceStatusesAsync();
+        var powerTask = Task.Run(() => _database.GetSystemPowerSamplesAsync(fromUtc, toUtc));
+        var statusTask = Task.Run(() => _database.GetLatestSourceStatusesAsync());
         await Task.WhenAll(powerTask, statusTask);
         token.ThrowIfCancellationRequested();
 
@@ -542,10 +551,10 @@ public partial class MainViewModel : ObservableObject
 
             // Fetch power state events and power samples to detect sleep/gap
             // intervals that should be excluded from process attribution.
-            var powerTask = _database.GetSystemPowerSamplesAsync(fromUtc, toUtc);
-            var eventsTask = _monitor.GetPowerStateEventsAsync(fromUtc, toUtc);
-            var processTask = _database.GetProcessAggregatesForAnalysisAsync(rawIntervals);
-            var gpuTask = _database.GetGpuProcessAggregatesAsync(rawIntervals);
+            var powerTask = Task.Run(() => _database.GetSystemPowerSamplesAsync(fromUtc, toUtc));
+            var eventsTask = Task.Run(() => _monitor.GetPowerStateEventsAsync(fromUtc, toUtc));
+            var processTask = Task.Run(() => _database.GetProcessAggregatesForAnalysisAsync(rawIntervals));
+            var gpuTask = Task.Run(() => _database.GetGpuProcessAggregatesAsync(rawIntervals));
             await Task.WhenAll(powerTask, eventsTask, processTask, gpuTask);
             token.ThrowIfCancellationRequested();
 
@@ -592,8 +601,8 @@ public partial class MainViewModel : ObservableObject
                 .ToList();
 
             // Re-query aggregates narrowed to awake intervals.
-            processAggregates = await _database.GetProcessAggregatesForAnalysisAsync(awakeIntervals);
-            gpuAggregates = await _database.GetGpuProcessAggregatesAsync(awakeIntervals);
+            processAggregates = await Task.Run(() => _database.GetProcessAggregatesForAnalysisAsync(awakeIntervals));
+            gpuAggregates = await Task.Run(() => _database.GetGpuProcessAggregatesAsync(awakeIntervals));
 
             var windowStart = awakeIntervals.Min(i => i.FromUtc);
             var windowEnd = awakeIntervals.Max(i => i.ToUtc);
@@ -758,6 +767,7 @@ public partial class MainViewModel : ObservableObject
         BatteryPercentText = "--";
         DischargeRateText = "--";
         SelectedRangeText = "--";
+        LastSampleTimeText = "--";
         CycleStatusText = "No cycle selected";
 
         _suppressCycleSelection = true;
@@ -775,6 +785,9 @@ public partial class MainViewModel : ObservableObject
     private void UpdateStatusBar(SystemPowerSample? latest)
     {
         AcStatusText = "--";
+        LastSampleTimeText = latest is null
+            ? "--"
+            : $"Data as of {latest.TimestampUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
 
         if (latest is null)
             return;
@@ -807,8 +820,12 @@ public partial class MainViewModel : ObservableObject
 
         var from = first.BatteryPercent.Value;
         var to = last.BatteryPercent.Value;
-        var drop = Math.Max(0, from - to);
-        return $"{drop:F1}% ({from:F1}% -> {to:F1}%)";
+        var delta = from - to;
+        // Charging inside the range is reported as such instead of being clamped
+        // to a misleading "0.0% drop".
+        return delta >= 0
+            ? $"{delta:F1}% ({from:F1}% -> {to:F1}%)"
+            : $"Charged +{-delta:F1}% ({from:F1}% -> {to:F1}%)";
     }
 
     private static string FormatEnergyUsed(IReadOnlyList<SystemPowerSample> samples)
@@ -1125,8 +1142,9 @@ public partial class MainViewModel : ObservableObject
         foreach (var s in powerSamples)
         {
             var ac = s.IsAcOnline switch { true => "true", false => "false", _ => "" };
-            await writer.WriteLineAsync(
-                $"{s.TimestampUtc:O},{ac},{s.BatteryPercent},{s.ChargeRateMilliwatts},{s.EstimatedDischargeWatts},{s.PowerMode}");
+            // InvariantCulture: comma-decimal locales must not corrupt CSV columns.
+            await writer.WriteLineAsync(FormattableString.Invariant(
+                $"{s.TimestampUtc:O},{ac},{s.BatteryPercent},{s.ChargeRateMilliwatts},{s.EstimatedDischargeWatts},{s.PowerMode}"));
         }
 
         await writer.WriteLineAsync();
@@ -1134,8 +1152,8 @@ public partial class MainViewModel : ObservableObject
         await writer.WriteLineAsync("TimestampUtc,Pid,ProcessName,CpuPercent,WorkingSetMb,DiskReadBytesPerSec,DiskWriteBytesPerSec,IsForeground");
         foreach (var s in processSamples)
         {
-            await writer.WriteLineAsync(
-                $"{s.TimestampUtc:O},{s.Pid},\"{s.ProcessName}\",{s.CpuPercent},{s.WorkingSetMb},{s.DiskReadBytesPerSecond},{s.DiskWriteBytesPerSecond},{s.IsForegroundProcess}");
+            await writer.WriteLineAsync(FormattableString.Invariant(
+                $"{s.TimestampUtc:O},{s.Pid},\"{s.ProcessName}\",{s.CpuPercent},{s.WorkingSetMb},{s.DiskReadBytesPerSecond},{s.DiskWriteBytesPerSecond},{s.IsForegroundProcess}"));
         }
     }
 }

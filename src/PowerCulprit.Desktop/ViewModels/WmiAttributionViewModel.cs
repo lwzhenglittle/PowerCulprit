@@ -75,8 +75,8 @@ public partial class WmiAttributionViewModel : ObservableObject
     {
         try
         {
-            await _database.RebuildBatteryCyclesAsync();
-            var cycle = (await _database.GetLatestBatteryDisplayCyclesAsync(1)).FirstOrDefault();
+            await Task.Run(() => _database.RebuildBatteryCyclesAsync());
+            var cycle = (await Task.Run(() => _database.GetLatestBatteryDisplayCyclesAsync(1))).FirstOrDefault();
             if (cycle is null)
             {
                 var toUtc = DateTime.UtcNow;
@@ -110,7 +110,7 @@ public partial class WmiAttributionViewModel : ObservableObject
             ErrorText = "";
             StatusText = "Loading WMI activity...";
 
-            var aggregates = await _database.GetWmiCallerAggregatesAsync(fromUtc, toUtc, DisplayLimit);
+            var aggregates = await Task.Run(() => _database.GetWmiCallerAggregatesAsync(fromUtc, toUtc, DisplayLimit));
             token.ThrowIfCancellationRequested();
 
             ApplyLoadedRange(fromUtc, toUtc, aggregates);

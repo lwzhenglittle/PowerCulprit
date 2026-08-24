@@ -29,7 +29,10 @@
                 <StackPanel Spacing="4">
                     <TextBlock Text="PowerCulprit"
                                Style="{StaticResource DashboardTitleTextBlockStyle}" />
-                    <TextBlock Text="Battery drain analysis dashboard"
+                    <TextBlock Text="Battery drain analysis dashboard — correlation-based attribution, not a per-process wattmeter"
+                               Style="{StaticResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    <TextBlock Text="{x:Bind ViewModel.LastSampleTimeText, Mode=OneWay}"
                                Style="{StaticResource CaptionTextBlockStyle}"
                                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                 </StackPanel>
@@ -106,6 +109,11 @@
                         <StackPanel Orientation="Horizontal"
                                     Spacing="16"
                                     VerticalAlignment="Center">
+                            <ProgressRing Width="18"
+                                          Height="18"
+                                          IsActive="{x:Bind ViewModel.IsBusy, Mode=OneWay}"
+                                          Visibility="{x:Bind ViewModel.IsBusy, Mode=OneWay}"
+                                          ToolTipService.ToolTip="Loading or analyzing..." />
                             <ToggleSwitch Header="GPU Engine"
                                           IsOn="{x:Bind ViewModel.IsGpuSamplingEnabled, Mode=TwoWay}"
                                           OffContent="Off"
@@ -342,7 +350,11 @@
                             </Grid.ColumnDefinitions>
                             <TextBlock Text="Rank" Style="{StaticResource TableHeaderTextBlockStyle}" />
                             <TextBlock Grid.Column="1" Text="Name" Style="{StaticResource TableHeaderTextBlockStyle}" />
-                            <TextBlock Grid.Column="2" Text="Score" HorizontalAlignment="Right" Style="{StaticResource TableHeaderTextBlockStyle}" />
+                            <TextBlock Grid.Column="2"
+                                       Text="Score"
+                                       HorizontalAlignment="Right"
+                                       Style="{StaticResource TableHeaderTextBlockStyle}"
+                                       ToolTipService.ToolTip="Heuristic correlation score (not watts) — ranks how strongly each process's activity tracks the battery discharge curve in the selected range" />
                             <TextBlock Grid.Column="3" Text="Avg CPU" HorizontalAlignment="Right" Style="{StaticResource TableHeaderTextBlockStyle}" />
                             <TextBlock Grid.Column="4" Text="Max CPU" HorizontalAlignment="Right" Style="{StaticResource TableHeaderTextBlockStyle}" />
                             <TextBlock Grid.Column="5" Text="Avg GPU" HorizontalAlignment="Right" Style="{StaticResource TableHeaderTextBlockStyle}" />
