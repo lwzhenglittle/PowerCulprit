@@ -20,7 +20,7 @@ public static class CpuTimelineBuilder
         var energyByTimestamp = BuildEnergyTimeline(orderedPower);
 
         var cpuByTimestamp = hardwareSamples
-            .Where(IsCpuSensor)
+            .Where(IsAttributionSensor)
             .GroupBy(s => s.TimestampUtc)
             .ToDictionary(g => g.Key, BuildCpuValues);
 
@@ -44,7 +44,14 @@ public static class CpuTimelineBuilder
                 power is null ? null : energyWh,
                 cpu?.CpuAverageClockMhz,
                 cpu?.CpuLoadPercent,
-                cpu?.CpuPackagePowerWatts));
+                cpu?.CpuPackagePowerWatts)
+            {
+                IsAcOnline = power?.IsAcOnline,
+                CpuPlatformPowerWatts = cpu?.CpuPlatformPowerWatts,
+                CpuCoresPowerWatts = cpu?.CpuCoresPowerWatts,
+                CpuMemoryPowerWatts = cpu?.CpuMemoryPowerWatts,
+                GpuPowerWatts = cpu?.GpuPowerWatts
+            });
         }
 
         return result;
@@ -129,11 +136,29 @@ public static class CpuTimelineBuilder
             UnitEquals(s, "W") &&
             s.SensorName.Contains("Package", StringComparison.OrdinalIgnoreCase));
 
+        var platformPower = FindPowerSensor(list, "CPU Platform");
+        var coresPower = FindPowerSensor(list, "CPU Cores");
+        var memoryPower = FindPowerSensor(list, "CPU Memory");
+        var gpuPower = FindPowerSensor(list, "GPU Power");
+
         return new CpuValues(
             clocks.Count > 0 ? Math.Round(clocks.Average(), 3) : null,
             load?.Value,
-            packagePower?.Value);
+            packagePower?.Value,
+            platformPower?.Value,
+            coresPower?.Value,
+            memoryPower?.Value,
+            gpuPower?.Value);
     }
+
+    private static HardwareSensorSample? FindPowerSensor(
+        IReadOnlyList<HardwareSensorSample> samples,
+        string sensorName)
+        => samples.FirstOrDefault(s =>
+            s.MetricName.Equals("Power", StringComparison.OrdinalIgnoreCase) &&
+            UnitEquals(s, "W") &&
+            s.SensorName.Equals(sensorName, StringComparison.OrdinalIgnoreCase) &&
+            double.IsFinite(s.Value) && s.Value >= 0);
 
     private static SystemPowerSample? FindNearestPowerSample(IReadOnlyList<SystemPowerSample> samples, DateTime timestampUtc)
     {
@@ -155,8 +180,10 @@ public static class CpuTimelineBuilder
         return best;
     }
 
-    private static bool IsCpuSensor(HardwareSensorSample sample)
-        => sample.DeviceName.Contains("CPU", StringComparison.OrdinalIgnoreCase) ||
+    private static bool IsAttributionSensor(HardwareSensorSample sample)
+        => (sample.MetricName.Equals("Power", StringComparison.OrdinalIgnoreCase) &&
+            sample.SensorName.Equals("GPU Power", StringComparison.OrdinalIgnoreCase)) ||
+           sample.DeviceName.Contains("CPU", StringComparison.OrdinalIgnoreCase) ||
            sample.DeviceName.Contains("Core", StringComparison.OrdinalIgnoreCase) ||
            sample.SensorName.Contains("CPU", StringComparison.OrdinalIgnoreCase) ||
            sample.SensorName.Contains("P-Core", StringComparison.OrdinalIgnoreCase) ||
@@ -183,5 +210,9 @@ public static class CpuTimelineBuilder
     private sealed record CpuValues(
         double? CpuAverageClockMhz,
         double? CpuLoadPercent,
-        double? CpuPackagePowerWatts);
+        double? CpuPackagePowerWatts,
+        double? CpuPlatformPowerWatts,
+        double? CpuCoresPowerWatts,
+        double? CpuMemoryPowerWatts,
+        double? GpuPowerWatts);
 }

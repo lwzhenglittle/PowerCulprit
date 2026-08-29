@@ -6,13 +6,16 @@
     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     xmlns:vm="using:PowerCulprit.Desktop.ViewModels"
+    NavigationCacheMode="Enabled"
     mc:Ignorable="d">
 
     <Page.Resources>
         <vm:BoolToInverseConverter x:Key="BoolToInverseConverter" />
+        <vm:BoolToVisibilityConverter x:Key="BoolToVisibilityConverter" />
     </Page.Resources>
 
     <ScrollViewer Background="{ThemeResource ApplicationPageBackgroundThemeBrush}"
+                  HorizontalScrollBarVisibility="Auto"
                   VerticalScrollBarVisibility="Auto">
         <StackPanel Padding="{StaticResource PageContentMargin}" Spacing="16">
             <Grid ColumnSpacing="16">
@@ -65,11 +68,17 @@
                         </AppBarButton.Icon>
                     </AppBarButton>
                     <CommandBar.Content>
-                        <TextBlock Text="{x:Bind ViewModel.ErrorText, Mode=OneWay}"
-                                   Foreground="{ThemeResource SystemFillColorCriticalBrush}"
-                                   MaxWidth="520"
-                                   TextTrimming="CharacterEllipsis"
-                                   VerticalAlignment="Center" />
+                        <StackPanel Orientation="Horizontal" Spacing="12">
+                            <ProgressRing Width="18"
+                                          Height="18"
+                                          IsActive="{x:Bind ViewModel.IsLoading, Mode=OneWay}"
+                                          Visibility="{x:Bind ViewModel.IsLoading, Mode=OneWay, Converter={StaticResource BoolToVisibilityConverter}}" />
+                            <InfoBar IsOpen="{x:Bind ViewModel.HasError, Mode=OneWay}"
+                                     IsClosable="False"
+                                     Severity="Error"
+                                     Message="{x:Bind ViewModel.ErrorText, Mode=OneWay}"
+                                     MaxWidth="520" />
+                        </StackPanel>
                     </CommandBar.Content>
                 </CommandBar>
             </Border>
@@ -107,7 +116,8 @@
                 </Border>
             </Grid>
 
-            <Border Style="{StaticResource DashboardCardStyle}">
+            <Border Style="{StaticResource DashboardCardStyle}"
+                    MinWidth="900">
                 <StackPanel Spacing="10">
                     <Grid ColumnSpacing="12">
                         <Grid.ColumnDefinitions>
@@ -150,6 +160,7 @@
                     </Border>
 
                     <ListView ItemsSource="{x:Bind ViewModel.CallerRows, Mode=OneWay}"
+                              MinWidth="900"
                               MaxHeight="520"
                               SelectionMode="None">
                         <ListView.ItemTemplate>
@@ -181,6 +192,11 @@
                             </DataTemplate>
                         </ListView.ItemTemplate>
                     </ListView>
+
+                    <TextBlock Text="No WMI activity in the selected range."
+                               Style="{StaticResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               Visibility="{x:Bind ViewModel.HasCallerRows, Mode=OneWay, Converter={StaticResource BoolToVisibilityConverter}, ConverterParameter=Invert}" />
 
                     <TextBlock Text="{x:Bind ViewModel.StatusText, Mode=OneWay}"
                                Style="{StaticResource CaptionTextBlockStyle}"

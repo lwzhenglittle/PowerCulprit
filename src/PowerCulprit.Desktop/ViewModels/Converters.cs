@@ -24,28 +24,52 @@ public class BoolToInverseConverter : IValueConverter
 }
 
 /// <summary>
+/// Converts a Boolean value to WinUI Visibility. Pass "Invert" as the
+/// converter parameter when the visible state should represent false.
+/// </summary>
+public class BoolToVisibilityConverter : IValueConverter
+{
+    public object Convert(object value, Type targetType, object parameter, string language)
+    {
+        var visible = value is bool b && b;
+        if (parameter is string text && text.Equals("Invert", StringComparison.OrdinalIgnoreCase))
+            visible = !visible;
+
+        return visible ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    public object ConvertBack(object value, Type targetType, object parameter, string language)
+        => throw new NotSupportedException();
+}
+
+/// <summary>
 /// Maps a SourceStatus.Status string to a SolidColorBrush. Runtime Binding does
 /// not auto-convert "Green" → Brush like XAML markup does, so we do it here.
 /// </summary>
 public class StatusToBrushConverter : IValueConverter
 {
-    private static readonly SolidColorBrush AvailableBrush = new(Colors.LimeGreen);
-    private static readonly SolidColorBrush PartialBrush = new(Colors.Orange);
-    private static readonly SolidColorBrush UnavailableBrush = new(Colors.IndianRed);
-    private static readonly SolidColorBrush RequiresAdminBrush = new(Colors.DarkOrange);
-    private static readonly SolidColorBrush DefaultBrush = new(Colors.Gray);
-
     public object Convert(object value, Type targetType, object parameter, string language)
     {
         return (value as string) switch
         {
-            "Available" => AvailableBrush,
-            "Partial" => PartialBrush,
-            "Unavailable" => UnavailableBrush,
-            "Requires admin" => RequiresAdminBrush,
-            "Disabled" => DefaultBrush,
-            _ => DefaultBrush
+            "Available" => GetThemeBrush("SystemFillColorSuccessBrush", Colors.LimeGreen),
+            "Partial" => GetThemeBrush("SystemFillColorCautionBrush", Colors.Orange),
+            "Unavailable" => GetThemeBrush("SystemFillColorCriticalBrush", Colors.IndianRed),
+            "Requires admin" => GetThemeBrush("SystemFillColorCautionBrush", Colors.DarkOrange),
+            "Disabled" => GetThemeBrush("SystemFillColorNeutralBrush", Colors.Gray),
+            _ => GetThemeBrush("SystemFillColorNeutralBrush", Colors.Gray)
         };
+    }
+
+    private static SolidColorBrush GetThemeBrush(string resourceKey, Windows.UI.Color fallback)
+    {
+        if (Application.Current?.Resources.TryGetValue(resourceKey, out var value) == true &&
+            value is SolidColorBrush brush)
+        {
+            return brush;
+        }
+
+        return new SolidColorBrush(fallback);
     }
 
     public object ConvertBack(object value, Type targetType, object parameter, string language)

@@ -1,11 +1,15 @@
+using System.Diagnostics;
 using System.Numerics;
 using Microsoft.Graphics.Canvas;
+using Microsoft.Graphics.Canvas.Geometry;
 using Microsoft.Graphics.Canvas.Text;
+using Microsoft.Graphics.Canvas.UI;
 using Microsoft.Graphics.Canvas.UI.Xaml;
 using Microsoft.UI;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
+using PowerCulprit.Core.Analysis;
 using PowerCulprit.Desktop.ViewModels;
 using Windows.Foundation;
 using Windows.UI;
@@ -19,6 +23,11 @@ public sealed partial class PowerHistoryChart : UserControl
     private const float PlotRight = 64;
     private const float PlotBottom = 34;
     private const double MinVisibleSeconds = 60;
+    private const int MinimumPointBudget = 128;
+    private const int MaximumPointBudget = 2048;
+    private const double PointsPerDip = 1.25;
+    private const int SmoothingPointThreshold = 32;
+    private static readonly long PanFrameTicks = Math.Max(1, Stopwatch.Frequency / 30);
 
     private static readonly CanvasTextFormat AxisTextFormat = new() { FontSize = 11 };
     private static readonly CanvasTextFormat TooltipTextFormat = new() { FontSize = 12 };
@@ -32,6 +41,18 @@ public sealed partial class PowerHistoryChart : UserControl
     private DateTime? _previewFromUtc;
     private DateTime? _previewToUtc;
     private Point? _hoverPosition;
+    private int _lastHoverPixel = -1;
+    private long _lastPanInvalidateTimestamp;
+    private IReadOnlyList<PowerChartSample>? _cachedSamples;
+    private CanvasCachedGeometry? _cachedBatteryGeometry;
+    private CanvasCachedGeometry? _cachedDischargeGeometry;
+    private DateTime _cachedFromUtc;
+    private DateTime _cachedToUtc;
+    private float _cachedWidth;
+    private float _cachedHeight;
+    private double _cachedAxisMax;
+    private ElementTheme _cachedTheme;
+    private bool _geometryCacheValid;
 
     public PowerHistoryChart()
     {
@@ -39,6 +60,9 @@ public sealed partial class PowerHistoryChart : UserControl
     }
 
     public event EventHandler<VisibleRangeChangedEventArgs>? VisibleRangeChanged;
+
+    public void ResetZoom()
+        => SetVisibleRangeFromInteraction(HistoryFromUtc, HistoryToUtc);
 
     public static readonly DependencyProperty SamplesProperty =
         DependencyProperty.Register(
@@ -129,7 +153,11 @@ public sealed partial class PowerHistoryChart : UserControl
                 e.Property == VisibleToUtcProperty)
             {
                 chart.ClearPreviewRange();
+                chart.InvalidateGeometryCache();
             }
+
+            if (e.Property == DischargeAxisMaxProperty)
+                chart.InvalidateGeometryCache();
 
             chart.QueueInvalidate();
         }
@@ -164,7 +192,8 @@ public sealed partial class PowerHistoryChart : UserControl
         var ds = args.DrawingSession;
         var width = (float)sender.ActualWidth;
         var height = (float)sender.ActualHeight;
-        if (width <= PlotLeft + PlotRight || height <= PlotTop + PlotBottom)
+        if (!float.IsFinite(width) || !float.IsFinite(height) ||
+            width <= PlotLeft + PlotRight || height <= PlotTop + PlotBottom)
             return;
 
         var colors = GetPalette();
@@ -189,14 +218,65 @@ public sealed partial class PowerHistoryChart : UserControl
 
         DrawAxes(ds, plot, fromUtc, toUtc, colors);
 
-        var batteryPoints = BuildDisplayPoints(samples, fromUtc, toUtc, plot, (sample) => sample.BatteryPercent, MapBatteryY);
-        var dischargePoints = BuildDisplayPoints(samples, fromUtc, toUtc, plot, (sample) => sample.DischargeWatts, MapDischargeY);
+        EnsureGeometryCache(sender, samples, fromUtc, toUtc, plot);
 
-        DrawPolyline(ds, batteryPoints, colors.BatteryLine, 2);
-        DrawPolyline(ds, dischargePoints, colors.DischargeLine, 2);
+        if (_cachedBatteryGeometry is not null)
+            ds.DrawCachedGeometry(_cachedBatteryGeometry, colors.BatteryLine);
+        if (_cachedDischargeGeometry is not null)
+            ds.DrawCachedGeometry(_cachedDischargeGeometry, colors.DischargeLine);
 
         if (_isPointerOver && _hoverPosition.HasValue)
             DrawTooltip(ds, plot, fromUtc, toUtc, samples, _hoverPosition.Value, colors);
+    }
+
+    private void EnsureGeometryCache(
+        CanvasControl resourceCreator,
+        IReadOnlyList<PowerChartSample> samples,
+        DateTime fromUtc,
+        DateTime toUtc,
+        Rect plot)
+    {
+        var width = (float)plot.Width;
+        var height = (float)plot.Height;
+        var theme = ActualTheme;
+        if (_geometryCacheValid && ReferenceEquals(_cachedSamples, samples) &&
+            _cachedFromUtc == fromUtc && _cachedToUtc == toUtc &&
+            Math.Abs(_cachedWidth - width) < 0.5f && Math.Abs(_cachedHeight - height) < 0.5f &&
+            Math.Abs(_cachedAxisMax - DischargeAxisMax) < 0.0001 && _cachedTheme == theme)
+        {
+            return;
+        }
+
+        InvalidateGeometryCache();
+        _cachedSamples = samples;
+        _cachedFromUtc = fromUtc;
+        _cachedToUtc = toUtc;
+        _cachedWidth = width;
+        _cachedHeight = height;
+        _cachedAxisMax = DischargeAxisMax;
+        _cachedTheme = theme;
+        var batterySeries = BuildDisplaySeries(
+            samples, fromUtc, toUtc, plot,
+            sample => sample.BatteryPercent,
+            MapBatteryY,
+            TimeSeriesReductionMode.LargestTriangleThreeBuckets);
+        var dischargeSeries = BuildDisplaySeries(
+            samples, fromUtc, toUtc, plot,
+            sample => sample.DischargeWatts,
+            MapDischargeY,
+            TimeSeriesReductionMode.MinMax);
+        _cachedBatteryGeometry = BuildCachedGeometry(resourceCreator, batterySeries.Points, batterySeries.Smooth);
+        _cachedDischargeGeometry = BuildCachedGeometry(resourceCreator, dischargeSeries.Points, dischargeSeries.Smooth);
+        _geometryCacheValid = true;
+    }
+
+    private void InvalidateGeometryCache()
+    {
+        _geometryCacheValid = false;
+        _cachedBatteryGeometry?.Dispose();
+        _cachedDischargeGeometry?.Dispose();
+        _cachedBatteryGeometry = null;
+        _cachedDischargeGeometry = null;
     }
 
     private void DrawFrame(CanvasDrawingSession ds, Rect plot, ChartPalette colors)
@@ -241,87 +321,82 @@ public sealed partial class PowerHistoryChart : UserControl
         ds.DrawText("Est. discharge W", (float)plot.Left + 112, legendY, colors.DischargeLine, AxisTextFormat);
     }
 
-    private IReadOnlyList<Vector2> BuildDisplayPoints(
+    private DisplaySeries BuildDisplaySeries(
         IReadOnlyList<PowerChartSample> samples,
         DateTime fromUtc,
         DateTime toUtc,
         Rect plot,
         Func<PowerChartSample, double?> getValue,
-        Func<double, Rect, float> mapY)
+        Func<double, Rect, float> mapY,
+        TimeSeriesReductionMode reductionMode)
     {
-        var targetBuckets = Math.Max(1, (int)plot.Width);
-        var bucketTicks = Math.Max(1, (toUtc - fromUtc).Ticks / targetBuckets);
-        var reduced = new List<(DateTime TimestampUtc, double Value)>(Math.Min(samples.Count, targetBuckets * 4));
-
-        var index = 0;
-        while (index < samples.Count && samples[index].TimestampUtc < fromUtc)
-            index++;
-
-        while (index < samples.Count && samples[index].TimestampUtc <= toUtc)
+        var start = LowerBound(samples, fromUtc);
+        var end = UpperBound(samples, toUtc);
+        var visible = new List<TimeSeriesPoint>(Math.Max(0, end - start));
+        for (var index = start; index < end; index++)
         {
             var sample = samples[index];
             var value = getValue(sample);
-            if (!value.HasValue)
-            {
-                index++;
-                continue;
-            }
-
-            var bucketStartTicks = ((sample.TimestampUtc - fromUtc).Ticks / bucketTicks) * bucketTicks;
-            var bucketEnd = fromUtc.AddTicks(bucketStartTicks + bucketTicks);
-            var first = (sample.TimestampUtc, value.Value);
-            var last = first;
-            var min = first;
-            var max = first;
-            index++;
-
-            while (index < samples.Count && samples[index].TimestampUtc <= toUtc && samples[index].TimestampUtc < bucketEnd)
-            {
-                sample = samples[index];
-                value = getValue(sample);
-                index++;
-                if (!value.HasValue)
-                    continue;
-
-                var point = (sample.TimestampUtc, value.Value);
-                last = point;
-                if (point.Value < min.Value) min = point;
-                if (point.Value > max.Value) max = point;
-            }
-
-            AddDistinct(reduced, first);
-            AddDistinct(reduced, min);
-            AddDistinct(reduced, max);
-            AddDistinct(reduced, last);
+            if (value.HasValue && double.IsFinite(value.Value))
+                visible.Add(new TimeSeriesPoint(sample.TimestampUtc, value.Value));
         }
 
-        if (reduced.Count == 0)
-            return Array.Empty<Vector2>();
+        if (visible.Count == 0)
+            return new DisplaySeries(Array.Empty<Vector2>(), false);
 
+        var budget = CalculatePointBudget(plot.Width);
+        var reduced = TimeSeriesReducer.Reduce(visible, budget, reductionMode);
         var points = new List<Vector2>(reduced.Count);
         foreach (var point in reduced)
             points.Add(new Vector2(MapX(point.TimestampUtc, fromUtc, toUtc, plot), mapY(point.Value, plot)));
 
-        return points;
+        return new DisplaySeries(points, visible.Count >= SmoothingPointThreshold && points.Count >= 4);
     }
 
-    private static void AddDistinct(List<(DateTime TimestampUtc, double Value)> points, (DateTime TimestampUtc, double Value) point)
+    private static int CalculatePointBudget(double plotWidth)
     {
-        if (points.Count == 0)
+        var width = double.IsFinite(plotWidth) ? Math.Max(1, plotWidth) : 1;
+        return (int)Math.Clamp(Math.Ceiling(width * PointsPerDip), MinimumPointBudget, MaximumPointBudget);
+    }
+
+    private static CanvasCachedGeometry? BuildCachedGeometry(
+        ICanvasResourceCreator resourceCreator,
+        IReadOnlyList<Vector2> points,
+        bool smooth)
+    {
+        if (points.Count < 2)
+            return null;
+
+        using var builder = new CanvasPathBuilder(resourceCreator);
+        builder.BeginFigure(points[0], CanvasFigureFill.Default);
+        for (var index = 1; index < points.Count; index++)
         {
-            points.Add(point);
-            return;
+            if (!smooth)
+            {
+                builder.AddLine(points[index].X, points[index].Y);
+                continue;
+            }
+
+            var p0 = index > 1 ? points[index - 2] : points[index - 1];
+            var p1 = points[index - 1];
+            var p2 = points[index];
+            var p3 = index + 1 < points.Count ? points[index + 1] : p2;
+            var control1 = p1 + (p2 - p0) / 8f;
+            var control2 = p2 - (p3 - p1) / 8f;
+            ClampControlPoint(ref control1, p1, p2);
+            ClampControlPoint(ref control2, p1, p2);
+            builder.AddCubicBezier(control1, control2, p2);
         }
 
-        var previous = points[^1];
-        if (previous.TimestampUtc != point.TimestampUtc || Math.Abs(previous.Value - point.Value) >= 0.0001)
-            points.Add(point);
+        builder.EndFigure(CanvasFigureLoop.Open);
+        using var geometry = CanvasGeometry.CreatePath(builder);
+        return CanvasCachedGeometry.CreateStroke(geometry, 2);
     }
 
-    private static void DrawPolyline(CanvasDrawingSession ds, IReadOnlyList<Vector2> points, Color color, float thickness)
+    private static void ClampControlPoint(ref Vector2 control, Vector2 start, Vector2 end)
     {
-        for (var i = 1; i < points.Count; i++)
-            ds.DrawLine(points[i - 1], points[i], color, thickness);
+        control.X = Math.Clamp(control.X, Math.Min(start.X, end.X), Math.Max(start.X, end.X));
+        control.Y = Math.Clamp(control.Y, Math.Min(start.Y, end.Y), Math.Max(start.Y, end.Y));
     }
 
     private void DrawTooltip(CanvasDrawingSession ds, Rect plot, DateTime fromUtc, DateTime toUtc, IReadOnlyList<PowerChartSample> samples, Point pointer, ChartPalette colors)
@@ -528,6 +603,7 @@ public sealed partial class PowerHistoryChart : UserControl
         _dragStartToUtc = toUtc;
         _previewFromUtc = fromUtc;
         _previewToUtc = toUtc;
+        _lastPanInvalidateTimestamp = 0;
         ChartCanvas.CapturePointer(e.Pointer);
         e.Handled = true;
     }
@@ -535,6 +611,11 @@ public sealed partial class PowerHistoryChart : UserControl
     private void ChartCanvas_PointerMoved(object sender, PointerRoutedEventArgs e)
     {
         var point = e.GetCurrentPoint(ChartCanvas);
+        var hoverPixel = (int)Math.Round(point.Position.X);
+        if (!_isDragging && hoverPixel == _lastHoverPixel)
+            return;
+
+        _lastHoverPixel = hoverPixel;
         _hoverPosition = point.Position;
 
         if (_isDragging)
@@ -575,6 +656,7 @@ public sealed partial class PowerHistoryChart : UserControl
     {
         _isPointerOver = false;
         _hoverPosition = null;
+        _lastHoverPixel = -1;
         if (!_isDragging)
             QueueInvalidate();
     }
@@ -614,6 +696,11 @@ public sealed partial class PowerHistoryChart : UserControl
         var clamped = ClampRange(_dragStartFromUtc + shift, _dragStartToUtc + shift, HistoryFromUtc, HistoryToUtc);
         _previewFromUtc = clamped.FromUtc;
         _previewToUtc = clamped.ToUtc;
+        var timestamp = Stopwatch.GetTimestamp();
+        if (timestamp - _lastPanInvalidateTimestamp < PanFrameTicks)
+            return;
+
+        _lastPanInvalidateTimestamp = timestamp;
         QueueInvalidate();
     }
 
@@ -645,15 +732,31 @@ public sealed partial class PowerHistoryChart : UserControl
 
     private Rect GetPlotRect()
     {
-        var width = Math.Max(PlotLeft + PlotRight + 1, ChartCanvas.ActualWidth);
-        var height = Math.Max(PlotTop + PlotBottom + 1, ChartCanvas.ActualHeight);
+        var width = double.IsFinite(ChartCanvas.ActualWidth)
+            ? Math.Max(PlotLeft + PlotRight + 1, ChartCanvas.ActualWidth)
+            : PlotLeft + PlotRight + 1;
+        var height = double.IsFinite(ChartCanvas.ActualHeight)
+            ? Math.Max(PlotTop + PlotBottom + 1, ChartCanvas.ActualHeight)
+            : PlotTop + PlotBottom + 1;
         return new Rect(PlotLeft, PlotTop, width - PlotLeft - PlotRight, height - PlotTop - PlotBottom);
     }
 
     private void ChartCanvas_Unloaded(object sender, RoutedEventArgs e)
     {
+        InvalidateGeometryCache();
         ChartCanvas.RemoveFromVisualTree();
     }
+
+    private void ChartCanvas_CreateResources(CanvasControl sender, CanvasCreateResourcesEventArgs args)
+        => InvalidateGeometryCache();
+
+    private void ChartCanvas_SizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        InvalidateGeometryCache();
+        QueueInvalidate();
+    }
+
+    private sealed record DisplaySeries(IReadOnlyList<Vector2> Points, bool Smooth);
 
     private ChartPalette GetPalette()
     {

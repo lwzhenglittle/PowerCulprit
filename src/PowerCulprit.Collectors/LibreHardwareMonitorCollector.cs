@@ -270,7 +270,7 @@ public class LibreHardwareMonitorCollector : IDisposable
         };
     }
 
-    private static string GetUnitString(LibreHardwareMonitor.Hardware.SensorType type)
+    internal static string GetUnitString(LibreHardwareMonitor.Hardware.SensorType type)
     {
         return type switch
         {
@@ -279,7 +279,7 @@ public class LibreHardwareMonitorCollector : IDisposable
             LibreHardwareMonitor.Hardware.SensorType.Load => "%",
             LibreHardwareMonitor.Hardware.SensorType.Clock => "MHz",
             LibreHardwareMonitor.Hardware.SensorType.Voltage => "V",
-            LibreHardwareMonitor.Hardware.SensorType.Energy => "J",
+            LibreHardwareMonitor.Hardware.SensorType.Energy => "mWh",
             LibreHardwareMonitor.Hardware.SensorType.Current => "A",
             _ => ""
         };

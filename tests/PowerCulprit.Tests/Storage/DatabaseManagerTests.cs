@@ -60,7 +60,8 @@ public class DatabaseManagerTests : IDisposable
         Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_analysis_aggregates';"));
         Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='gpu_analysis_aggregates';"));
         Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='hardware_sensor_aggregates';"));
-        Assert.Equal(7, await ScalarLongAsync("PRAGMA user_version;"));
+        Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_instances';"));
+        Assert.Equal(9, await ScalarLongAsync("PRAGMA user_version;"));
     }
 
     [Fact]
@@ -91,7 +92,7 @@ public class DatabaseManagerTests : IDisposable
 
         await _db.InitializeAsync();
 
-        Assert.Equal(7, await ScalarLongAsync("PRAGMA user_version;"));
+        Assert.Equal(9, await ScalarLongAsync("PRAGMA user_version;"));
         Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM system_power_samples;"));
         Assert.Equal(1, await ScalarLongAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_analysis_aggregates';"));
         // v7: is_ac_online is now nullable — the legacy NOT NULL column must
@@ -756,6 +757,7 @@ public class DatabaseManagerTests : IDisposable
             Power(start.AddMinutes(1), ac: false, percent: 90),
             Power(start.AddMinutes(2), ac: false, percent: 80),
             Power(start.AddMinutes(3), ac: true, percent: 80),
+            Power(start.AddMinutes(3).AddSeconds(1), ac: true, percent: 80),
             Power(start.AddMinutes(4), ac: false, percent: 80),
             Power(start.AddMinutes(5), ac: false, percent: 65),
             Power(start.AddMinutes(6), ac: true, percent: 65)
@@ -764,14 +766,18 @@ public class DatabaseManagerTests : IDisposable
         await _db.RebuildBatteryCyclesAsync();
 
         var displayCycles = await _db.GetLatestBatteryDisplayCyclesAsync(10);
-        var display = Assert.Single(displayCycles);
-        Assert.Equal(2, display.RawCycleCount);
-        Assert.Equal(25, display.DischargePercent);
-        Assert.Equal(25, display.DischargeWh);
+        Assert.Equal(2, displayCycles.Count);
+        var orderedDisplays = displayCycles.OrderBy(c => c.StartUtc).ToList();
+        Assert.All(orderedDisplays, display => Assert.Equal(1, display.RawCycleCount));
+        Assert.Equal(10, orderedDisplays[0].DischargePercent);
+        Assert.Equal(15, orderedDisplays[1].DischargePercent);
 
-        var rawCycles = await _db.GetBatteryCyclesForDisplayCycleAsync(display.Id);
-        Assert.Equal(2, rawCycles.Count);
-        Assert.All(rawCycles, c => Assert.Equal(display.Id, c.DisplayCycleId));
+        foreach (var display in orderedDisplays)
+        {
+            var rawCycles = await _db.GetBatteryCyclesForDisplayCycleAsync(display.Id);
+            var raw = Assert.Single(rawCycles);
+            Assert.Equal(display.Id, raw.DisplayCycleId);
+        }
     }
 
     [Fact]
@@ -791,18 +797,12 @@ public class DatabaseManagerTests : IDisposable
         await _db.RebuildBatteryCyclesAsync();
 
         var displayCycles = await _db.GetLatestBatteryDisplayCyclesAsync(10);
-        Assert.Equal(2, displayCycles.Count);
-
-        var allRawCycles = new List<BatteryCycle>();
-        foreach (var display in displayCycles)
-            allRawCycles.AddRange(await _db.GetBatteryCyclesForDisplayCycleAsync(display.Id));
-
-        var rawCycles = allRawCycles.OrderBy(c => c.StartUtc).ToList();
-        Assert.Equal(2, rawCycles.Count);
-        Assert.Equal(start.AddMinutes(1), rawCycles[0].StartUtc, TimeSpan.FromSeconds(1));
-        Assert.Equal(start.AddMinutes(2), rawCycles[0].EndUtc!.Value, TimeSpan.FromSeconds(1));
-        Assert.Equal(start.AddMinutes(3), rawCycles[1].StartUtc, TimeSpan.FromSeconds(1));
-        Assert.True(rawCycles[1].StartedAtSessionBoundary);
+        var display = Assert.Single(displayCycles);
+        var rawCycles = await _db.GetBatteryCyclesForDisplayCycleAsync(display.Id);
+        var raw = Assert.Single(rawCycles);
+        Assert.Equal(start.AddMinutes(1), raw.StartUtc, TimeSpan.FromSeconds(1));
+        Assert.True(raw.IsOpen);
+        Assert.False(raw.StartedAtSessionBoundary);
     }
 
     [Fact]
@@ -1079,7 +1079,7 @@ public class DatabaseManagerTests : IDisposable
             using var legacyDb = new PowerCulprit.Storage.DatabaseManager(legacyPath);
             await legacyDb.InitializeAsync();
 
-            Assert.Equal(7, await ScalarLongAsync(legacyPath, "PRAGMA user_version;"));
+            Assert.Equal(9, await ScalarLongAsync(legacyPath, "PRAGMA user_version;"));
             Assert.Equal(0, await ScalarLongAsync(
                 legacyPath,
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_samples';"));
@@ -1248,6 +1248,61 @@ public class DatabaseManagerTests : IDisposable
     // skip the bad rows and commit everything else.
 
     [Fact]
+    public async Task InsertMonitoringCycle_ProcessLifecycle_RoundTripsStableInstancesAndParent()
+    {
+        var parentStart = new DateTime(2026, 8, 25, 12, 0, 0, DateTimeKind.Utc);
+        var childStart = parentStart.AddSeconds(2);
+        var childStop = childStart.AddSeconds(4);
+        var events = new[]
+        {
+            new ProcessLifecycleEvent
+            {
+                Kind = ProcessLifecycleEventKind.Start, TimestampUtc = parentStart,
+                StartTimeUtc = parentStart, Pid = 100, ProcessName = "launcher.exe"
+            },
+            new ProcessLifecycleEvent
+            {
+                Kind = ProcessLifecycleEventKind.Start, TimestampUtc = childStart,
+                StartTimeUtc = childStart, Pid = 200, ProcessName = "worker.exe",
+                ParentPid = 100, ParentStartTimeUtc = parentStart, CommandLine = "worker.exe --once"
+            },
+            new ProcessLifecycleEvent
+            {
+                Kind = ProcessLifecycleEventKind.Stop, TimestampUtc = childStop,
+                StartTimeUtc = childStart, Pid = 200, ProcessName = "worker.exe"
+            }
+        };
+
+        await _db.InsertMonitoringCycleAsync(
+            null,
+            Array.Empty<ProcessSample>(),
+            Array.Empty<GpuProcessSample>(),
+            Array.Empty<HardwareSensorSample>(),
+            Array.Empty<SourceStatus>(),
+            processLifecycleEvents: events);
+        await _db.InsertMonitoringCycleAsync(
+            null,
+            Array.Empty<ProcessSample>(),
+            Array.Empty<GpuProcessSample>(),
+            Array.Empty<HardwareSensorSample>(),
+            Array.Empty<SourceStatus>(),
+            processLifecycleEvents: new[] { events[1] });
+
+        var instances = await _db.GetProcessInstancesAsync(parentStart, childStop.AddSeconds(1));
+
+        Assert.Equal(2, instances.Count);
+        var parent = Assert.Single(instances, instance => instance.Pid == 100);
+        var child = Assert.Single(instances, instance => instance.Pid == 200);
+        Assert.Equal(parent.Id, child.ParentInstanceId);
+        Assert.Equal("launcher.exe", child.ParentProcessName);
+        Assert.Equal(childStart, child.StartTimeUtc);
+        Assert.Equal(childStop, child.StopTimeUtc);
+        Assert.True(child.StartObserved);
+        Assert.True(child.StopObserved);
+        Assert.Equal(TimeSpan.FromSeconds(4), child.Lifetime);
+    }
+
+    [Fact]
     public async Task InsertMonitoringCycle_NaNSensorValue_SkipsRowAndCommitsRest()
     {
         var ts = new DateTime(2026, 6, 23, 12, 0, 0, DateTimeKind.Utc);
@@ -1354,6 +1409,32 @@ public class DatabaseManagerTests : IDisposable
         var sample = Assert.Single(result);
         Assert.Equal("CPU Package", sample.SensorName);
         Assert.Equal(12.3, sample.Value);
+    }
+
+    [Fact]
+    public async Task InitializeAsync_CorrectsLegacyLhmEnergyUnitWithoutChangingValue()
+    {
+        var ts = new DateTime(2026, 8, 25, 12, 0, 0, DateTimeKind.Utc);
+        await _db.InsertHardwareSensorSamplesAsync(new[]
+        {
+            new HardwareSensorSample
+            {
+                TimestampUtc = ts,
+                Source = "LibreHardwareMonitor",
+                DeviceName = "Battery",
+                SensorName = "Remaining Capacity",
+                MetricName = "Energy",
+                Value = 99900,
+                Unit = "J"
+            }
+        });
+        using var upgraded = new PowerCulprit.Storage.DatabaseManager(_testDbPath);
+        await upgraded.InitializeAsync();
+        var sample = Assert.Single(await upgraded.GetHardwareSensorSamplesAsync(
+            ts.AddSeconds(-1), ts.AddSeconds(1)));
+
+        Assert.Equal(99900, sample.Value);
+        Assert.Equal("mWh", sample.Unit);
     }
 
     [Fact]

@@ -66,6 +66,11 @@ public sealed partial class MainPage : Page
         ViewModel?.SetChartVisibleRangeFromUserInteraction(e.FromUtc, e.ToUtc);
     }
 
+    private void HistoryChart_ResetZoom_Click(object sender, Microsoft.UI.Xaml.RoutedEventArgs e)
+    {
+        HistoryChart.ResetZoom();
+    }
+
     private void RestorePageScrolling()
     {
         RootScrollViewer.VerticalScrollMode = ScrollMode.Enabled;

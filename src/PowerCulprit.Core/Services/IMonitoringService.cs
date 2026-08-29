@@ -28,14 +28,20 @@ public class MonitoringSnapshot
     /// <summary>CPU package power in watts, if available.</summary>
     public double? CpuPackagePowerWatts { get; init; }
 
-    /// <summary>iGPU power or activity value (watts if LHM, util% if GPU Engine fallback).</summary>
-    public double? IgpuPowerValue { get; init; }
+    /// <summary>RAPL platform-domain power in watts; overlaps other domains and is not additive.</summary>
+    public double? CpuPlatformPowerWatts { get; init; }
 
-    /// <summary>iGPU activity percentage from GPU Engine (null if LHM power available).</summary>
+    /// <summary>RAPL PP0/core-domain power in watts.</summary>
+    public double? CpuCoresPowerWatts { get; init; }
+
+    /// <summary>RAPL DRAM/memory-domain power in watts.</summary>
+    public double? CpuMemoryPowerWatts { get; init; }
+
+    /// <summary>Direct Intel GPU hardware power in watts; never a utilization proxy.</summary>
+    public double? GpuPowerWatts { get; init; }
+
+    /// <summary>Intel GPU activity percentage from GPU Engine, independent of hardware watts.</summary>
     public double? IgpuActivityPercent { get; init; }
-
-    /// <summary>Whether iGPU data is from LHM (true) or GPU Engine fallback (false).</summary>
-    public bool IgpuFromHardwareSensor { get; init; }
 
     /// <summary>Current source statuses (refreshed periodically).</summary>
     public IReadOnlyList<SourceStatus> SourceStatuses { get; init; } = Array.Empty<SourceStatus>();
@@ -79,6 +85,12 @@ public interface IMonitoringService
     event Action<bool>? RunningChanged;
 
     /// <summary>
+    /// Raised after a monitoring cycle has produced a new snapshot. Subscribers
+    /// may be invoked on a worker thread and must marshal UI work themselves.
+    /// </summary>
+    event Action<MonitoringSnapshot>? SnapshotPublished;
+
+    /// <summary>
     /// Record a system power state transition (suspend / resume / resume-automatic)
     /// received via WM_POWERBROADCAST.
     /// </summary>
@@ -92,5 +104,6 @@ public interface IMonitoringService
     /// </summary>
     Task<IReadOnlyList<PowerStateEvent>> GetPowerStateEventsAsync(
         DateTime fromUtc,
-        DateTime toUtc);
+        DateTime toUtc,
+        CancellationToken cancellationToken = default);
 }

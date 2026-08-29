@@ -11,4 +11,11 @@ public sealed record CpuTimelineSample(
     double? CumulativeEnergyWh,
     double? CpuAverageClockMhz,
     double? CpuLoadPercent,
-    double? CpuPackagePowerWatts);
+    double? CpuPackagePowerWatts)
+{
+    public bool? IsAcOnline { get; init; }
+    public double? CpuPlatformPowerWatts { get; init; }
+    public double? CpuCoresPowerWatts { get; init; }
+    public double? CpuMemoryPowerWatts { get; init; }
+    public double? GpuPowerWatts { get; init; }
+}

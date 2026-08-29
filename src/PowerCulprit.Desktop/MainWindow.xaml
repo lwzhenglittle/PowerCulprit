@@ -22,7 +22,7 @@
                 <Image Width="16"
                        Height="16">
                     <Image.Source>
-                        <SvgImageSource UriSource="ms-appx:///Assets/AppIcon.svg" />
+                        <SvgImageSource UriSource="ms-appx:///Assets/AppIconMicro.svg" />
                     </Image.Source>
                 </Image>
                 <TextBlock VerticalAlignment="Center"

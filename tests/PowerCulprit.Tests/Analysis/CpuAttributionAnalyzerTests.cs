@@ -24,10 +24,10 @@ public class CpuAttributionAnalyzerTests
         // frozen across the gap.
         var samples = new List<CpuTimelineSample>
         {
-            new(_baseTime, null, 0.0, null, null, 5.0),
-            new(_baseTime.AddSeconds(2), null, 0.0028, null, null, 5.0),
-            new(_baseTime.AddHours(2), null, 0.0028, null, null, 5.0),
-            new(_baseTime.AddHours(2).AddSeconds(2), null, 0.0056, null, null, 5.0),
+            new(_baseTime, null, 0.0, null, null, 5.0) { IsAcOnline = false },
+            new(_baseTime.AddSeconds(2), null, 0.0028, null, null, 5.0) { IsAcOnline = false },
+            new(_baseTime.AddHours(2), null, 0.0028, null, null, 5.0) { IsAcOnline = false },
+            new(_baseTime.AddHours(2).AddSeconds(2), null, 0.0056, null, null, 5.0) { IsAcOnline = false },
         };
 
         var result = CpuAttributionAnalyzer.Analyze(samples);
@@ -48,12 +48,12 @@ public class CpuAttributionAnalyzerTests
         // zero-rate point.
         var samples = new List<CpuTimelineSample>
         {
-            new(_baseTime, null, 0.0, null, null, 2.0),
-            new(_baseTime.AddSeconds(2), null, 0.0012, null, null, 4.0),
-            new(_baseTime.AddSeconds(4), null, 0.0036, null, null, 6.0),
-            new(_baseTime.AddSeconds(6), null, 0.0072, null, null, 8.0),
+            new(_baseTime, null, 0.0, null, null, 2.0) { IsAcOnline = false },
+            new(_baseTime.AddSeconds(2), null, 0.0012, null, null, 4.0) { IsAcOnline = false },
+            new(_baseTime.AddSeconds(4), null, 0.0036, null, null, 6.0) { IsAcOnline = false },
+            new(_baseTime.AddSeconds(6), null, 0.0072, null, null, 8.0) { IsAcOnline = false },
             // 2-hour gap (suspend) — energy frozen at the last awake value.
-            new(_baseTime.AddHours(2).AddSeconds(6), null, 0.0072, null, null, 8.0),
+            new(_baseTime.AddHours(2).AddSeconds(6), null, 0.0072, null, null, 8.0) { IsAcOnline = false },
         };
 
         var result = CpuAttributionAnalyzer.Analyze(samples);

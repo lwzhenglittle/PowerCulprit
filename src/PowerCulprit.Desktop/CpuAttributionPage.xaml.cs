@@ -46,6 +46,11 @@ public sealed partial class CpuAttributionPage : Page
         ViewModel?.SetChartVisibleRangeFromUserInteraction(e.FromUtc, e.ToUtc);
     }
 
+    private void CpuChart_ResetZoom_Click(object sender, Microsoft.UI.Xaml.RoutedEventArgs e)
+    {
+        CpuChart.ResetZoom();
+    }
+
     private void RestorePageScrolling()
     {
         RootScrollViewer.VerticalScrollMode = ScrollMode.Enabled;

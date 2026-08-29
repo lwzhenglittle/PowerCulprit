@@ -4,6 +4,13 @@ namespace PowerCulprit.Tests.Collectors;
 
 public class LibreHardwareMonitorCollectorTests
 {
+    [Fact]
+    public void GetUnitString_EnergyUsesLibreHardwareMonitorMilliwattHours()
+    {
+        Assert.Equal("mWh", LibreHardwareMonitorCollector.GetUnitString(
+            LibreHardwareMonitor.Hardware.SensorType.Energy));
+    }
+
     private static readonly DateTime Now = new(2026, 07, 16, 12, 0, 0, DateTimeKind.Utc);
 
     [Fact]

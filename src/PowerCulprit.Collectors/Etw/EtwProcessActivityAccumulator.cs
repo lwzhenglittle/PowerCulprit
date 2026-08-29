@@ -1,3 +1,5 @@
+using PowerCulprit.Core.Models;
+
 namespace PowerCulprit.Collectors;
 
 /// <summary>
@@ -9,6 +11,7 @@ public sealed class EtwProcessActivityAccumulator
     private readonly object _lock = new();
     private readonly Dictionary<int, MutableActivity> _activities = new();
     private readonly Dictionary<int, MutableMetadata> _metadata = new();
+    private readonly List<ProcessLifecycleEvent> _lifecycleEvents = new();
     private DateTime _lastSnapshotUtc;
     private EtwActivityCounters _periodCounters = new();
 
@@ -25,17 +28,40 @@ public sealed class EtwProcessActivityAccumulator
 
         lock (_lock)
         {
+            var normalizedStartTimeUtc = NormalizeUtc(startTimeUtc);
+            DateTime? parentStartTimeUtc = null;
+            if (parentPid is > 0 &&
+                _metadata.TryGetValue(parentPid.Value, out var parentMetadata) &&
+                (!parentMetadata.StopTimeUtc.HasValue ||
+                 !normalizedStartTimeUtc.HasValue ||
+                 parentMetadata.StopTimeUtc.Value >= normalizedStartTimeUtc.Value))
+            {
+                parentStartTimeUtc = parentMetadata.StartTimeUtc;
+            }
+
             var metadata = new MutableMetadata(pid)
             {
                 ProcessName = NormalizeText(processName),
                 ImagePath = NormalizeText(imagePath),
                 CommandLine = NormalizeText(commandLine),
                 ParentPid = parentPid,
-                StartTimeUtc = NormalizeUtc(startTimeUtc),
+                StartTimeUtc = normalizedStartTimeUtc,
                 StopTimeUtc = null,
                 LastSeenUtc = NormalizeUtc(startTimeUtc) ?? DateTime.UtcNow
             };
             _metadata[pid] = metadata;
+            _lifecycleEvents.Add(new ProcessLifecycleEvent
+            {
+                Kind = ProcessLifecycleEventKind.Start,
+                TimestampUtc = metadata.StartTimeUtc ?? DateTime.UtcNow,
+                Pid = pid,
+                StartTimeUtc = metadata.StartTimeUtc,
+                ProcessName = metadata.ProcessName,
+                ImagePath = metadata.ImagePath,
+                CommandLine = metadata.CommandLine,
+                ParentPid = metadata.ParentPid,
+                ParentStartTimeUtc = parentStartTimeUtc
+            });
 
             var activity = GetOrCreateActivity(pid);
             activity.ProcessStartCount++;
@@ -54,19 +80,34 @@ public sealed class EtwProcessActivityAccumulator
         lock (_lock)
         {
             var utc = NormalizeUtc(stopTimeUtc) ?? DateTime.UtcNow;
+            MutableMetadata? lifecycleMetadata = null;
             if (_metadata.TryGetValue(pid, out var metadata))
             {
                 metadata.StopTimeUtc = utc;
                 metadata.LastSeenUtc = utc;
+                lifecycleMetadata = metadata;
             }
             else
             {
-                _metadata[pid] = new MutableMetadata(pid)
+                lifecycleMetadata = new MutableMetadata(pid)
                 {
                     StopTimeUtc = utc,
                     LastSeenUtc = utc
                 };
+                _metadata[pid] = lifecycleMetadata;
             }
+
+            _lifecycleEvents.Add(new ProcessLifecycleEvent
+            {
+                Kind = ProcessLifecycleEventKind.Stop,
+                TimestampUtc = utc,
+                Pid = pid,
+                StartTimeUtc = lifecycleMetadata.StartTimeUtc,
+                ProcessName = lifecycleMetadata.ProcessName,
+                ImagePath = lifecycleMetadata.ImagePath,
+                CommandLine = lifecycleMetadata.CommandLine,
+                ParentPid = lifecycleMetadata.ParentPid
+            });
 
             var activity = GetOrCreateActivity(pid);
             activity.ProcessStopCount++;
@@ -160,16 +201,22 @@ public sealed class EtwProcessActivityAccumulator
                 .OrderBy(kvp => kvp.Key)
                 .Select(kvp => ToImmutable(kvp.Value))
                 .ToArray();
+            var captureReliable = _periodCounters.LostEventCount == 0;
+            var lifecycleEvents = _lifecycleEvents
+                .Select(evt => evt with { CaptureReliable = captureReliable })
+                .ToArray();
 
             var snapshot = new EtwProcessActivitySnapshot
             {
                 TimestampUtc = nowUtc,
                 Interval = interval,
                 Activities = snapshotActivities,
+                LifecycleEvents = lifecycleEvents,
                 Counters = _periodCounters
             };
 
             _activities.Clear();
+            _lifecycleEvents.Clear();
             _periodCounters = new EtwActivityCounters();
             _lastSnapshotUtc = nowUtc;
             return snapshot;

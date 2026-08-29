@@ -17,7 +17,10 @@ public partial class App : Application
     private TrayManager? _trayManager;
     private PowerStateMonitor? _powerStateMonitor;
     private SingleInstanceGuard? _singleInstanceGuard;
-    private bool _isExiting;
+    private int _shutdownStarted;
+    private CancellationTokenSource? _lifetimeCts;
+    private Task? _monitorStartTask;
+    private Task? _initialHistoryTask;
 
     public App()
     {
@@ -67,6 +70,7 @@ public partial class App : Application
         }
 
         _serviceProvider = BuildServiceProvider();
+        _lifetimeCts = new CancellationTokenSource();
 
         var mainViewModel = _serviceProvider.GetRequiredService<MainViewModel>();
         var cpuViewModel = _serviceProvider.GetRequiredService<CpuAttributionViewModel>();
@@ -103,16 +107,64 @@ public partial class App : Application
 
         _window.Activate();
 
-        _ = mainViewModel.StartMonitoringCommand.ExecuteAsync(null);
-        _ = LoadInitialHistoryAfterFirstFrameAsync(mainViewModel, _window.DispatcherQueue);
+        _monitorStartTask = mainViewModel.StartMonitoringCommand.ExecuteAsync(null);
+        _initialHistoryTask = LoadInitialHistoryAfterFirstFrameAsync(
+            mainViewModel,
+            _window.DispatcherQueue,
+            _lifetimeCts.Token);
     }
 
     private static async Task LoadInitialHistoryAfterFirstFrameAsync(
         MainViewModel viewModel,
-        DispatcherQueue dispatcher)
+        DispatcherQueue dispatcher,
+        CancellationToken cancellationToken)
     {
-        await Task.Delay(TimeSpan.FromMilliseconds(750));
-        dispatcher.TryEnqueue(() => _ = viewModel.LatestCommand.ExecuteAsync(null));
+        try
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(750), cancellationToken);
+            if (cancellationToken.IsCancellationRequested)
+                return;
+
+            var completion = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            if (!dispatcher.TryEnqueue(async () =>
+            {
+                try
+                {
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        completion.TrySetCanceled(cancellationToken);
+                        return;
+                    }
+
+                    await viewModel.LatestCommand.ExecuteAsync(null);
+                    completion.TrySetResult();
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    completion.TrySetCanceled(cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    completion.TrySetException(ex);
+                }
+            }))
+            {
+                return;
+            }
+
+            // Await the dispatched command so shutdown can wait for an already
+            // started load instead of disposing its dependencies underneath it.
+            await completion.Task;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Normal during application shutdown.
+        }
+        catch (Exception ex)
+        {
+            CrashLog.Write(ex, "InitialHistoryLoad");
+        }
     }
 
     private void ShowWindow()
@@ -147,55 +199,167 @@ public partial class App : Application
         var dispatcher = _window?.DispatcherQueue;
         if (dispatcher is null)
         {
-            _ = DoExitOnUiThreadAsync();
+            StartShutdown(closeWindowOnUiThread: false);
             return;
         }
 
         if (dispatcher.HasThreadAccess)
-            _ = DoExitOnUiThreadAsync();
-        else
-            dispatcher.TryEnqueue(() => _ = DoExitOnUiThreadAsync());
+        {
+            StartShutdown(closeWindowOnUiThread: true);
+            return;
+        }
+
+        if (!dispatcher.TryEnqueue(() => StartShutdown(closeWindowOnUiThread: true)))
+        {
+            // The UI queue may already be shutting down. Do not silently lose
+            // the tray Exit command: clean up non-UI resources and terminate.
+            StartShutdown(closeWindowOnUiThread: false);
+        }
     }
 
-    private async Task DoExitOnUiThreadAsync()
+    private void StartShutdown(bool closeWindowOnUiThread)
     {
-        if (_isExiting)
-            return;
-        _isExiting = true;
+        if (closeWindowOnUiThread)
+        {
+            _ = RunShutdownAndObserveAsync(closeWindowOnUiThread: true);
+        }
+        else
+        {
+            // The fallback can be called from the tray STA thread. Run it on
+            // the pool so TrayManager.Dispose() never tries to join itself.
+            _ = Task.Run(() => RunShutdownAndObserveAsync(closeWindowOnUiThread: false));
+        }
+    }
 
-        _trayManager?.Dispose();
-        _trayManager = null;
-
-        // Detach power state monitor before stopping monitoring
-        _powerStateMonitor?.Dispose();
-        _powerStateMonitor = null;
-
-        // Stop monitoring
+    private async Task RunShutdownAndObserveAsync(bool closeWindowOnUiThread)
+    {
         try
         {
-            var monitor = _serviceProvider?.GetService<IMonitoringService>();
-            if (monitor is not null)
-                await monitor.StopAsync();
+            await DoExitAsync(closeWindowOnUiThread);
         }
-        catch { /* best effort */ }
-
-        // Dispose tray BEFORE closing window
-        _trayManager = null;
-
-        // Dispose DI container — must happen before final window close so
-        // singletons get a chance to release native handles (LHM, PDH, etc.).
-        _serviceProvider?.Dispose();
-        _serviceProvider = null;
-
-        _singleInstanceGuard?.Dispose();
-        _singleInstanceGuard = null;
-
-        if (_window is MainWindow window)
+        catch (Exception ex)
         {
-            window.CloseForReal();
-            _window = null;
+            // DoExitAsync protects each cleanup stage, but keep a final guard
+            // around the fire-and-forget entry point so an unexpected failure
+            // cannot leave a hidden process holding the single-instance lock.
+            CrashLog.Write(ex, "ApplicationShutdown");
+            Environment.Exit(1);
         }
+    }
 
+    private async Task DoExitAsync(bool closeWindowOnUiThread)
+    {
+        if (Interlocked.Exchange(ref _shutdownStarted, 1) != 0)
+            return;
+        var window = _window as MainWindow;
+        try
+        {
+            try { _lifetimeCts?.Cancel(); }
+            catch (Exception ex) { CrashLog.Write(ex, "ApplicationShutdown.CancelStartup"); }
+
+            var initialHistoryTask = Interlocked.Exchange(ref _initialHistoryTask, null);
+            if (initialHistoryTask is not null)
+            {
+                try
+                {
+                    await initialHistoryTask.WaitAsync(TimeSpan.FromSeconds(2));
+                }
+                catch (OperationCanceledException) { }
+                catch (TimeoutException ex)
+                {
+                    CrashLog.Write(ex, "ApplicationShutdown.InitialHistoryTimeout");
+                }
+                catch (Exception ex)
+                {
+                    CrashLog.Write(ex, "ApplicationShutdown.InitialHistory");
+                }
+            }
+
+            var monitorStartTask = Interlocked.Exchange(ref _monitorStartTask, null);
+            if (monitorStartTask is not null)
+            {
+                try
+                {
+                    await monitorStartTask.WaitAsync(TimeSpan.FromSeconds(2));
+                }
+                catch (OperationCanceledException) { }
+                catch (TimeoutException ex)
+                {
+                    CrashLog.Write(ex, "ApplicationShutdown.MonitorStartTimeout");
+                }
+                catch (Exception ex)
+                {
+                    CrashLog.Write(ex, "ApplicationShutdown.MonitorStart");
+                }
+            }
+
+            try { _trayManager?.Dispose(); }
+            catch (Exception ex) { CrashLog.Write(ex, "ApplicationShutdown.Tray"); }
+            _trayManager = null;
+
+            // Detach power state monitor before stopping monitoring
+            try { _powerStateMonitor?.Dispose(); }
+            catch (Exception ex) { CrashLog.Write(ex, "ApplicationShutdown.PowerStateMonitor"); }
+            _powerStateMonitor = null;
+
+            // Stop monitoring before disposing the service provider.
+            try
+            {
+                var monitor = _serviceProvider?.GetService<IMonitoringService>();
+                if (monitor is not null)
+                    await monitor.StopAsync();
+            }
+            catch (Exception ex)
+            {
+                CrashLog.Write(ex, "ApplicationShutdown.Monitoring");
+            }
+        }
+        finally
+        {
+            // Every cleanup stage above is best effort. This finally block is
+            // the last line of defense if an unexpected stage throws, and it
+            // guarantees that no hidden instance keeps the mutex alive.
+            try { _trayManager?.Dispose(); }
+            catch (Exception ex) { CrashLog.Write(ex, "ApplicationShutdown.Tray.Finally"); }
+            _trayManager = null;
+
+            try { _powerStateMonitor?.Dispose(); }
+            catch (Exception ex) { CrashLog.Write(ex, "ApplicationShutdown.PowerStateMonitor.Finally"); }
+            _powerStateMonitor = null;
+
+            try { _serviceProvider?.Dispose(); }
+            catch (Exception ex) { CrashLog.Write(ex, "ApplicationShutdown.Services"); }
+            _serviceProvider = null;
+
+            try { _singleInstanceGuard?.Dispose(); }
+            catch (Exception ex) { CrashLog.Write(ex, "ApplicationShutdown.SingleInstance"); }
+            _singleInstanceGuard = null;
+
+            try { _lifetimeCts?.Dispose(); }
+            catch (Exception ex) { CrashLog.Write(ex, "ApplicationShutdown.Lifetime"); }
+            _lifetimeCts = null;
+
+            _window = null;
+            if (closeWindowOnUiThread && window is not null)
+            {
+                try
+                {
+                    window.CloseForReal();
+                }
+                catch (Exception ex)
+                {
+                    CrashLog.Write(ex, "ApplicationShutdown.Window");
+                    Environment.Exit(1);
+                }
+            }
+            else
+            {
+                // No usable UI dispatcher remains, so there is no safe way to
+                // invoke Window.Close from this thread. All owned resources have
+                // already been released; terminate instead of leaving a zombie.
+                Environment.Exit(0);
+            }
+        }
     }
 
     private async Task ExportDataAsync()
@@ -275,6 +439,7 @@ public partial class App : Application
         services.AddSingleton<IMonitoringService>(sp => sp.GetRequiredService<MonitoringService>());
 
         services.AddSingleton<MainViewModel>();
+        services.AddSingleton<HistorySelectionState>();
         services.AddSingleton<CpuAttributionViewModel>();
         services.AddSingleton<WmiAttributionViewModel>();
         services.AddSingleton(DispatcherQueue.GetForCurrentThread());

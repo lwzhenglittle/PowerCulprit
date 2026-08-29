@@ -4,6 +4,7 @@
 out/
 publish/
 artifacts/
+tmp/
 
 # .NET restore/build state
 project.lock.json

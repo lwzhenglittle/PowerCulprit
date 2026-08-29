@@ -9,7 +9,10 @@
     mc:Ignorable="d">
 
     <canvas:CanvasControl x:Name="ChartCanvas"
+                          AutomationProperties.Name="CPU attribution chart"
+                          AutomationProperties.HelpText="Shows battery, energy, CPU power, load and clock history. Use mouse wheel to zoom, drag to pan, and double-click to reset."
                           ClearColor="Transparent"
+                          CreateResources="ChartCanvas_CreateResources"
                           DoubleTapped="ChartCanvas_DoubleTapped"
                           Draw="ChartCanvas_Draw"
                           PointerCanceled="ChartCanvas_PointerCanceled"
@@ -20,5 +23,6 @@
                           PointerPressed="ChartCanvas_PointerPressed"
                           PointerReleased="ChartCanvas_PointerReleased"
                           PointerWheelChanged="ChartCanvas_PointerWheelChanged"
+                          SizeChanged="ChartCanvas_SizeChanged"
                           Unloaded="ChartCanvas_Unloaded" />
 </UserControl>

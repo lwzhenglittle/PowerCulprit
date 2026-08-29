@@ -40,21 +40,19 @@ public class IntelGpuPowerCollector
 
     /// <summary>
     /// Returns the best available iGPU power value in watts, or null.
-    /// Uses LHM data first, falls back to GPU Engine aggregate utilization.
+    /// Uses only a direct LHM power sensor. GPU utilization remains a separate metric.
     /// </summary>
     public double? GetIgpuPowerWatts(
         IReadOnlyList<HardwareSensorSample> lhmSamples,
         IReadOnlyList<GpuProcessSample>? gpuSamples = null)
     {
-        var value = TryGetIgpuPowerWatts(lhmSamples, gpuSamples, out _);
-        return value;
+        return TryGetIgpuPowerWatts(lhmSamples, gpuSamples, out _);
     }
 
     /// <summary>
     /// Like <see cref="GetIgpuPowerWatts"/> but also reports whether the value
-    /// came from an LHM hardware power sensor (true) vs the GPU Engine utilization
-    /// fallback / no data (false). Lets <c>MonitoringService</c> avoid re-scanning
-    /// the LHM sample list a second time just to label the snapshot.
+    /// came from an LHM hardware power sensor. GPU utilization is deliberately
+    /// never returned under a watt-valued API.
     /// </summary>
     public double? TryGetIgpuPowerWatts(
         IReadOnlyList<HardwareSensorSample> lhmSamples,
@@ -82,13 +80,6 @@ public class IntelGpuPowerCollector
         }
 
         fromHardwareSensor = false;
-
-        // Fallback: aggregate GPU Engine utilization as a proxy
-        if (gpuSamples is not null && gpuSamples.Count > 0)
-        {
-            var totalUtil = gpuSamples.Sum(g => g.UtilizationPercent);
-            return totalUtil; // not watts, but a proxy for activity
-        }
 
         return null;
     }

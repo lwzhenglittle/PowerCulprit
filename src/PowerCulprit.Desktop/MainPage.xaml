@@ -9,16 +9,53 @@
     xmlns:vm="using:PowerCulprit.Desktop.ViewModels"
     mc:Ignorable="d">
 
+    <!-- Keep the default NavigationCacheMode=Disabled. The Win2D chart calls
+         RemoveFromVisualTree when unloaded and cannot be reused from a cached page. -->
+
     <Page.Resources>
         <vm:BoolToInverseConverter x:Key="BoolToInverseConverter" />
+        <vm:BoolToVisibilityConverter x:Key="BoolToVisibilityConverter" />
         <vm:StatusToBrushConverter x:Key="StatusToBrushConverter" />
         <vm:StringToVisibilityConverter x:Key="StringToVisibilityConverter" />
     </Page.Resources>
 
     <ScrollViewer x:Name="RootScrollViewer"
                   Background="{ThemeResource ApplicationPageBackgroundThemeBrush}"
+                  HorizontalContentAlignment="Stretch"
+                  HorizontalScrollMode="Disabled"
+                  HorizontalScrollBarVisibility="Disabled"
                   VerticalScrollBarVisibility="Auto">
-        <StackPanel Padding="{StaticResource PageContentMargin}" Spacing="16">
+        <VisualStateManager.VisualStateGroups>
+            <VisualStateGroup x:Name="WindowWidthStates">
+                <VisualState x:Name="WideLayout">
+                    <VisualState.StateTriggers>
+                        <AdaptiveTrigger MinWindowWidth="1000" />
+                    </VisualState.StateTriggers>
+                    <VisualState.Setters>
+                        <Setter Target="SourcesColumn.Width" Value="360" />
+                        <Setter Target="HistoryCard.(Grid.Row)" Value="0" />
+                        <Setter Target="HistoryCard.(Grid.Column)" Value="0" />
+                        <Setter Target="SourcesPanel.(Grid.Row)" Value="0" />
+                        <Setter Target="SourcesPanel.(Grid.Column)" Value="1" />
+                    </VisualState.Setters>
+                </VisualState>
+                <VisualState x:Name="CompactLayout">
+                    <VisualState.StateTriggers>
+                        <AdaptiveTrigger MinWindowWidth="0" />
+                    </VisualState.StateTriggers>
+                    <VisualState.Setters>
+                        <Setter Target="SourcesColumn.Width" Value="0" />
+                        <Setter Target="HistoryCard.(Grid.Row)" Value="0" />
+                        <Setter Target="HistoryCard.(Grid.Column)" Value="0" />
+                        <Setter Target="SourcesPanel.(Grid.Row)" Value="1" />
+                        <Setter Target="SourcesPanel.(Grid.Column)" Value="0" />
+                    </VisualState.Setters>
+                </VisualState>
+            </VisualStateGroup>
+        </VisualStateManager.VisualStateGroups>
+        <StackPanel Padding="{StaticResource PageContentMargin}"
+                    Spacing="16"
+                    Width="{x:Bind RootScrollViewer.ViewportWidth, Mode=OneWay}">
 
             <Grid ColumnSpacing="16">
                 <Grid.ColumnDefinitions>
@@ -112,17 +149,17 @@
                             <ProgressRing Width="18"
                                           Height="18"
                                           IsActive="{x:Bind ViewModel.IsBusy, Mode=OneWay}"
-                                          Visibility="{x:Bind ViewModel.IsBusy, Mode=OneWay}"
+                                          Visibility="{x:Bind ViewModel.IsBusy, Mode=OneWay, Converter={StaticResource BoolToVisibilityConverter}}"
                                           ToolTipService.ToolTip="Loading or analyzing..." />
                             <ToggleSwitch Header="GPU Engine"
                                           IsOn="{x:Bind ViewModel.IsGpuSamplingEnabled, Mode=TwoWay}"
                                           OffContent="Off"
                                           OnContent="On" />
-                            <TextBlock Text="{x:Bind ViewModel.ErrorText, Mode=OneWay}"
-                                       Foreground="{ThemeResource SystemFillColorCriticalBrush}"
-                                       MaxWidth="420"
-                                       TextTrimming="CharacterEllipsis"
-                                       VerticalAlignment="Center" />
+                            <InfoBar IsOpen="{x:Bind ViewModel.HasError, Mode=OneWay}"
+                                     IsClosable="False"
+                                     Severity="Error"
+                                     Message="{x:Bind ViewModel.ErrorText, Mode=OneWay}"
+                                     MaxWidth="520" />
                         </StackPanel>
                     </CommandBar.Content>
 
@@ -148,7 +185,7 @@
 
                 <Border Style="{StaticResource DashboardCompactCardStyle}">
                     <StackPanel Spacing="6">
-                        <TextBlock Text="Power"
+                        <TextBlock Text="Power source"
                                    Style="{StaticResource MetricLabelTextBlockStyle}" />
                         <TextBlock Text="{x:Bind ViewModel.AcStatusText, Mode=OneWay}"
                                    Style="{StaticResource MetricValueTextBlockStyle}" />
@@ -158,44 +195,114 @@
                 <Border Grid.Column="1"
                         Style="{StaticResource DashboardCompactCardStyle}">
                     <StackPanel Spacing="6">
-                        <TextBlock Text="Battery drop"
+                        <TextBlock Text="Battery now"
                                    Style="{StaticResource MetricLabelTextBlockStyle}" />
-                        <TextBlock Text="{x:Bind ViewModel.BatteryPercentText, Mode=OneWay}"
+                        <TextBlock Text="{x:Bind ViewModel.CurrentBatteryPercentText, Mode=OneWay}"
                                    Style="{StaticResource MetricValueTextBlockStyle}"
-                                   ToolTipService.ToolTip="{x:Bind ViewModel.BatteryPercentText, Mode=OneWay}" />
+                                   ToolTipService.ToolTip="Latest live battery percentage" />
                     </StackPanel>
                 </Border>
 
                 <Border Grid.Column="2"
                         Style="{StaticResource DashboardCompactCardStyle}">
                     <StackPanel Spacing="6">
-                        <TextBlock Text="Energy used"
+                        <TextBlock Text="Live power split (30 s)"
                                    Style="{StaticResource MetricLabelTextBlockStyle}" />
-                        <TextBlock Text="{x:Bind ViewModel.DischargeRateText, Mode=OneWay}"
+                        <TextBlock Text="{x:Bind ViewModel.CurrentPowerBreakdownTotalText, Mode=OneWay}"
                                    Style="{StaticResource MetricValueTextBlockStyle}"
-                                   ToolTipService.ToolTip="{x:Bind ViewModel.DischargeRateText, Mode=OneWay}" />
+                                   ToolTipService.ToolTip="Time-weighted whole-system discharge measured at the battery" />
+                        <ProgressBar Minimum="0"
+                                     Maximum="100"
+                                     Value="{x:Bind ViewModel.CurrentCpuSharePercent, Mode=OneWay}"
+                                     Height="8"
+                                     ToolTipService.ToolTip="Filled portion is CPU package share; the track remainder is non-CPU residual" />
+                        <Grid RowSpacing="2" ColumnSpacing="8">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="CPU package"
+                                       Style="{StaticResource MetricLabelTextBlockStyle}"
+                                       VerticalAlignment="Center" />
+                            <TextBlock Grid.Column="1"
+                                       Text="{x:Bind ViewModel.CurrentCpuShareText, Mode=OneWay}"
+                                       Style="{StaticResource MetricValueTextBlockStyle}"
+                                       HorizontalAlignment="Right"
+                                       ToolTipService.ToolTip="CPU package divided by whole-system battery discharge over the same time window" />
+                            <TextBlock Grid.Row="1"
+                                       Text="Non-CPU residual"
+                                       Style="{StaticResource MetricLabelTextBlockStyle}"
+                                       VerticalAlignment="Center" />
+                            <TextBlock Grid.Row="1"
+                                       Grid.Column="1"
+                                       Text="{x:Bind ViewModel.CurrentNonCpuShareText, Mode=OneWay}"
+                                       Style="{StaticResource MetricValueTextBlockStyle}"
+                                       HorizontalAlignment="Right"
+                                       ToolTipService.ToolTip="Battery discharge minus CPU package. Includes display, storage, radios, fans, conversion losses and measurement error; it is not a direct peripheral measurement" />
+                        </Grid>
+                        <TextBlock Text="{x:Bind ViewModel.CurrentPowerBreakdownStatusText, Mode=OneWay}"
+                                   TextWrapping="Wrap"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <Expander Header="Instantaneous overlapping domains"
+                                  HorizontalAlignment="Stretch">
+                            <Grid RowSpacing="2" ColumnSpacing="8" Margin="0,4,0,0">
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="CPU package" Style="{StaticResource MetricLabelTextBlockStyle}" />
+                                <TextBlock Grid.Column="1" Text="{x:Bind ViewModel.CurrentCpuPackagePowerText, Mode=OneWay}" HorizontalAlignment="Right" />
+                                <TextBlock Grid.Row="1" Text="CPU cores" Style="{StaticResource MetricLabelTextBlockStyle}" />
+                                <TextBlock Grid.Row="1" Grid.Column="1" Text="{x:Bind ViewModel.CurrentCpuCoresPowerText, Mode=OneWay}" HorizontalAlignment="Right" />
+                                <TextBlock Grid.Row="2" Text="CPU memory" Style="{StaticResource MetricLabelTextBlockStyle}" />
+                                <TextBlock Grid.Row="2" Grid.Column="1" Text="{x:Bind ViewModel.CurrentCpuMemoryPowerText, Mode=OneWay}" HorizontalAlignment="Right" />
+                                <TextBlock Grid.Row="3" Text="CPU platform" Style="{StaticResource MetricLabelTextBlockStyle}" />
+                                <TextBlock Grid.Row="3" Grid.Column="1" Text="{x:Bind ViewModel.CurrentCpuPlatformPowerText, Mode=OneWay}" HorizontalAlignment="Right" />
+                                <TextBlock Grid.Row="4" Text="GPU" Style="{StaticResource MetricLabelTextBlockStyle}" />
+                                <TextBlock Grid.Row="4" Grid.Column="1" Text="{x:Bind ViewModel.CurrentGpuPowerText, Mode=OneWay}" HorizontalAlignment="Right" />
+                            </Grid>
+                        </Expander>
                     </StackPanel>
                 </Border>
 
                 <Border Grid.Column="3"
                         Style="{StaticResource DashboardCompactCardStyle}">
                     <StackPanel Spacing="6">
-                        <TextBlock Text="Range"
+                        <TextBlock Text="Battery energy used"
                                    Style="{StaticResource MetricLabelTextBlockStyle}" />
-                        <TextBlock Text="{x:Bind ViewModel.SelectedRangeText, Mode=OneWay}"
+                        <TextBlock Text="{x:Bind ViewModel.DischargeRateText, Mode=OneWay}"
                                    Style="{StaticResource MetricValueTextBlockStyle}"
-                                   ToolTipService.ToolTip="{x:Bind ViewModel.SelectedRangeText, Mode=OneWay}" />
+                                   ToolTipService.ToolTip="Selected historical range energy" />
                     </StackPanel>
                 </Border>
             </Grid>
 
-            <Grid ColumnSpacing="16">
+            <Grid x:Name="HistoryAndSourcesGrid"
+                  ColumnSpacing="16"
+                  RowSpacing="16">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="360" />
+                    <ColumnDefinition x:Name="SourcesColumn" Width="360" />
                 </Grid.ColumnDefinitions>
 
-                <Border Style="{StaticResource DashboardCardStyle}">
+                <Border x:Name="HistoryCard"
+                        Style="{StaticResource DashboardCardStyle}">
                     <Grid RowSpacing="8">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
@@ -206,14 +313,20 @@
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" />
                                 <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
                             <TextBlock Text="Battery history"
                                        Style="{StaticResource SectionTitleTextBlockStyle}" />
-                            <TextBlock Grid.Column="1"
+                            <Button Grid.Column="1"
+                                    Content="Reset zoom"
+                                    Click="HistoryChart_ResetZoom_Click"
+                                    Padding="10,4"
+                                    MinHeight="28" />
+                            <TextBlock Grid.Column="2"
                                        Text="{x:Bind ViewModel.HistoryStatusText, Mode=OneWay}"
                                        Style="{StaticResource CaptionTextBlockStyle}"
                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                       MaxWidth="360"
+                                       MaxWidth="280"
                                        TextTrimming="CharacterEllipsis"
                                        VerticalAlignment="Top" />
                         </Grid>
@@ -233,7 +346,9 @@
                     </Grid>
                 </Border>
 
-                <StackPanel Grid.Column="1" Spacing="16">
+                <StackPanel x:Name="SourcesPanel"
+                            Grid.Column="1"
+                            Spacing="16">
                     <Border Style="{StaticResource DashboardCardStyle}">
                         <StackPanel Spacing="10">
                             <TextBlock Text="Cycle"
@@ -374,10 +489,10 @@
                         </Grid>
                     </Border>
 
-                    <ListView Grid.Row="2"
-                              ItemsSource="{x:Bind ViewModel.ProcessRows, Mode=OneWay}"
-                              SelectionMode="None"
-                              ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                    <Grid Grid.Row="2">
+                        <ListView ItemsSource="{x:Bind ViewModel.ProcessRows, Mode=OneWay}"
+                                  SelectionMode="None"
+                                  ScrollViewer.HorizontalScrollBarVisibility="Auto">
                         <ListView.ItemContainerStyle>
                             <Style TargetType="ListViewItem">
                                 <Setter Property="Padding" Value="0" />
@@ -426,7 +541,111 @@
                                 </Border>
                             </DataTemplate>
                         </ListView.ItemTemplate>
-                    </ListView>
+                        </ListView>
+                        <TextBlock Text="No process attribution in the selected range."
+                                   HorizontalAlignment="Center"
+                                   VerticalAlignment="Center"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   Visibility="{x:Bind ViewModel.HasProcessRows, Mode=OneWay, Converter={StaticResource BoolToVisibilityConverter}, ConverterParameter=Invert}" />
+                    </Grid>
+                </Grid>
+            </Border>
+
+            <Border Style="{StaticResource DashboardCardStyle}">
+                <Grid RowSpacing="8">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="260" />
+                    </Grid.RowDefinitions>
+
+                    <TextBlock Text="Launch attribution"
+                               Style="{StaticResource SectionTitleTextBlockStyle}" />
+                    <TextBlock Grid.Row="1"
+                               Text="Observed ETW parent-child launches. Power delta compares conservative windows before and after each launch; it is evidence, not direct per-process watts."
+                               TextWrapping="Wrap"
+                               Style="{StaticResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+
+                    <Border Grid.Row="2"
+                            Style="{StaticResource TableHeaderBorderStyle}">
+                        <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="150" />
+                                <ColumnDefinition Width="150" />
+                                <ColumnDefinition Width="60" />
+                                <ColumnDefinition Width="60" />
+                                <ColumnDefinition Width="60" />
+                                <ColumnDefinition Width="86" />
+                                <ColumnDefinition Width="76" />
+                                <ColumnDefinition Width="82" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Launcher" Style="{StaticResource TableHeaderTextBlockStyle}" />
+                            <TextBlock Grid.Column="1" Text="Started" Style="{StaticResource TableHeaderTextBlockStyle}" />
+                            <TextBlock Grid.Column="2" Text="Starts" HorizontalAlignment="Right" Style="{StaticResource TableHeaderTextBlockStyle}" />
+                            <TextBlock Grid.Column="3" Text="Short" HorizontalAlignment="Right" Style="{StaticResource TableHeaderTextBlockStyle}" />
+                            <TextBlock Grid.Column="4" Text="Desc." HorizontalAlignment="Right" Style="{StaticResource TableHeaderTextBlockStyle}" />
+                            <TextBlock Grid.Column="5" Text="Median life" HorizontalAlignment="Right" Style="{StaticResource TableHeaderTextBlockStyle}" />
+                            <TextBlock Grid.Column="6" Text="Power delta" HorizontalAlignment="Right" Style="{StaticResource TableHeaderTextBlockStyle}" />
+                            <TextBlock Grid.Column="7" Text="Confidence" Style="{StaticResource TableHeaderTextBlockStyle}" />
+                            <TextBlock Grid.Column="8" Text="Evidence" Style="{StaticResource TableHeaderTextBlockStyle}" />
+                        </Grid>
+                    </Border>
+
+                    <Grid Grid.Row="3">
+                        <ListView ItemsSource="{x:Bind ViewModel.LaunchInsightRows, Mode=OneWay}"
+                                  SelectionMode="None"
+                                  ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                            <ListView.ItemContainerStyle>
+                                <Style TargetType="ListViewItem">
+                                    <Setter Property="Padding" Value="0" />
+                                    <Setter Property="Margin" Value="0" />
+                                    <Setter Property="MinHeight" Value="0" />
+                                    <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                    <Setter Property="Height" Value="40" />
+                                </Style>
+                            </ListView.ItemContainerStyle>
+                            <ListView.ItemTemplate>
+                                <DataTemplate>
+                                    <Border BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                            BorderThickness="0,0,0,1">
+                                        <Grid ColumnSpacing="8" Padding="{StaticResource TableCellPadding}">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="150" />
+                                                <ColumnDefinition Width="150" />
+                                                <ColumnDefinition Width="60" />
+                                                <ColumnDefinition Width="60" />
+                                                <ColumnDefinition Width="60" />
+                                                <ColumnDefinition Width="86" />
+                                                <ColumnDefinition Width="76" />
+                                                <ColumnDefinition Width="82" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Text="{Binding LauncherProcessName}" Style="{StaticResource TableCellTextBlockStyle}" ToolTipService.ToolTip="{Binding LauncherProcessName}" />
+                                            <TextBlock Grid.Column="1" Text="{Binding LaunchedProcessName}" Style="{StaticResource TableCellTextBlockStyle}" ToolTipService.ToolTip="{Binding LaunchedProcessName}" />
+                                            <TextBlock Grid.Column="2" Text="{Binding LaunchCountText}" HorizontalAlignment="Right" Style="{StaticResource TableCellTextBlockStyle}" />
+                                            <TextBlock Grid.Column="3" Text="{Binding ShortLivedCountText}" HorizontalAlignment="Right" Style="{StaticResource TableCellTextBlockStyle}" />
+                                            <TextBlock Grid.Column="4" Text="{Binding DescendantCountText}" HorizontalAlignment="Right" Style="{StaticResource TableCellTextBlockStyle}" />
+                                            <TextBlock Grid.Column="5" Text="{Binding MedianLifetimeText}" HorizontalAlignment="Right" Style="{StaticResource TableCellTextBlockStyle}" />
+                                            <TextBlock Grid.Column="6" Text="{Binding PowerDeltaText}" HorizontalAlignment="Right" Style="{StaticResource TableCellTextBlockStyle}" />
+                                            <TextBlock Grid.Column="7" Text="{Binding ConfidenceText}" Style="{StaticResource TableCellTextBlockStyle}" />
+                                            <TextBlock Grid.Column="8" Text="{Binding EvidenceText}" Style="{StaticResource TableCellTextBlockStyle}" ToolTipService.ToolTip="{Binding EvidenceText}" />
+                                        </Grid>
+                                    </Border>
+                                </DataTemplate>
+                            </ListView.ItemTemplate>
+                        </ListView>
+                        <TextBlock Text="No process launch evidence in this range. Lifecycle history is available only after this version starts monitoring."
+                                   HorizontalAlignment="Center"
+                                   VerticalAlignment="Center"
+                                   TextWrapping="Wrap"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   Visibility="{x:Bind ViewModel.HasLaunchInsightRows, Mode=OneWay, Converter={StaticResource BoolToVisibilityConverter}, ConverterParameter=Invert}" />
+                    </Grid>
                 </Grid>
             </Border>
 

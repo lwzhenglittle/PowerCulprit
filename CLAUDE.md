@@ -51,7 +51,7 @@ The whole product hinges on degrading gracefully:
 
 - Missing values are `null`, never fabricated. UI renders them as `--`.
 - Each collector exposes `GetStatus()` returning `SourceStatus { IsAvailable, Status, RequiresAdmin, Details }`. `--diagnose` and the status panel read these.
-- `IntelCpuPowerCollector` / `IntelGpuPowerCollector` take the already-collected `HardwareSensorSample` list and *filter* it — they are derivations, not independent data sources. When LHM has no GPU power sensor, `IntelGpuPowerCollector` falls back to GPU Engine utilization and `MonitoringService` records that with `IgpuFromHardwareSensor = false` so the UI/Reason text can say "estimated from utilization, not measured."
+- `IntelCpuPowerCollector` / `IntelGpuPowerCollector` take the already-collected `HardwareSensorSample` list and *filter* it — they are derivations, not independent data sources. Direct hardware power (W) and GPU Engine utilization (%) must remain separate; utilization is never returned or displayed as watts. RAPL package/platform/core/memory domains overlap and must not be summed.
 - `PowerCulpritAnalyzer.Reason` strings must explain *why* a process ranked where it did and call out missing inputs (e.g. "no battery discharge correlation available").
 
 ### Time

@@ -605,6 +605,11 @@ public class PowerCulpritAnalyzer
 
         foreach (var sample in powerSamples)
         {
+            // Attribution is against battery discharge. AC samples are not
+            // zero-watt system samples and must not enter the correlation.
+            if (sample.IsAcOnline == true)
+                continue;
+
             double? dischargeW = null;
 
             if (sample.ChargeRateMilliwatts.HasValue)

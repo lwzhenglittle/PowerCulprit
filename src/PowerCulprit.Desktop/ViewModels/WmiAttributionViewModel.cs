@@ -14,16 +14,20 @@ public partial class WmiAttributionViewModel : ObservableObject
 
     private readonly DatabaseManager _database;
     private readonly ILogger<WmiAttributionViewModel> _logger;
+    private readonly HistorySelectionState _historySelection;
     private CancellationTokenSource? _loadCts;
+    private bool _hasLoadedRange;
     private DateTime _selectedFromUtc = DateTime.MinValue;
     private DateTime _selectedToUtc = DateTime.MinValue;
 
     public WmiAttributionViewModel(
         DatabaseManager database,
-        ILogger<WmiAttributionViewModel> logger)
+        ILogger<WmiAttributionViewModel> logger,
+        HistorySelectionState historySelection)
     {
         _database = database;
         _logger = logger;
+        _historySelection = historySelection;
     }
 
     [ObservableProperty]
@@ -45,13 +49,19 @@ public partial class WmiAttributionViewModel : ObservableObject
     public partial string StatusText { get; set; } = "No WMI activity loaded";
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasError))]
     public partial string ErrorText { get; set; } = "";
+
+    public bool HasError => !string.IsNullOrWhiteSpace(ErrorText);
 
     [ObservableProperty]
     public partial bool IsLoading { get; set; }
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasCallerRows))]
     public partial ObservableCollection<WmiCallerRow> CallerRows { get; set; } = new();
+
+    public bool HasCallerRows => CallerRows.Count > 0;
 
     [RelayCommand]
     private Task Refresh()
@@ -69,14 +79,25 @@ public partial class WmiAttributionViewModel : ObservableObject
     }
 
     public Task InitializeAsync()
-        => LoadLatestCycleAsync();
+    {
+        if (_hasLoadedRange && _historySelection.HasRange &&
+            _selectedFromUtc == _historySelection.FromUtc &&
+            _selectedToUtc == _historySelection.ToUtc)
+        {
+            return Task.CompletedTask;
+        }
+
+        return _historySelection.HasRange
+            ? LoadRangeAsync(_historySelection.FromUtc, _historySelection.ToUtc)
+            : LoadLatestCycleAsync();
+    }
 
     private async Task LoadLatestCycleAsync()
     {
         try
         {
-            await Task.Run(() => _database.RebuildBatteryCyclesAsync());
-            var cycle = (await Task.Run(() => _database.GetLatestBatteryDisplayCyclesAsync(1))).FirstOrDefault();
+            await _database.RebuildBatteryCyclesAsync();
+            var cycle = (await _database.GetLatestBatteryDisplayCyclesAsync(1)).FirstOrDefault();
             if (cycle is null)
             {
                 var toUtc = DateTime.UtcNow;
@@ -110,7 +131,7 @@ public partial class WmiAttributionViewModel : ObservableObject
             ErrorText = "";
             StatusText = "Loading WMI activity...";
 
-            var aggregates = await Task.Run(() => _database.GetWmiCallerAggregatesAsync(fromUtc, toUtc, DisplayLimit));
+            var aggregates = await _database.GetWmiCallerAggregatesAsync(fromUtc, toUtc, DisplayLimit, token);
             token.ThrowIfCancellationRequested();
 
             ApplyLoadedRange(fromUtc, toUtc, aggregates);
@@ -139,6 +160,8 @@ public partial class WmiAttributionViewModel : ObservableObject
     {
         _selectedFromUtc = fromUtc;
         _selectedToUtc = toUtc;
+        _hasLoadedRange = true;
+        _historySelection.SetRange(fromUtc, toUtc);
         SelectedRangeText = FormatRangeWithDuration(fromUtc, toUtc);
 
         var ordered = aggregates

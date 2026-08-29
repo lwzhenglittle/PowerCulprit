@@ -1,11 +1,15 @@
+using System.Diagnostics;
 using System.Numerics;
 using Microsoft.Graphics.Canvas;
+using Microsoft.Graphics.Canvas.Geometry;
 using Microsoft.Graphics.Canvas.Text;
+using Microsoft.Graphics.Canvas.UI;
 using Microsoft.Graphics.Canvas.UI.Xaml;
 using Microsoft.UI;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
+using PowerCulprit.Core.Analysis;
 using PowerCulprit.Core.Models;
 using Windows.Foundation;
 using Windows.UI;
@@ -20,6 +24,11 @@ public sealed partial class CpuAttributionChart : UserControl
     private const float PlotBottom = 34;
     private const float BandGap = 12;
     private const double MinVisibleSeconds = 60;
+    private const int MinimumPointBudget = 128;
+    private const int MaximumPointBudget = 2048;
+    private const double PointsPerDip = 1.25;
+    private const int SmoothingPointThreshold = 32;
+    private static readonly long PanFrameTicks = Math.Max(1, Stopwatch.Frequency / 30);
 
     private static readonly CanvasTextFormat AxisTextFormat = new() { FontSize = 11 };
     private static readonly CanvasTextFormat TooltipTextFormat = new() { FontSize = 12 };
@@ -33,6 +42,23 @@ public sealed partial class CpuAttributionChart : UserControl
     private DateTime? _previewFromUtc;
     private DateTime? _previewToUtc;
     private Point? _hoverPosition;
+    private int _lastHoverPixel = -1;
+    private long _lastPanInvalidateTimestamp;
+    private IReadOnlyList<CpuTimelineSample>? _cachedSamples;
+    private CanvasCachedGeometry? _cachedBatteryGeometry;
+    private CanvasCachedGeometry? _cachedEnergyGeometry;
+    private CanvasCachedGeometry? _cachedPowerGeometry;
+    private CanvasCachedGeometry? _cachedLoadGeometry;
+    private CanvasCachedGeometry? _cachedClockGeometry;
+    private DateTime _cachedFromUtc;
+    private DateTime _cachedToUtc;
+    private float _cachedWidth;
+    private float _cachedHeight;
+    private double _cachedCpuPowerAxisMax;
+    private double _cachedCpuClockAxisMax;
+    private double _cachedEnergyAxisMax;
+    private ElementTheme _cachedTheme;
+    private bool _geometryCacheValid;
 
     public CpuAttributionChart()
     {
@@ -40,6 +66,9 @@ public sealed partial class CpuAttributionChart : UserControl
     }
 
     public event EventHandler<VisibleRangeChangedEventArgs>? VisibleRangeChanged;
+
+    public void ResetZoom()
+        => SetVisibleRangeFromInteraction(HistoryFromUtc, HistoryToUtc);
 
     public static readonly DependencyProperty SamplesProperty =
         DependencyProperty.Register(
@@ -127,6 +156,8 @@ public sealed partial class CpuAttributionChart : UserControl
                 chart.ClearPreviewRange();
             }
 
+            chart.InvalidateGeometryCache();
+
             chart.QueueInvalidate();
         }
     }
@@ -160,7 +191,8 @@ public sealed partial class CpuAttributionChart : UserControl
         var ds = args.DrawingSession;
         var width = (float)sender.ActualWidth;
         var height = (float)sender.ActualHeight;
-        if (width <= PlotLeft + PlotRight || height <= PlotTop + PlotBottom + BandGap * 3)
+        if (!float.IsFinite(width) || !float.IsFinite(height) ||
+            width <= PlotLeft + PlotRight || height <= PlotTop + PlotBottom + BandGap * 3)
             return;
 
         var colors = GetPalette();
@@ -183,14 +215,79 @@ public sealed partial class CpuAttributionChart : UserControl
         DrawAxes(ds, bands, fromUtc, toUtc, colors);
         DrawLegends(ds, bands, colors);
 
-        DrawPolyline(ds, BuildDisplayPoints(samples, fromUtc, toUtc, bands[0], s => s.BatteryPercent, v => MapRangeY(v, 0, 100, bands[0])), colors.BatteryLine, 2);
-        DrawPolyline(ds, BuildDisplayPoints(samples, fromUtc, toUtc, bands[0], s => s.CumulativeEnergyWh, v => MapRangeY(v, 0, Math.Max(1, EnergyAxisMax), bands[0])), colors.EnergyLine, 2);
-        DrawPolyline(ds, BuildDisplayPoints(samples, fromUtc, toUtc, bands[1], s => s.CpuPackagePowerWatts, v => MapRangeY(v, 0, Math.Max(1, CpuPowerAxisMax), bands[1])), colors.PowerLine, 2);
-        DrawPolyline(ds, BuildDisplayPoints(samples, fromUtc, toUtc, bands[2], s => s.CpuLoadPercent, v => MapRangeY(v, 0, 100, bands[2])), colors.LoadLine, 2);
-        DrawPolyline(ds, BuildDisplayPoints(samples, fromUtc, toUtc, bands[3], s => s.CpuAverageClockMhz, v => MapRangeY(v, 0, Math.Max(1000, CpuClockAxisMax), bands[3])), colors.ClockLine, 2);
+        EnsureGeometryCache(sender, samples, fromUtc, toUtc, plot, bands);
+        if (_cachedBatteryGeometry is not null)
+            ds.DrawCachedGeometry(_cachedBatteryGeometry, colors.BatteryLine);
+        if (_cachedEnergyGeometry is not null)
+            ds.DrawCachedGeometry(_cachedEnergyGeometry, colors.EnergyLine);
+        if (_cachedPowerGeometry is not null)
+            ds.DrawCachedGeometry(_cachedPowerGeometry, colors.PowerLine);
+        if (_cachedLoadGeometry is not null)
+            ds.DrawCachedGeometry(_cachedLoadGeometry, colors.LoadLine);
+        if (_cachedClockGeometry is not null)
+            ds.DrawCachedGeometry(_cachedClockGeometry, colors.ClockLine);
 
         if (_isPointerOver && _hoverPosition.HasValue)
             DrawTooltip(ds, plot, bands, fromUtc, toUtc, samples, _hoverPosition.Value, colors);
+    }
+
+    private void EnsureGeometryCache(
+        CanvasControl resourceCreator,
+        IReadOnlyList<CpuTimelineSample> samples,
+        DateTime fromUtc,
+        DateTime toUtc,
+        Rect plot,
+        Rect[] bands)
+    {
+        var width = (float)plot.Width;
+        var height = (float)plot.Height;
+        var theme = ActualTheme;
+        if (_geometryCacheValid && ReferenceEquals(_cachedSamples, samples) &&
+            _cachedFromUtc == fromUtc && _cachedToUtc == toUtc &&
+            Math.Abs(_cachedWidth - width) < 0.5f && Math.Abs(_cachedHeight - height) < 0.5f &&
+            Math.Abs(_cachedCpuPowerAxisMax - CpuPowerAxisMax) < 0.0001 &&
+            Math.Abs(_cachedCpuClockAxisMax - CpuClockAxisMax) < 0.0001 &&
+            Math.Abs(_cachedEnergyAxisMax - EnergyAxisMax) < 0.0001 && _cachedTheme == theme)
+        {
+            return;
+        }
+
+        InvalidateGeometryCache();
+        _cachedSamples = samples;
+        _cachedFromUtc = fromUtc;
+        _cachedToUtc = toUtc;
+        _cachedWidth = width;
+        _cachedHeight = height;
+        _cachedCpuPowerAxisMax = CpuPowerAxisMax;
+        _cachedCpuClockAxisMax = CpuClockAxisMax;
+        _cachedEnergyAxisMax = EnergyAxisMax;
+        _cachedTheme = theme;
+        var batterySeries = BuildDisplaySeries(samples, fromUtc, toUtc, bands[0], s => s.BatteryPercent, v => MapRangeY(v, 0, 100, bands[0]), TimeSeriesReductionMode.LargestTriangleThreeBuckets);
+        var energySeries = BuildDisplaySeries(samples, fromUtc, toUtc, bands[0], s => s.CumulativeEnergyWh, v => MapRangeY(v, 0, Math.Max(1, EnergyAxisMax), bands[0]), TimeSeriesReductionMode.LargestTriangleThreeBuckets);
+        var powerSeries = BuildDisplaySeries(samples, fromUtc, toUtc, bands[1], s => s.CpuPackagePowerWatts, v => MapRangeY(v, 0, Math.Max(1, CpuPowerAxisMax), bands[1]), TimeSeriesReductionMode.MinMax);
+        var loadSeries = BuildDisplaySeries(samples, fromUtc, toUtc, bands[2], s => s.CpuLoadPercent, v => MapRangeY(v, 0, 100, bands[2]), TimeSeriesReductionMode.MinMax);
+        var clockSeries = BuildDisplaySeries(samples, fromUtc, toUtc, bands[3], s => s.CpuAverageClockMhz, v => MapRangeY(v, 0, Math.Max(1000, CpuClockAxisMax), bands[3]), TimeSeriesReductionMode.MinMax);
+        _cachedBatteryGeometry = BuildCachedGeometry(resourceCreator, batterySeries.Points, batterySeries.Smooth);
+        _cachedEnergyGeometry = BuildCachedGeometry(resourceCreator, energySeries.Points, energySeries.Smooth);
+        _cachedPowerGeometry = BuildCachedGeometry(resourceCreator, powerSeries.Points, powerSeries.Smooth);
+        _cachedLoadGeometry = BuildCachedGeometry(resourceCreator, loadSeries.Points, loadSeries.Smooth);
+        _cachedClockGeometry = BuildCachedGeometry(resourceCreator, clockSeries.Points, clockSeries.Smooth);
+        _geometryCacheValid = true;
+    }
+
+    private void InvalidateGeometryCache()
+    {
+        _geometryCacheValid = false;
+        _cachedBatteryGeometry?.Dispose();
+        _cachedEnergyGeometry?.Dispose();
+        _cachedPowerGeometry?.Dispose();
+        _cachedLoadGeometry?.Dispose();
+        _cachedClockGeometry?.Dispose();
+        _cachedBatteryGeometry = null;
+        _cachedEnergyGeometry = null;
+        _cachedPowerGeometry = null;
+        _cachedLoadGeometry = null;
+        _cachedClockGeometry = null;
     }
 
     private static Rect[] GetBands(Rect plot)
@@ -215,12 +312,32 @@ public sealed partial class CpuAttributionChart : UserControl
 
     private void DrawAxes(CanvasDrawingSession ds, Rect[] bands, DateTime fromUtc, DateTime toUtc, ChartPalette colors)
     {
-        foreach (var band in bands)
+        for (var bandIndex = 0; bandIndex < bands.Length; bandIndex++)
         {
+            var band = bands[bandIndex];
             for (var i = 0; i <= 2; i++)
             {
                 var y = (float)(band.Bottom - band.Height * i / 2.0);
                 ds.DrawLine((float)band.Left, y, (float)band.Right, y, colors.Grid, 1);
+
+                var leftLabel = bandIndex switch
+                {
+                    0 => $"{i * 50}%",
+                    2 => $"{i * 50}%",
+                    _ => null
+                };
+                var rightLabel = bandIndex switch
+                {
+                    0 => $"{EnergyAxisMax * i / 2.0:F1} Wh",
+                    1 => $"{CpuPowerAxisMax * i / 2.0:F0} W",
+                    3 => $"{CpuClockAxisMax * i / 2.0:F0} MHz",
+                    _ => null
+                };
+
+                if (leftLabel is not null)
+                    ds.DrawText(leftLabel, 6, y - 8, colors.SecondaryText, AxisTextFormat);
+                if (rightLabel is not null)
+                    ds.DrawText(rightLabel, (float)band.Right + 6, y - 8, colors.SecondaryText, AxisTextFormat);
             }
         }
 
@@ -238,7 +355,7 @@ public sealed partial class CpuAttributionChart : UserControl
 
     private void DrawLegends(CanvasDrawingSession ds, Rect[] bands, ChartPalette colors)
     {
-        DrawLegend(ds, bands[0], "Battery % / Energy Wh", colors.BatteryLine, colors);
+        DrawLegend(ds, bands[0], "Battery % (left) / Energy Wh (right)", colors.BatteryLine, colors);
         DrawLegend(ds, bands[1], $"CPU Package W (0-{CpuPowerAxisMax:F0})", colors.PowerLine, colors);
         DrawLegend(ds, bands[2], "CPU Load %", colors.LoadLine, colors);
         DrawLegend(ds, bands[3], $"CPU Clock MHz (0-{CpuClockAxisMax:F0})", colors.ClockLine, colors);
@@ -251,87 +368,82 @@ public sealed partial class CpuAttributionChart : UserControl
         ds.DrawText(text, (float)band.Left + 22, y, color, AxisTextFormat);
     }
 
-    private IReadOnlyList<Vector2> BuildDisplayPoints(
+    private DisplaySeries BuildDisplaySeries(
         IReadOnlyList<CpuTimelineSample> samples,
         DateTime fromUtc,
         DateTime toUtc,
         Rect plot,
         Func<CpuTimelineSample, double?> getValue,
-        Func<double, float> mapY)
+        Func<double, float> mapY,
+        TimeSeriesReductionMode reductionMode)
     {
-        var targetBuckets = Math.Max(1, (int)plot.Width);
-        var bucketTicks = Math.Max(1, (toUtc - fromUtc).Ticks / targetBuckets);
-        var reduced = new List<(DateTime TimestampUtc, double Value)>(Math.Min(samples.Count, targetBuckets * 4));
-
-        var index = 0;
-        while (index < samples.Count && samples[index].TimestampUtc < fromUtc)
-            index++;
-
-        while (index < samples.Count && samples[index].TimestampUtc <= toUtc)
+        var start = LowerBound(samples, fromUtc);
+        var end = UpperBound(samples, toUtc);
+        var visible = new List<TimeSeriesPoint>(Math.Max(0, end - start));
+        for (var index = start; index < end; index++)
         {
             var sample = samples[index];
             var value = getValue(sample);
-            if (!value.HasValue)
-            {
-                index++;
-                continue;
-            }
-
-            var bucketStartTicks = ((sample.TimestampUtc - fromUtc).Ticks / bucketTicks) * bucketTicks;
-            var bucketEnd = fromUtc.AddTicks(bucketStartTicks + bucketTicks);
-            var first = (sample.TimestampUtc, value.Value);
-            var last = first;
-            var min = first;
-            var max = first;
-            index++;
-
-            while (index < samples.Count && samples[index].TimestampUtc <= toUtc && samples[index].TimestampUtc < bucketEnd)
-            {
-                sample = samples[index];
-                value = getValue(sample);
-                index++;
-                if (!value.HasValue)
-                    continue;
-
-                var point = (sample.TimestampUtc, value.Value);
-                last = point;
-                if (point.Value < min.Value) min = point;
-                if (point.Value > max.Value) max = point;
-            }
-
-            AddDistinct(reduced, first);
-            AddDistinct(reduced, min);
-            AddDistinct(reduced, max);
-            AddDistinct(reduced, last);
+            if (value.HasValue && double.IsFinite(value.Value))
+                visible.Add(new TimeSeriesPoint(sample.TimestampUtc, value.Value));
         }
 
-        if (reduced.Count == 0)
-            return Array.Empty<Vector2>();
+        if (visible.Count == 0)
+            return new DisplaySeries(Array.Empty<Vector2>(), false);
 
+        var budget = CalculatePointBudget(plot.Width);
+        var reduced = TimeSeriesReducer.Reduce(visible, budget, reductionMode);
         var points = new List<Vector2>(reduced.Count);
         foreach (var point in reduced)
             points.Add(new Vector2(MapX(point.TimestampUtc, fromUtc, toUtc, plot), mapY(point.Value)));
 
-        return points;
+        return new DisplaySeries(points, visible.Count >= SmoothingPointThreshold && points.Count >= 4);
     }
 
-    private static void AddDistinct(List<(DateTime TimestampUtc, double Value)> points, (DateTime TimestampUtc, double Value) point)
+    private static int CalculatePointBudget(double plotWidth)
     {
-        if (points.Count == 0)
+        var width = double.IsFinite(plotWidth) ? Math.Max(1, plotWidth) : 1;
+        return (int)Math.Clamp(Math.Ceiling(width * PointsPerDip), MinimumPointBudget, MaximumPointBudget);
+    }
+
+    private static CanvasCachedGeometry? BuildCachedGeometry(
+        ICanvasResourceCreator resourceCreator,
+        IReadOnlyList<Vector2> points,
+        bool smooth)
+    {
+        if (points.Count < 2)
+            return null;
+
+        using var builder = new CanvasPathBuilder(resourceCreator);
+        builder.BeginFigure(points[0], CanvasFigureFill.Default);
+        for (var index = 1; index < points.Count; index++)
         {
-            points.Add(point);
-            return;
+            if (!smooth)
+            {
+                builder.AddLine(points[index].X, points[index].Y);
+                continue;
+            }
+
+            var p0 = index > 1 ? points[index - 2] : points[index - 1];
+            var p1 = points[index - 1];
+            var p2 = points[index];
+            var p3 = index + 1 < points.Count ? points[index + 1] : p2;
+            var control1 = p1 + (p2 - p0) / 8f;
+            var control2 = p2 - (p3 - p1) / 8f;
+            ClampControlPoint(ref control1, p1, p2);
+            ClampControlPoint(ref control2, p1, p2);
+            builder.AddCubicBezier(control1, control2, p2);
         }
 
-        var previous = points[^1];
-        if (previous.TimestampUtc != point.TimestampUtc || Math.Abs(previous.Value - point.Value) >= 0.0001)
-            points.Add(point);
+        builder.EndFigure(CanvasFigureLoop.Open);
+        using var geometry = CanvasGeometry.CreatePath(builder);
+        return CanvasCachedGeometry.CreateStroke(geometry, 2);
     }
 
-    private static void DrawPolyline(CanvasDrawingSession ds, IReadOnlyList<Vector2> points, Color color, float thickness)
+    private static void ClampControlPoint(ref Vector2 control, Vector2 start, Vector2 end)
     {
-        for (var i = 1; i < points.Count; i++)
-            ds.DrawLine(points[i - 1], points[i], color, thickness);
+        control.X = Math.Clamp(control.X, Math.Min(start.X, end.X), Math.Max(start.X, end.X));
+        control.Y = Math.Clamp(control.Y, Math.Min(start.Y, end.Y), Math.Max(start.Y, end.Y));
     }
 
     private void DrawTooltip(CanvasDrawingSession ds, Rect plot, Rect[] bands, DateTime fromUtc, DateTime toUtc, IReadOnlyList<CpuTimelineSample> samples, Point pointer, ChartPalette colors)
@@ -349,7 +461,7 @@ public sealed partial class CpuAttributionChart : UserControl
         foreach (var band in bands)
             ds.DrawLine(x, (float)band.Top, x, (float)band.Bottom, colors.HoverLine, 1);
 
-        var text = $"{nearest.TimestampUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}\nBattery: {FormatOptional(nearest.BatteryPercent, "%")}\nEnergy: {FormatOptional(nearest.CumulativeEnergyWh, " Wh")}\nCPU W: {FormatOptional(nearest.CpuPackagePowerWatts, " W")}\nCPU load: {FormatOptional(nearest.CpuLoadPercent, "%")}\nClock: {FormatOptional(nearest.CpuAverageClockMhz, " MHz")}";
+        var text = $"{nearest.TimestampUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}\nBattery: {FormatOptional(nearest.BatteryPercent, "%")}\nBattery energy: {FormatOptional(nearest.CumulativeEnergyWh, " Wh")}\nCPU package: {FormatOptional(nearest.CpuPackagePowerWatts, " W")}\nCPU load: {FormatOptional(nearest.CpuLoadPercent, "%")}\nClock: {FormatOptional(nearest.CpuAverageClockMhz, " MHz")}";
         var boxX = Math.Min((float)plot.Right - 220, Math.Max((float)plot.Left + 8, x + 10));
         var boxY = (float)plot.Top + 10;
         ds.FillRoundedRectangle(boxX, boxY, 210, 112, 6, 6, colors.TooltipBackground);
@@ -531,6 +643,7 @@ public sealed partial class CpuAttributionChart : UserControl
         _dragStartToUtc = toUtc;
         _previewFromUtc = fromUtc;
         _previewToUtc = toUtc;
+        _lastPanInvalidateTimestamp = 0;
         ChartCanvas.CapturePointer(e.Pointer);
         e.Handled = true;
     }
@@ -538,6 +651,11 @@ public sealed partial class CpuAttributionChart : UserControl
     private void ChartCanvas_PointerMoved(object sender, PointerRoutedEventArgs e)
     {
         var point = e.GetCurrentPoint(ChartCanvas);
+        var hoverPixel = (int)Math.Round(point.Position.X);
+        if (!_isDragging && hoverPixel == _lastHoverPixel)
+            return;
+
+        _lastHoverPixel = hoverPixel;
         _hoverPosition = point.Position;
 
         if (_isDragging)
@@ -578,6 +696,7 @@ public sealed partial class CpuAttributionChart : UserControl
     {
         _isPointerOver = false;
         _hoverPosition = null;
+        _lastHoverPixel = -1;
         if (!_isDragging)
             QueueInvalidate();
     }
@@ -617,6 +736,11 @@ public sealed partial class CpuAttributionChart : UserControl
         var clamped = ClampRange(_dragStartFromUtc + shift, _dragStartToUtc + shift, HistoryFromUtc, HistoryToUtc);
         _previewFromUtc = clamped.FromUtc;
         _previewToUtc = clamped.ToUtc;
+        var timestamp = Stopwatch.GetTimestamp();
+        if (timestamp - _lastPanInvalidateTimestamp < PanFrameTicks)
+            return;
+
+        _lastPanInvalidateTimestamp = timestamp;
         QueueInvalidate();
     }
 
@@ -648,15 +772,31 @@ public sealed partial class CpuAttributionChart : UserControl
 
     private Rect GetPlotRect()
     {
-        var width = Math.Max(PlotLeft + PlotRight + 1, ChartCanvas.ActualWidth);
-        var height = Math.Max(PlotTop + PlotBottom + 1, ChartCanvas.ActualHeight);
+        var width = double.IsFinite(ChartCanvas.ActualWidth)
+            ? Math.Max(PlotLeft + PlotRight + 1, ChartCanvas.ActualWidth)
+            : PlotLeft + PlotRight + 1;
+        var height = double.IsFinite(ChartCanvas.ActualHeight)
+            ? Math.Max(PlotTop + PlotBottom + 1, ChartCanvas.ActualHeight)
+            : PlotTop + PlotBottom + 1;
         return new Rect(PlotLeft, PlotTop, width - PlotLeft - PlotRight, height - PlotTop - PlotBottom);
     }
 
     private void ChartCanvas_Unloaded(object sender, RoutedEventArgs e)
     {
+        InvalidateGeometryCache();
         ChartCanvas.RemoveFromVisualTree();
     }
+
+    private void ChartCanvas_CreateResources(CanvasControl sender, CanvasCreateResourcesEventArgs args)
+        => InvalidateGeometryCache();
+
+    private void ChartCanvas_SizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        InvalidateGeometryCache();
+        QueueInvalidate();
+    }
+
+    private sealed record DisplaySeries(IReadOnlyList<Vector2> Points, bool Smooth);
 
     private ChartPalette GetPalette()
     {

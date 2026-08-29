@@ -42,7 +42,7 @@ public class DatabaseManager : IDisposable
     private readonly string _connectionString;
     private bool _initialized;
     private const int BusyTimeoutMilliseconds = 5000;
-    private const int CurrentSchemaVersion = 7;
+    private const int CurrentSchemaVersion = 9;
     private const string WmiActivityLastRecordIdMetadataKey = "wmi_activity_last_event_record_id";
     public static readonly TimeSpan DefaultRawRetention = TimeSpan.FromHours(24);
     public static readonly TimeSpan DefaultAggregationWindow = TimeSpan.FromMinutes(5);
@@ -143,7 +143,9 @@ public class DatabaseManager : IDisposable
         await CreateBatteryCycleTablesAsync(connection, transaction);
         await CreateMetadataTableAsync(connection, transaction);
         await CreateAggregateTablesAsync(connection, transaction);
+        await MigrateLibreHardwareMonitorEnergyUnitsAsync(connection, transaction);
         await CreatePowerStateEventsTableAsync(connection, transaction);
+        await CreateProcessInstancesTableAsync(connection, transaction);
 
         await transaction.CommitAsync();
         await SetUserVersionAsync(connection, CurrentSchemaVersion);
@@ -201,6 +203,7 @@ public class DatabaseManager : IDisposable
             DROP TABLE IF EXISTS wmi_activity_samples;
             DROP TABLE IF EXISTS session_start_markers;
             DROP TABLE IF EXISTS power_state_events;
+            DROP TABLE IF EXISTS process_instances;
             DROP TABLE IF EXISTS process_analysis_aggregates;
             DROP TABLE IF EXISTS gpu_analysis_aggregates;
             DROP TABLE IF EXISTS hardware_sensor_aggregates;
@@ -363,6 +366,38 @@ public class DatabaseManager : IDisposable
             );
             CREATE INDEX IF NOT EXISTS idx_process_facts_timestamp
                 ON process_sample_facts(timestamp_id);
+            """;
+
+        await using var cmd = new SqliteCommand(sql, connection, transaction);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    private static async Task CreateProcessInstancesTableAsync(
+        SqliteConnection connection, SqliteTransaction transaction)
+    {
+        const string sql = """
+            CREATE TABLE IF NOT EXISTS process_instances (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                pid                 INTEGER NOT NULL,
+                start_utc           TEXT    NOT NULL,
+                stop_utc            TEXT,
+                start_observed      INTEGER NOT NULL,
+                stop_observed       INTEGER NOT NULL,
+                process_name        TEXT    NOT NULL,
+                executable_path     TEXT,
+                command_line        TEXT,
+                parent_pid          INTEGER,
+                parent_start_utc    TEXT,
+                parent_instance_id  INTEGER,
+                capture_reliable    INTEGER NOT NULL,
+                UNIQUE(pid, start_utc)
+            );
+            CREATE INDEX IF NOT EXISTS idx_process_instances_start
+                ON process_instances(start_utc);
+            CREATE INDEX IF NOT EXISTS idx_process_instances_stop
+                ON process_instances(stop_utc);
+            CREATE INDEX IF NOT EXISTS idx_process_instances_parent
+                ON process_instances(parent_instance_id);
             """;
 
         await using var cmd = new SqliteCommand(sql, connection, transaction);
@@ -1052,16 +1087,19 @@ public class DatabaseManager : IDisposable
         IReadOnlyList<GpuProcessSample> gpuSamples,
         IReadOnlyList<HardwareSensorSample> hardwareSamples,
         IReadOnlyList<SourceStatus> sourceStatuses,
-        IReadOnlyList<WmiActivitySample>? wmiActivitySamples = null)
+        IReadOnlyList<WmiActivitySample>? wmiActivitySamples = null,
+        IReadOnlyList<ProcessLifecycleEvent>? processLifecycleEvents = null)
     {
         wmiActivitySamples ??= Array.Empty<WmiActivitySample>();
+        processLifecycleEvents ??= Array.Empty<ProcessLifecycleEvent>();
 
         if (powerSample is null &&
             processSamples.Count == 0 &&
             gpuSamples.Count == 0 &&
             hardwareSamples.Count == 0 &&
             sourceStatuses.Count == 0 &&
-            wmiActivitySamples.Count == 0)
+            wmiActivitySamples.Count == 0 &&
+            processLifecycleEvents.Count == 0)
         {
             return;
         }
@@ -1091,6 +1129,9 @@ public class DatabaseManager : IDisposable
 
             if (wmiActivitySamples.Count > 0)
                 await InsertWmiActivitySamplesInTransactionAsync(connection, transaction, wmiActivitySamples);
+
+            if (processLifecycleEvents.Count > 0)
+                await InsertProcessLifecycleEventsInTransactionAsync(connection, transaction, processLifecycleEvents);
 
             await transaction.CommitAsync();
         }
@@ -1123,6 +1164,187 @@ public class DatabaseManager : IDisposable
         cmd.Parameters.AddWithValue("$fc", (object?)sample.FullChargeCapacityMWh ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$ed", (object?)sample.EstimatedDischargeWatts ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$pm", (object?)sample.PowerMode ?? DBNull.Value);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
+    /// LibreHardwareMonitor defines SensorType.Energy as milliwatt-hours. Older
+    /// PowerCulprit builds mislabeled these unchanged numeric values as joules.
+    /// Correct labels in place; values require no conversion.
+    /// </summary>
+    private static async Task MigrateLibreHardwareMonitorEnergyUnitsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction)
+    {
+        const string sql = """
+            UPDATE hardware_sensor_samples
+            SET unit = 'mWh'
+            WHERE source = 'LibreHardwareMonitor'
+              AND metric_name = 'Energy'
+              AND unit = 'J';
+
+            DELETE FROM hardware_sensor_aggregates AS old
+            WHERE old.source = 'LibreHardwareMonitor'
+              AND old.metric_name = 'Energy'
+              AND old.unit = 'J'
+              AND EXISTS (
+                  SELECT 1 FROM hardware_sensor_aggregates AS corrected
+                  WHERE corrected.window_start_utc = old.window_start_utc
+                    AND corrected.window_end_utc = old.window_end_utc
+                    AND corrected.source = old.source
+                    AND corrected.device_name = old.device_name
+                    AND corrected.sensor_name = old.sensor_name
+                    AND corrected.metric_name = old.metric_name
+                    AND corrected.unit = 'mWh');
+
+            UPDATE hardware_sensor_aggregates
+            SET unit = 'mWh'
+            WHERE source = 'LibreHardwareMonitor'
+              AND metric_name = 'Energy'
+              AND unit = 'J';
+            """;
+        await using var cmd = new SqliteCommand(sql, connection, transaction);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    private static async Task InsertProcessLifecycleEventsInTransactionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        IReadOnlyList<ProcessLifecycleEvent> events)
+    {
+        foreach (var evt in events
+                     .Where(evt => evt.Pid > 0)
+                     .OrderBy(evt => evt.TimestampUtc)
+                     .ThenBy(evt => evt.Kind))
+        {
+            if (evt.Kind == ProcessLifecycleEventKind.Start)
+            {
+                var startUtc = evt.StartTimeUtc ?? evt.TimestampUtc;
+                var parentInstanceId = await ResolveParentInstanceIdAsync(
+                    connection, transaction, evt.ParentPid, evt.ParentStartTimeUtc, startUtc);
+                await using var insert = new SqliteCommand(
+                    """
+                    INSERT INTO process_instances
+                        (pid, start_utc, stop_utc, start_observed, stop_observed,
+                         process_name, executable_path, command_line, parent_pid,
+                         parent_start_utc, parent_instance_id, capture_reliable)
+                    VALUES
+                        ($pid, $start, NULL, 1, 0, $name, $path, $cmd, $parentPid,
+                         $parentStart, $parentId, $reliable)
+                    ON CONFLICT(pid, start_utc) DO UPDATE SET
+                        start_observed = 1,
+                        process_name = CASE WHEN excluded.process_name <> '' THEN excluded.process_name ELSE process_instances.process_name END,
+                        executable_path = COALESCE(excluded.executable_path, process_instances.executable_path),
+                        command_line = COALESCE(excluded.command_line, process_instances.command_line),
+                        parent_pid = COALESCE(excluded.parent_pid, process_instances.parent_pid),
+                        parent_start_utc = COALESCE(excluded.parent_start_utc, process_instances.parent_start_utc),
+                        parent_instance_id = COALESCE(excluded.parent_instance_id, process_instances.parent_instance_id),
+                        capture_reliable = process_instances.capture_reliable AND excluded.capture_reliable;
+                    """, connection, transaction);
+                AddLifecycleParameters(insert, evt, startUtc, parentInstanceId);
+                await insert.ExecuteNonQueryAsync();
+            }
+            else
+            {
+                var updated = await UpdateStoppedProcessInstanceAsync(connection, transaction, evt);
+                if (updated == 0)
+                    await InsertOrphanStopAsync(connection, transaction, evt);
+            }
+        }
+    }
+
+    private static void AddLifecycleParameters(
+        SqliteCommand cmd,
+        ProcessLifecycleEvent evt,
+        DateTime startUtc,
+        long? parentInstanceId)
+    {
+        cmd.Parameters.AddWithValue("$pid", evt.Pid);
+        cmd.Parameters.AddWithValue("$start", SerializeTimestamp(startUtc));
+        cmd.Parameters.AddWithValue("$name", evt.ProcessName?.Trim() ?? string.Empty);
+        cmd.Parameters.AddWithValue("$path", (object?)evt.ImagePath ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$cmd", (object?)evt.CommandLine ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$parentPid", (object?)evt.ParentPid ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$parentStart", evt.ParentStartTimeUtc.HasValue
+            ? SerializeTimestamp(evt.ParentStartTimeUtc.Value)
+            : DBNull.Value);
+        cmd.Parameters.AddWithValue("$parentId", (object?)parentInstanceId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$reliable", evt.CaptureReliable ? 1L : 0L);
+    }
+
+    private static async Task<long?> ResolveParentInstanceIdAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int? parentPid,
+        DateTime? parentStartTimeUtc,
+        DateTime childStartUtc)
+    {
+        if (parentPid is not > 0)
+            return null;
+
+        var sql = parentStartTimeUtc.HasValue
+            ? "SELECT id FROM process_instances WHERE pid = $pid AND start_utc = $parentStart LIMIT 1;"
+            : """
+              SELECT id FROM process_instances
+              WHERE pid = $pid AND start_utc <= $childStart
+                AND (stop_utc IS NULL OR stop_utc >= $childStart)
+              ORDER BY start_utc DESC LIMIT 1;
+              """;
+        await using var cmd = new SqliteCommand(sql, connection, transaction);
+        cmd.Parameters.AddWithValue("$pid", parentPid.Value);
+        if (parentStartTimeUtc.HasValue)
+            cmd.Parameters.AddWithValue("$parentStart", SerializeTimestamp(parentStartTimeUtc.Value));
+        else
+            cmd.Parameters.AddWithValue("$childStart", SerializeTimestamp(childStartUtc));
+        var value = await cmd.ExecuteScalarAsync();
+        return value is null || value is DBNull ? null : Convert.ToInt64(value);
+    }
+
+    private static async Task<int> UpdateStoppedProcessInstanceAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ProcessLifecycleEvent evt)
+    {
+        var startPredicate = evt.StartTimeUtc.HasValue
+            ? "start_utc = $start"
+            : "start_utc = (SELECT MAX(start_utc) FROM process_instances WHERE pid = $pid AND start_utc <= $stop AND stop_utc IS NULL)";
+        await using var cmd = new SqliteCommand(
+            $"""
+             UPDATE process_instances
+             SET stop_utc = $stop,
+                 stop_observed = 1,
+                 capture_reliable = capture_reliable AND $reliable
+             WHERE pid = $pid AND {startPredicate};
+             """, connection, transaction);
+        cmd.Parameters.AddWithValue("$pid", evt.Pid);
+        cmd.Parameters.AddWithValue("$stop", SerializeTimestamp(evt.TimestampUtc));
+        cmd.Parameters.AddWithValue("$reliable", evt.CaptureReliable ? 1L : 0L);
+        if (evt.StartTimeUtc.HasValue)
+            cmd.Parameters.AddWithValue("$start", SerializeTimestamp(evt.StartTimeUtc.Value));
+        return await cmd.ExecuteNonQueryAsync();
+    }
+
+    private static async Task InsertOrphanStopAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ProcessLifecycleEvent evt)
+    {
+        await using var cmd = new SqliteCommand(
+            """
+            INSERT OR IGNORE INTO process_instances
+                (pid, start_utc, stop_utc, start_observed, stop_observed,
+                 process_name, executable_path, command_line, parent_pid,
+                 parent_start_utc, parent_instance_id, capture_reliable)
+            VALUES ($pid, $time, $time, 0, 1, $name, $path, $cmd, $parentPid,
+                    NULL, NULL, $reliable);
+            """, connection, transaction);
+        cmd.Parameters.AddWithValue("$pid", evt.Pid);
+        cmd.Parameters.AddWithValue("$time", SerializeTimestamp(evt.TimestampUtc));
+        cmd.Parameters.AddWithValue("$name", evt.ProcessName?.Trim() ?? string.Empty);
+        cmd.Parameters.AddWithValue("$path", (object?)evt.ImagePath ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$cmd", (object?)evt.CommandLine ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$parentPid", (object?)evt.ParentPid ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$reliable", evt.CaptureReliable ? 1L : 0L);
         await cmd.ExecuteNonQueryAsync();
     }
 
@@ -1513,7 +1735,8 @@ public class DatabaseManager : IDisposable
     /// Returns system power samples within the given UTC time window.
     /// </summary>
     public async Task<IReadOnlyList<SystemPowerSample>> GetSystemPowerSamplesAsync(
-        DateTime fromUtc, DateTime toUtc)
+        DateTime fromUtc, DateTime toUtc,
+        CancellationToken cancellationToken = default)
     {
         await EnsureInitializedAsync();
 
@@ -1533,8 +1756,8 @@ public class DatabaseManager : IDisposable
         cmd.Parameters.AddWithValue("$to",   SerializeTimestamp(toUtc));
 
         var results = new List<SystemPowerSample>();
-        await using var reader = await cmd.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
         {
             results.Add(new SystemPowerSample
             {
@@ -1546,6 +1769,62 @@ public class DatabaseManager : IDisposable
                 FullChargeCapacityMWh   = reader.IsDBNull(5) ? null : reader.GetDouble(5),
                 EstimatedDischargeWatts = reader.IsDBNull(6) ? null : reader.GetDouble(6),
                 PowerMode               = reader.IsDBNull(7) ? null : reader.GetString(7)
+            });
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// Returns process instances that overlap a UTC window, including resolved
+    /// immediate-parent identity when the parent start was observed.
+    /// </summary>
+    public async Task<IReadOnlyList<ProcessInstance>> GetProcessInstancesAsync(
+        DateTime fromUtc,
+        DateTime toUtc,
+        CancellationToken cancellationToken = default)
+    {
+        if (toUtc < fromUtc)
+            return Array.Empty<ProcessInstance>();
+
+        await EnsureInitializedAsync();
+        await using var connection = await OpenConnectionAsync();
+        const string sql = """
+            SELECT child.id, child.pid, child.start_utc, child.stop_utc,
+                   child.start_observed, child.stop_observed, child.process_name,
+                   child.executable_path, child.command_line, child.parent_pid,
+                   child.parent_start_utc, child.parent_instance_id,
+                   parent.process_name, child.capture_reliable
+            FROM process_instances child
+            LEFT JOIN process_instances parent ON parent.id = child.parent_instance_id
+            WHERE child.start_utc <= $to
+              AND COALESCE(child.stop_utc, $to) >= $from
+            ORDER BY child.start_utc, child.id;
+            """;
+        await using var cmd = new SqliteCommand(sql, connection);
+        cmd.Parameters.AddWithValue("$from", SerializeTimestamp(fromUtc));
+        cmd.Parameters.AddWithValue("$to", SerializeTimestamp(toUtc));
+
+        var results = new List<ProcessInstance>();
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            results.Add(new ProcessInstance
+            {
+                Id = reader.GetInt64(0),
+                Pid = reader.GetInt32(1),
+                StartTimeUtc = DeserializeTimestamp(reader.GetString(2)),
+                StopTimeUtc = reader.IsDBNull(3) ? null : DeserializeTimestamp(reader.GetString(3)),
+                StartObserved = reader.GetInt64(4) != 0,
+                StopObserved = reader.GetInt64(5) != 0,
+                ProcessName = reader.GetString(6),
+                ImagePath = reader.IsDBNull(7) ? null : reader.GetString(7),
+                CommandLine = reader.IsDBNull(8) ? null : reader.GetString(8),
+                ParentPid = reader.IsDBNull(9) ? null : reader.GetInt32(9),
+                ParentStartTimeUtc = reader.IsDBNull(10) ? null : DeserializeTimestamp(reader.GetString(10)),
+                ParentInstanceId = reader.IsDBNull(11) ? null : reader.GetInt64(11),
+                ParentProcessName = reader.IsDBNull(12) ? null : reader.GetString(12),
+                CaptureReliable = reader.GetInt64(13) != 0
             });
         }
 
@@ -1626,7 +1905,8 @@ public class DatabaseManager : IDisposable
     /// Returns the process fields needed by the historical analyzer.
     /// </summary>
     public async Task<IReadOnlyList<ProcessSample>> GetProcessSamplesForAnalysisAsync(
-        DateTime fromUtc, DateTime toUtc)
+        DateTime fromUtc, DateTime toUtc,
+        CancellationToken cancellationToken = default)
     {
         await EnsureInitializedAsync();
 
@@ -1660,8 +1940,8 @@ public class DatabaseManager : IDisposable
         cmd.Parameters.AddWithValue("$to", SerializeTimestamp(toUtc));
 
         var results = new List<ProcessSample>();
-        await using var reader = await cmd.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
         {
             results.Add(new ProcessSample
             {
@@ -1689,7 +1969,8 @@ public class DatabaseManager : IDisposable
     /// Returns SQL-side process aggregates for the historical analyzer.
     /// </summary>
     public async Task<IReadOnlyList<ProcessAnalysisAggregate>> GetProcessAggregatesForAnalysisAsync(
-        IReadOnlyList<(DateTime FromUtc, DateTime ToUtc)> intervals)
+        IReadOnlyList<(DateTime FromUtc, DateTime ToUtc)> intervals,
+        CancellationToken cancellationToken = default)
     {
         await EnsureInitializedAsync();
         if (intervals.Count == 0)
@@ -1789,8 +2070,8 @@ public class DatabaseManager : IDisposable
             cmd.Parameters.AddWithValue(name, value);
 
         var results = new List<ProcessAnalysisAggregate>();
-        await using var reader = await cmd.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
         {
             results.Add(new ProcessAnalysisAggregate
             {
@@ -1855,7 +2136,8 @@ public class DatabaseManager : IDisposable
     }
 
     public async Task<IReadOnlyList<WmiCallerAggregate>> GetWmiCallerAggregatesAsync(
-        DateTime fromUtc, DateTime toUtc, int limit = 100)
+        DateTime fromUtc, DateTime toUtc, int limit = 100,
+        CancellationToken cancellationToken = default)
     {
         await EnsureInitializedAsync();
         if (limit <= 0)
@@ -1928,8 +2210,8 @@ public class DatabaseManager : IDisposable
         cmd.Parameters.AddWithValue("$limit", limit);
 
         var results = new List<WmiCallerAggregate>();
-        await using var reader = await cmd.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
         {
             results.Add(new WmiCallerAggregate
             {
@@ -1954,7 +2236,8 @@ public class DatabaseManager : IDisposable
     /// Returns SQL-side GPU Engine aggregates for the historical analyzer.
     /// </summary>
     public async Task<IReadOnlyList<GpuProcessAnalysisAggregate>> GetGpuProcessAggregatesAsync(
-        IReadOnlyList<(DateTime FromUtc, DateTime ToUtc)> intervals)
+        IReadOnlyList<(DateTime FromUtc, DateTime ToUtc)> intervals,
+        CancellationToken cancellationToken = default)
     {
         await EnsureInitializedAsync();
         if (intervals.Count == 0)
@@ -2004,8 +2287,8 @@ public class DatabaseManager : IDisposable
             cmd.Parameters.AddWithValue(name, value);
 
         var results = new List<GpuProcessAnalysisAggregate>();
-        await using var reader = await cmd.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
         {
             results.Add(new GpuProcessAnalysisAggregate
             {
@@ -2023,7 +2306,8 @@ public class DatabaseManager : IDisposable
     /// Returns hardware sensor samples within the given UTC time window.
     /// </summary>
     public async Task<IReadOnlyList<HardwareSensorSample>> GetHardwareSensorSamplesAsync(
-        DateTime fromUtc, DateTime toUtc)
+        DateTime fromUtc, DateTime toUtc,
+        CancellationToken cancellationToken = default)
     {
         await EnsureInitializedAsync();
 
@@ -2045,8 +2329,8 @@ public class DatabaseManager : IDisposable
         cmd.Parameters.AddWithValue("$to", SerializeTimestamp(toUtc));
 
         var results = new List<HardwareSensorSample>();
-        await using var reader = await cmd.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
         {
             results.Add(new HardwareSensorSample
             {
@@ -2066,7 +2350,8 @@ public class DatabaseManager : IDisposable
     /// <summary>
     /// Returns the latest SourceStatus for each source name.
     /// </summary>
-    public async Task<IReadOnlyList<SourceStatus>> GetLatestSourceStatusesAsync()
+    public async Task<IReadOnlyList<SourceStatus>> GetLatestSourceStatusesAsync(
+        CancellationToken cancellationToken = default)
     {
         await EnsureInitializedAsync();
 
@@ -2088,8 +2373,8 @@ public class DatabaseManager : IDisposable
         await using var cmd = new SqliteCommand(sql, connection);
 
         var results = new List<SourceStatus>();
-        await using var reader = await cmd.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
         {
             results.Add(new SourceStatus
             {
@@ -2202,7 +2487,8 @@ public class DatabaseManager : IDisposable
     /// </summary>
     public async Task<IReadOnlyList<PowerStateEvent>> GetPowerStateEventsAsync(
         DateTime fromUtc,
-        DateTime toUtc)
+        DateTime toUtc,
+        CancellationToken cancellationToken = default)
     {
         await EnsureInitializedAsync();
 
@@ -2219,8 +2505,8 @@ public class DatabaseManager : IDisposable
         cmd.Parameters.AddWithValue("$to", SerializeTimestamp(toUtc));
 
         var results = new List<PowerStateEvent>();
-        await using var reader = await cmd.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
         {
             results.Add(new PowerStateEvent
             {
@@ -2262,19 +2548,21 @@ public class DatabaseManager : IDisposable
     /// <summary>
     /// Rebuilds persisted battery cycle caches from retained system power samples.
     /// </summary>
-    public async Task<BatteryCycleBuildResult> RebuildBatteryCyclesAsync(int retentionDays = 7)
+    public async Task<BatteryCycleBuildResult> RebuildBatteryCyclesAsync(
+        int retentionDays = 7,
+        CancellationToken cancellationToken = default)
     {
         await EnsureInitializedAsync();
 
         var toUtc = DateTime.UtcNow;
         var fromUtc = toUtc.AddDays(-retentionDays);
-        var powerSamples = await GetSystemPowerSamplesAsync(fromUtc, toUtc);
+        var powerSamples = await GetSystemPowerSamplesAsync(fromUtc, toUtc, cancellationToken);
         var sessionStarts = await GetSessionStartMarkersAsync(fromUtc, toUtc);
         var powerEvents = await GetPowerStateEventsAsync(fromUtc, toUtc);
         var sleepIntervals = GapDetector.DetectSleepOnly(powerEvents);
         var result = BatteryCycleBuilder.Build(powerSamples, sessionStarts, sleepIntervals);
 
-        await _writeLock.WaitAsync();
+        await _writeLock.WaitAsync(cancellationToken);
         try
         {
             var connection = await GetOrOpenWriteConnectionAsync();
@@ -2288,6 +2576,7 @@ public class DatabaseManager : IDisposable
             var displayIdMap = new Dictionary<long, long>();
             foreach (var displayCycle in result.DisplayCycles)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var persistedId = await InsertBatteryDisplayCycleInTransactionAsync(
                     connection,
                     transaction,
@@ -2297,6 +2586,7 @@ public class DatabaseManager : IDisposable
 
             foreach (var cycle in result.RawCycles)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 if (!cycle.DisplayCycleId.HasValue ||
                     !displayIdMap.TryGetValue(cycle.DisplayCycleId.Value, out var displayCycleId))
                 {
@@ -2320,7 +2610,9 @@ public class DatabaseManager : IDisposable
         return result;
     }
 
-    public async Task<IReadOnlyList<BatteryDisplayCycle>> GetLatestBatteryDisplayCyclesAsync(int count)
+    public async Task<IReadOnlyList<BatteryDisplayCycle>> GetLatestBatteryDisplayCyclesAsync(
+        int count,
+        CancellationToken cancellationToken = default)
     {
         await EnsureInitializedAsync();
         if (count <= 0)
@@ -2342,14 +2634,16 @@ public class DatabaseManager : IDisposable
         cmd.Parameters.AddWithValue("$count", count);
 
         var results = new List<BatteryDisplayCycle>();
-        await using var reader = await cmd.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
             results.Add(ReadBatteryDisplayCycle(reader));
 
         return results;
     }
 
-    public async Task<IReadOnlyList<BatteryCycle>> GetBatteryCyclesForDisplayCycleAsync(long displayCycleId)
+    public async Task<IReadOnlyList<BatteryCycle>> GetBatteryCyclesForDisplayCycleAsync(
+        long displayCycleId,
+        CancellationToken cancellationToken = default)
     {
         await EnsureInitializedAsync();
 
@@ -2370,8 +2664,8 @@ public class DatabaseManager : IDisposable
         cmd.Parameters.AddWithValue("$displayCycleId", displayCycleId);
 
         var results = new List<BatteryCycle>();
-        await using var reader = await cmd.ExecuteReaderAsync();
-        while (await reader.ReadAsync())
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
             results.Add(ReadBatteryCycle(reader));
 
         return results;
@@ -2778,6 +3072,15 @@ public class DatabaseManager : IDisposable
                 totalDeleted += await cmd.ExecuteNonQueryAsync();
             }
 
+            await using (var cmd = new SqliteCommand(
+                "DELETE FROM process_instances WHERE stop_utc IS NOT NULL AND stop_utc < $cutoff;",
+                connection,
+                transaction))
+            {
+                cmd.Parameters.AddWithValue("$cutoff", historyCutoffStr);
+                totalDeleted += await cmd.ExecuteNonQueryAsync();
+            }
+
             foreach (var table in new[]
             {
                 "process_analysis_aggregates",
@@ -2918,6 +3221,7 @@ public class DatabaseManager : IDisposable
                 "wmi_activity_samples",
                 "session_start_markers",
                 "power_state_events",
+                "process_instances",
                 "metadata",
                 "process_analysis_aggregates",
                 "gpu_analysis_aggregates",

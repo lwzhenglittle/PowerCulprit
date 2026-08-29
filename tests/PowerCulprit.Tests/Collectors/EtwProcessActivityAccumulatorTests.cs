@@ -1,4 +1,5 @@
 using PowerCulprit.Collectors;
+using PowerCulprit.Core.Models;
 
 namespace PowerCulprit.Tests.Collectors;
 
@@ -132,5 +133,32 @@ public class EtwProcessActivityAccumulatorTests
         var third = accumulator.SnapshotAndReset(t1.AddSeconds(2));
         Assert.Equal(0, third.Counters.LostEventCount);
         Assert.False(third.HadLostEvents);
+    }
+
+    [Fact]
+    public void SnapshotAndReset_EmitsStableLifecycleEventsAndReliability()
+    {
+        var accumulator = new EtwProcessActivityAccumulator();
+        var t0 = new DateTime(2026, 8, 25, 12, 0, 0, DateTimeKind.Utc);
+        var childStart = t0.AddSeconds(1);
+        var childStop = childStart.AddSeconds(3);
+
+        accumulator.SnapshotAndReset(t0);
+        accumulator.RecordProcessStart(10, "launcher.exe", startTimeUtc: t0);
+        accumulator.RecordProcessStart(20, "worker.exe", parentPid: 10, startTimeUtc: childStart);
+        accumulator.RecordProcessStop(20, childStop);
+        accumulator.RecordLostEvents(1);
+
+        var snapshot = accumulator.SnapshotAndReset(t0.AddSeconds(5));
+
+        Assert.Equal(3, snapshot.LifecycleEvents.Count);
+        var childStartEvent = Assert.Single(snapshot.LifecycleEvents,
+            evt => evt.Pid == 20 && evt.Kind == ProcessLifecycleEventKind.Start);
+        var childStopEvent = Assert.Single(snapshot.LifecycleEvents,
+            evt => evt.Pid == 20 && evt.Kind == ProcessLifecycleEventKind.Stop);
+        Assert.Equal(childStart, childStartEvent.StartTimeUtc);
+        Assert.Equal(t0, childStartEvent.ParentStartTimeUtc);
+        Assert.Equal(childStart, childStopEvent.StartTimeUtc);
+        Assert.All(snapshot.LifecycleEvents, evt => Assert.False(evt.CaptureReliable));
     }
 }

@@ -50,7 +50,7 @@ public class IntelCpuPowerCollector
         // Look for CPU Package Power specifically
         var packageSample = lhmSamples
             .FirstOrDefault(s =>
-                s.MetricName == "Power" &&
+                IsPowerMetric(s) &&
                 s.SensorName.Contains("Package", StringComparison.OrdinalIgnoreCase) &&
                 s.DeviceName.Contains("CPU", StringComparison.OrdinalIgnoreCase));
 
@@ -60,10 +60,45 @@ public class IntelCpuPowerCollector
         // Try "CPU Package" sensor name
         packageSample = lhmSamples
             .FirstOrDefault(s =>
-                s.MetricName == "Power" &&
+                IsPowerMetric(s) &&
                 s.SensorName.Equals("CPU Package", StringComparison.OrdinalIgnoreCase));
 
         return packageSample?.Value;
+    }
+
+    /// <summary>
+    /// Returns the RAPL platform-domain power reported by LHM. This is not an
+    /// uncore measurement and must not be added to package power.
+    /// </summary>
+    public double? GetCpuPlatformPowerWatts(IReadOnlyList<HardwareSensorSample> lhmSamples)
+        => GetCpuPowerDomain(lhmSamples, "CPU Platform");
+
+    /// <summary>Returns the PP0/core-domain power reported as CPU Cores.</summary>
+    public double? GetCpuCoresPowerWatts(IReadOnlyList<HardwareSensorSample> lhmSamples)
+        => GetCpuPowerDomain(lhmSamples, "CPU Cores");
+
+    /// <summary>Returns the DRAM-domain power reported as CPU Memory.</summary>
+    public double? GetCpuMemoryPowerWatts(IReadOnlyList<HardwareSensorSample> lhmSamples)
+        => GetCpuPowerDomain(lhmSamples, "CPU Memory");
+
+    private static double? GetCpuPowerDomain(
+        IReadOnlyList<HardwareSensorSample> samples,
+        string sensorName)
+    {
+        var sample = samples.FirstOrDefault(s =>
+            IsPowerMetric(s) &&
+            s.SensorName.Equals(sensorName, StringComparison.OrdinalIgnoreCase) &&
+            (s.DeviceName.Contains("CPU", StringComparison.OrdinalIgnoreCase) ||
+             s.DeviceName.Contains("Core", StringComparison.OrdinalIgnoreCase)));
+
+        return sample is not null && double.IsFinite(sample.Value) && sample.Value >= 0
+            ? sample.Value
+            : null;
+    }
+
+    private static bool IsPowerMetric(HardwareSensorSample sample)
+    {
+        return sample.MetricName.Equals("Power", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -79,7 +114,7 @@ public class IntelCpuPowerCollector
             var filtered = FilterFromLhm(lhmSamples);
             sensorCount = filtered.Count;
             hasCpuPower = filtered.Any(s =>
-                s.MetricName == "Power" &&
+                IsPowerMetric(s) &&
                 s.SensorName.Contains("Package", StringComparison.OrdinalIgnoreCase));
         }
 

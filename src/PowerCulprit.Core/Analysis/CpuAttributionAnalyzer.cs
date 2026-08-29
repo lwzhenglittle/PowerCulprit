@@ -18,11 +18,16 @@ public static class CpuAttributionAnalyzer
             };
         }
 
-        var batteryDrop = CalculateBatteryDrop(ordered);
         var energyUsed = CalculateEnergyUsed(ordered);
-        var clockValues = Values(ordered.Select(s => s.CpuAverageClockMhz));
-        var loadValues = Values(ordered.Select(s => s.CpuLoadPercent));
-        var powerValues = Values(ordered.Select(s => s.CpuPackagePowerWatts));
+        var batterySamples = ordered.Where(s => s.IsAcOnline == false).ToList();
+        var batteryDrop = CalculateBatteryDrop(batterySamples);
+        var clockValues = Values(batterySamples.Select(s => s.CpuAverageClockMhz));
+        var loadValues = Values(batterySamples.Select(s => s.CpuLoadPercent));
+        var powerValues = Values(batterySamples.Select(s => s.CpuPackagePowerWatts));
+        var platformPowerValues = Values(batterySamples.Select(s => s.CpuPlatformPowerWatts));
+        var coresPowerValues = Values(batterySamples.Select(s => s.CpuCoresPowerWatts));
+        var memoryPowerValues = Values(batterySamples.Select(s => s.CpuMemoryPowerWatts));
+        var gpuPowerValues = Values(batterySamples.Select(s => s.GpuPowerWatts));
         var cpuEnergyWh = CalculateCpuEnergyWh(ordered);
         var correlation = ComputeCpuPowerEnergyCorrelation(ordered);
 
@@ -36,6 +41,14 @@ public static class CpuAttributionAnalyzer
             MaxCpuLoadPercent = Max(loadValues),
             AvgCpuPackagePowerWatts = Average(powerValues),
             MaxCpuPackagePowerWatts = Max(powerValues),
+            AvgCpuPlatformPowerWatts = Average(platformPowerValues),
+            MaxCpuPlatformPowerWatts = Max(platformPowerValues),
+            AvgCpuCoresPowerWatts = Average(coresPowerValues),
+            MaxCpuCoresPowerWatts = Max(coresPowerValues),
+            AvgCpuMemoryPowerWatts = Average(memoryPowerValues),
+            MaxCpuMemoryPowerWatts = Max(memoryPowerValues),
+            AvgGpuPowerWatts = Average(gpuPowerValues),
+            MaxGpuPowerWatts = Max(gpuPowerValues),
             CpuPackageEnergyWh = cpuEnergyWh,
             CpuPowerDischargeCorrelation = correlation
         };
@@ -77,6 +90,8 @@ public static class CpuAttributionAnalyzer
             var span = current.TimestampUtc - previous.TimestampUtc;
             if (span <= TimeSpan.Zero)
                 continue;
+            if (previous.IsAcOnline != false || current.IsAcOnline != false)
+                continue;
 
             // Skip unobserved intervals (sleep / hibernate / monitoring gap) —
             // never extrapolate boundary wattage across a gap. Reusing
@@ -112,6 +127,8 @@ public static class CpuAttributionAnalyzer
             var previous = samples[i - 1];
             var current = samples[i];
             if (!current.CpuPackagePowerWatts.HasValue ||
+                previous.IsAcOnline != false ||
+                current.IsAcOnline != false ||
                 !previous.CumulativeEnergyWh.HasValue ||
                 !current.CumulativeEnergyWh.HasValue)
             {
@@ -150,12 +167,18 @@ public static class CpuAttributionAnalyzer
             parts.Add("no battery discharge energy is available");
 
         if (result.AvgCpuPackagePowerWatts.HasValue)
-            parts.Add($"CPU package averaged {result.AvgCpuPackagePowerWatts.Value:F1} W");
+            parts.Add($"CPU package averaged {result.AvgCpuPackagePowerWatts.Value:F1} W while on battery");
         else
             parts.Add("CPU package power is unavailable");
 
         if (result.CpuPackageEnergyWh.HasValue)
-            parts.Add($"CPU package energy was about {result.CpuPackageEnergyWh.Value:F2} Wh");
+            parts.Add($"CPU package energy while on battery was about {result.CpuPackageEnergyWh.Value:F2} Wh");
+
+        if (result.AvgCpuPlatformPowerWatts.HasValue || result.AvgCpuCoresPowerWatts.HasValue ||
+            result.AvgCpuMemoryPowerWatts.HasValue || result.AvgGpuPowerWatts.HasValue)
+        {
+            parts.Add("platform/package/core/memory/GPU domains are overlapping observations and are not summed");
+        }
 
         if (result.AvgCpuLoadPercent.HasValue)
             parts.Add($"CPU load averaged {result.AvgCpuLoadPercent.Value:F1}%");

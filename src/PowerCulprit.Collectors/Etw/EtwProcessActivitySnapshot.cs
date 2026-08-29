@@ -1,3 +1,5 @@
+using PowerCulprit.Core.Models;
+
 namespace PowerCulprit.Collectors;
 
 /// <summary>Metadata observed from ETW process lifecycle events.</summary>
@@ -54,12 +56,14 @@ public sealed record EtwProcessActivitySnapshot
         TimestampUtc = DateTime.MinValue,
         Interval = TimeSpan.Zero,
         Activities = Array.Empty<EtwProcessActivity>(),
+        LifecycleEvents = Array.Empty<ProcessLifecycleEvent>(),
         Counters = new EtwActivityCounters()
     };
 
     public DateTime TimestampUtc { get; init; }
     public TimeSpan Interval { get; init; }
     public IReadOnlyList<EtwProcessActivity> Activities { get; init; } = Array.Empty<EtwProcessActivity>();
+    public IReadOnlyList<ProcessLifecycleEvent> LifecycleEvents { get; init; } = Array.Empty<ProcessLifecycleEvent>();
     public EtwActivityCounters Counters { get; init; } = new();
     public bool HadLostEvents => Counters.LostEventCount > 0;
     public long LostEventCount => Counters.LostEventCount;

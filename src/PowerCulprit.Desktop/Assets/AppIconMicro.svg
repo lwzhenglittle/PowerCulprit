@@ -1,0 +1,6 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="PowerCulprit">
+  <rect x="6" y="14" width="46" height="36" rx="9" fill="#0B1729" stroke="#38BDF8" stroke-width="4"/>
+  <rect x="52" y="25" width="6" height="14" rx="2" fill="#38BDF8"/>
+  <path d="M12 42C19 38 24 35 29 37C35 39 39 30 47 25" stroke="#4ADE80" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M35 16L26 31H33L29 46L41 28H34L35 16Z" fill="#FACC15" stroke="#FFF7ED" stroke-width="1.5" stroke-linejoin="round"/>
+</svg>

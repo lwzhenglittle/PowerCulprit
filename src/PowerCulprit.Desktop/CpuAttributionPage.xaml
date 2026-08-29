@@ -9,14 +9,23 @@
     xmlns:vm="using:PowerCulprit.Desktop.ViewModels"
     mc:Ignorable="d">
 
+    <!-- Keep the default NavigationCacheMode=Disabled. The Win2D chart calls
+         RemoveFromVisualTree when unloaded and cannot be reused from a cached page. -->
+
     <Page.Resources>
         <vm:BoolToInverseConverter x:Key="BoolToInverseConverter" />
+        <vm:BoolToVisibilityConverter x:Key="BoolToVisibilityConverter" />
     </Page.Resources>
 
     <ScrollViewer x:Name="RootScrollViewer"
                   Background="{ThemeResource ApplicationPageBackgroundThemeBrush}"
+                  HorizontalContentAlignment="Stretch"
+                  HorizontalScrollMode="Disabled"
+                  HorizontalScrollBarVisibility="Disabled"
                   VerticalScrollBarVisibility="Auto">
-        <StackPanel Padding="{StaticResource PageContentMargin}" Spacing="16">
+        <StackPanel Padding="{StaticResource PageContentMargin}"
+                    Spacing="16"
+                    Width="{x:Bind RootScrollViewer.ViewportWidth, Mode=OneWay}">
             <Grid ColumnSpacing="16">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
@@ -66,11 +75,17 @@
                         </AppBarButton.Icon>
                     </AppBarButton>
                     <CommandBar.Content>
-                        <TextBlock Text="{x:Bind ViewModel.ErrorText, Mode=OneWay}"
-                                   Foreground="{ThemeResource SystemFillColorCriticalBrush}"
-                                   MaxWidth="520"
-                                   TextTrimming="CharacterEllipsis"
-                                   VerticalAlignment="Center" />
+                        <StackPanel Orientation="Horizontal" Spacing="12">
+                            <ProgressRing Width="18"
+                                          Height="18"
+                                          IsActive="{x:Bind ViewModel.IsLoading, Mode=OneWay}"
+                                          Visibility="{x:Bind ViewModel.IsLoading, Mode=OneWay, Converter={StaticResource BoolToVisibilityConverter}}" />
+                            <InfoBar IsOpen="{x:Bind ViewModel.HasError, Mode=OneWay}"
+                                     IsClosable="False"
+                                     Severity="Error"
+                                     Message="{x:Bind ViewModel.ErrorText, Mode=OneWay}"
+                                     MaxWidth="520" />
+                        </StackPanel>
                     </CommandBar.Content>
                 </CommandBar>
             </Border>
@@ -94,7 +109,7 @@
                 </Border>
                 <Border Grid.Column="1" Style="{StaticResource DashboardCompactCardStyle}">
                     <StackPanel Spacing="6">
-                        <TextBlock Text="Energy used" Style="{StaticResource MetricLabelTextBlockStyle}" />
+                        <TextBlock Text="Battery energy used" Style="{StaticResource MetricLabelTextBlockStyle}" />
                         <TextBlock Text="{x:Bind ViewModel.EnergyUsedText, Mode=OneWay}" Style="{StaticResource MetricValueTextBlockStyle}" />
                     </StackPanel>
                 </Border>
@@ -125,6 +140,41 @@
             </Grid>
 
             <Border Style="{StaticResource DashboardCardStyle}">
+                <StackPanel Spacing="8">
+                    <TextBlock Text="Observed power domains (average / maximum)"
+                               Style="{StaticResource SectionTitleTextBlockStyle}" />
+                    <TextBlock Text="RAPL and GPU domains overlap. They are shown independently and are never added to system discharge or to one another."
+                               TextWrapping="Wrap"
+                               Style="{StaticResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    <Grid ColumnSpacing="12">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Spacing="4">
+                            <TextBlock Text="CPU platform" Style="{StaticResource MetricLabelTextBlockStyle}" />
+                            <TextBlock Text="{x:Bind ViewModel.CpuPlatformPowerText, Mode=OneWay}" Style="{StaticResource MetricValueTextBlockStyle}" />
+                        </StackPanel>
+                        <StackPanel Grid.Column="1" Spacing="4">
+                            <TextBlock Text="CPU cores" Style="{StaticResource MetricLabelTextBlockStyle}" />
+                            <TextBlock Text="{x:Bind ViewModel.CpuCoresPowerText, Mode=OneWay}" Style="{StaticResource MetricValueTextBlockStyle}" />
+                        </StackPanel>
+                        <StackPanel Grid.Column="2" Spacing="4">
+                            <TextBlock Text="CPU memory" Style="{StaticResource MetricLabelTextBlockStyle}" />
+                            <TextBlock Text="{x:Bind ViewModel.CpuMemoryPowerText, Mode=OneWay}" Style="{StaticResource MetricValueTextBlockStyle}" />
+                        </StackPanel>
+                        <StackPanel Grid.Column="3" Spacing="4">
+                            <TextBlock Text="GPU" Style="{StaticResource MetricLabelTextBlockStyle}" />
+                            <TextBlock Text="{x:Bind ViewModel.GpuPowerText, Mode=OneWay}" Style="{StaticResource MetricValueTextBlockStyle}" />
+                        </StackPanel>
+                    </Grid>
+                </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource DashboardCardStyle}">
                 <Grid RowSpacing="8">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />
@@ -134,10 +184,16 @@
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
                         <TextBlock Text="Battery + CPU timeline"
                                    Style="{StaticResource SectionTitleTextBlockStyle}" />
-                        <TextBlock Grid.Column="1"
+                        <Button Grid.Column="1"
+                                Content="Reset zoom"
+                                Click="CpuChart_ResetZoom_Click"
+                                Padding="10,4"
+                                MinHeight="28" />
+                        <TextBlock Grid.Column="2"
                                    Text="{x:Bind ViewModel.HistoryStatusText, Mode=OneWay}"
                                    Style="{StaticResource CaptionTextBlockStyle}"
                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
@@ -177,10 +233,10 @@
                 </Border>
                 <Border Grid.Column="1" Style="{StaticResource DashboardCardStyle}">
                     <StackPanel Spacing="8">
-                        <TextBlock Text="CPU energy + correlation" Style="{StaticResource SectionTitleTextBlockStyle}" />
-                        <TextBlock Text="CPU energy" Style="{StaticResource MetricLabelTextBlockStyle}" />
+                        <TextBlock Text="CPU package energy + correlation" Style="{StaticResource SectionTitleTextBlockStyle}" />
+                        <TextBlock Text="Package energy" Style="{StaticResource MetricLabelTextBlockStyle}" />
                         <TextBlock Text="{x:Bind ViewModel.CpuEnergyText, Mode=OneWay}" Style="{StaticResource MetricValueTextBlockStyle}" />
-                        <TextBlock Text="CPU/discharge r" Style="{StaticResource MetricLabelTextBlockStyle}" />
+                        <TextBlock Text="Package/discharge r" Style="{StaticResource MetricLabelTextBlockStyle}" />
                         <TextBlock Text="{x:Bind ViewModel.CorrelationText, Mode=OneWay}" Style="{StaticResource MetricValueTextBlockStyle}" />
                     </StackPanel>
                 </Border>

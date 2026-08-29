@@ -83,7 +83,7 @@ public class BatteryCycleBuilderTests
     }
 
     [Fact]
-    public void ConsecutiveSmallCycles_MergeUntilPercentAndWhThresholdsAreMet()
+    public void ConsecutiveSmallCycles_RemainSeparateDisplayCycles()
     {
         var start = new DateTime(2026, 6, 24, 8, 0, 0, DateTimeKind.Utc);
         var result = BatteryCycleBuilder.Build(new[]
@@ -92,18 +92,57 @@ public class BatteryCycleBuilderTests
             Power(start.AddMinutes(1), ac: false, percent: 80),
             Power(start.AddMinutes(2), ac: false, percent: 75),
             Power(start.AddMinutes(3), ac: true, percent: 75),
+            Power(start.AddMinutes(3).AddSeconds(1), ac: true, percent: 75),
             Power(start.AddMinutes(4), ac: false, percent: 75),
             Power(start.AddMinutes(5), ac: false, percent: 65),
             Power(start.AddMinutes(6), ac: true, percent: 65),
+            Power(start.AddMinutes(6).AddSeconds(1), ac: true, percent: 65),
             Power(start.AddMinutes(7), ac: false, percent: 65),
             Power(start.AddMinutes(8), ac: false, percent: 59),
             Power(start.AddMinutes(9), ac: true, percent: 59)
         });
 
-        var display = Assert.Single(result.DisplayCycles);
-        Assert.Equal(3, display.RawCycleCount);
-        Assert.Equal(21, display.DischargePercent);
-        Assert.Equal(21, display.DischargeWh);
+        Assert.Equal(3, result.RawCycles.Count);
+        Assert.Equal(3, result.DisplayCycles.Count);
+        Assert.All(result.DisplayCycles, display => Assert.Equal(1, display.RawCycleCount));
+        Assert.Equal(5, result.DisplayCycles[0].DischargePercent);
+        Assert.Equal(10, result.DisplayCycles[1].DischargePercent);
+        Assert.Equal(6, result.DisplayCycles[2].DischargePercent);
+    }
+
+    [Fact]
+    public void SingleAcSampleBetweenBatteryRuns_IsTreatedAsStateJitter()
+    {
+        var start = new DateTime(2026, 6, 24, 8, 0, 0, DateTimeKind.Utc);
+        var result = BatteryCycleBuilder.Build(new[]
+        {
+            Power(start, ac: true, percent: 80),
+            Power(start.AddMinutes(1), ac: false, percent: 80),
+            Power(start.AddMinutes(2), ac: false, percent: 75),
+            Power(start.AddMinutes(3), ac: true, percent: 75),
+            Power(start.AddMinutes(4), ac: false, percent: 74),
+            Power(start.AddMinutes(5), ac: false, percent: 70),
+            Power(start.AddMinutes(6), ac: true, percent: 70)
+        });
+
+        var cycle = Assert.Single(result.RawCycles);
+        Assert.Single(result.DisplayCycles);
+        Assert.False(cycle.IsOpen);
+        Assert.Equal(10, cycle.DischargePercent);
+    }
+
+    [Fact]
+    public void UnknownAcState_DoesNotStartAFakeBatteryCycle()
+    {
+        var start = new DateTime(2026, 6, 24, 8, 0, 0, DateTimeKind.Utc);
+        var result = BatteryCycleBuilder.Build(new[]
+        {
+            Power(start, ac: false, percent: 80) with { IsAcOnline = null },
+            Power(start.AddMinutes(1), ac: false, percent: 75) with { IsAcOnline = null }
+        });
+
+        Assert.Empty(result.RawCycles);
+        Assert.Empty(result.DisplayCycles);
     }
 
     [Fact]
@@ -115,20 +154,24 @@ public class BatteryCycleBuilderTests
             Power(start, ac: true, percent: 80),
             Power(start.AddMinutes(1), ac: false, percent: 80),
             Power(start.AddMinutes(12), ac: false, percent: 75),
-            Power(start.AddMinutes(13), ac: true, percent: 75),
-            Power(start.AddMinutes(14), ac: false, percent: 75),
-            Power(start.AddMinutes(15), ac: false, percent: 70),
-            Power(start.AddMinutes(16), ac: true, percent: 70)
+            Power(start.AddMinutes(13), ac: false, percent: 75),
+            Power(start.AddMinutes(14), ac: true, percent: 75),
+            Power(start.AddMinutes(15), ac: false, percent: 75),
+            Power(start.AddMinutes(16), ac: false, percent: 70),
+            Power(start.AddMinutes(17), ac: true, percent: 70)
         });
 
         Assert.Equal(2, result.DisplayCycles.Count);
         Assert.Equal(BatteryCycleConfidence.Low, result.RawCycles[0].Confidence);
+        Assert.Equal(BatteryCycleConfidence.Low, result.RawCycles[1].Confidence);
+        Assert.Equal(start.AddMinutes(1), result.RawCycles[0].LastSampleUtc);
+        Assert.Equal(start.AddMinutes(12), result.RawCycles[1].StartUtc);
         Assert.Equal(1, result.DisplayCycles[0].RawCycleCount);
         Assert.Equal(1, result.DisplayCycles[1].RawCycleCount);
     }
 
     [Fact]
-    public void SessionBoundaryInOfflineStretch_StartsNewDisplayCycle()
+    public void SessionBoundaryInOfflineStretch_DoesNotSplitContinuousCycle()
     {
         var start = new DateTime(2026, 6, 24, 8, 0, 0, DateTimeKind.Utc);
         var result = BatteryCycleBuilder.Build(
@@ -142,21 +185,16 @@ public class BatteryCycleBuilderTests
             },
             new[] { start.AddMinutes(2).AddSeconds(30) });
 
-        Assert.Equal(2, result.RawCycles.Count);
-        Assert.Equal(2, result.DisplayCycles.Count);
-
-        Assert.Equal(start.AddMinutes(1), result.RawCycles[0].StartUtc);
-        Assert.Equal(start.AddMinutes(2), result.RawCycles[0].EndUtc);
-        Assert.False(result.RawCycles[0].IsOpen);
-
-        Assert.Equal(start.AddMinutes(3), result.RawCycles[1].StartUtc);
-        Assert.True(result.RawCycles[1].IsOpen);
-        Assert.True(result.RawCycles[1].StartedAtSessionBoundary);
-        Assert.Equal(BatteryCycleConfidence.High, result.RawCycles[1].Confidence);
+        var cycle = Assert.Single(result.RawCycles);
+        Assert.Single(result.DisplayCycles);
+        Assert.Equal(start.AddMinutes(1), cycle.StartUtc);
+        Assert.True(cycle.IsOpen);
+        Assert.False(cycle.StartedAtSessionBoundary);
+        Assert.Equal(BatteryCycleConfidence.High, cycle.Confidence);
     }
 
     [Fact]
-    public void MultipleSessionBoundaries_SplitContinuousOfflineStretch()
+    public void MultipleSessionBoundaries_DoNotSplitContinuousOfflineStretch()
     {
         var start = new DateTime(2026, 6, 24, 8, 0, 0, DateTimeKind.Utc);
         var result = BatteryCycleBuilder.Build(
@@ -175,11 +213,12 @@ public class BatteryCycleBuilderTests
                 start.AddMinutes(4).AddSeconds(30)
             });
 
-        Assert.Equal(3, result.RawCycles.Count);
-        Assert.Equal(3, result.DisplayCycles.Count);
-        Assert.True(result.RawCycles[1].StartedAtSessionBoundary);
-        Assert.True(result.RawCycles[2].StartedAtSessionBoundary);
-        Assert.All(result.RawCycles, c => Assert.Equal(BatteryCycleConfidence.High, c.Confidence));
+        var cycle = Assert.Single(result.RawCycles);
+        Assert.Single(result.DisplayCycles);
+        Assert.Equal(start.AddMinutes(1), cycle.StartUtc);
+        Assert.True(cycle.IsOpen);
+        Assert.False(cycle.StartedAtSessionBoundary);
+        Assert.Equal(BatteryCycleConfidence.High, cycle.Confidence);
     }
 
     [Fact]
@@ -231,10 +270,12 @@ public class BatteryCycleBuilderTests
 
         var cycle = Assert.Single(result.RawCycles);
         Assert.Equal(BatteryCycleConfidence.High, cycle.Confidence);
+        Assert.Equal(5, cycle.DischargePercent);
+        Assert.Equal(5, cycle.DischargeWh);
     }
 
     [Fact]
-    public void LargeSampleGap_NotCoveredBySleep_MarksLowConfidence()
+    public void LargeSampleGap_NotCoveredBySleep_SplitsAndMarksBothSidesLowConfidence()
     {
         var start = new DateTime(2026, 6, 24, 8, 0, 0, DateTimeKind.Utc);
         var samples = new[]
@@ -247,8 +288,11 @@ public class BatteryCycleBuilderTests
 
         var result = BatteryCycleBuilder.Build(samples);
 
-        var cycle = Assert.Single(result.RawCycles);
-        Assert.Equal(BatteryCycleConfidence.Low, cycle.Confidence);
+        Assert.Equal(2, result.RawCycles.Count);
+        Assert.Equal(BatteryCycleConfidence.Low, result.RawCycles[0].Confidence);
+        Assert.Equal(BatteryCycleConfidence.Low, result.RawCycles[1].Confidence);
+        Assert.Equal(start.AddMinutes(1), result.RawCycles[0].LastSampleUtc);
+        Assert.Equal(start.AddMinutes(11).AddSeconds(1), result.RawCycles[1].StartUtc);
     }
 
     private static SystemPowerSample Power(DateTime timestampUtc, bool ac, double percent)

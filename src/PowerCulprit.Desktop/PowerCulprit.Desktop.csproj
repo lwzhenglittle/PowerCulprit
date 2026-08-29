@@ -27,8 +27,19 @@
     <Content Include="Assets\Square44x44Logo.targetsize-48_altform-lightunplated.png" />
     <Content Include="Assets\StoreLogo.png" />
     <Content Include="Assets\AppIcon.svg" />
+    <Content Include="Assets\AppIconMicro.svg" />
     <Content Include="Assets\AppIcon.ico" />
     <Content Include="Assets\Wide310x150Logo.scale-200.png" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Keep runtime assets beside the unpackaged executable in both build and
+         publish output. Without this, AppWindow.SetIcon and ms-appx SVG
+         references work in bin but silently disappear from dotnet publish. -->
+    <Content Update="Assets\**">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
   </ItemGroup>
 
   <ItemGroup>

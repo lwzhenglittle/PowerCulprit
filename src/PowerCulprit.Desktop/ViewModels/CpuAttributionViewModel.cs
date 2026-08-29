@@ -16,10 +16,12 @@ public partial class CpuAttributionViewModel : ObservableObject
     private readonly DatabaseManager _database;
     private readonly ILogger<CpuAttributionViewModel> _logger;
     private readonly DispatcherQueue _dispatcher;
+    private readonly HistorySelectionState _historySelection;
     private CancellationTokenSource? _loadCts;
     private DispatcherQueueTimer? _rangeDebounceTimer;
     private int _powerSampleCount;
     private int _hardwareSampleCount;
+    private bool _hasLoadedRange;
 
     private DateTime _historyFromUtc = DateTime.MinValue;
     private DateTime _historyToUtc = DateTime.MinValue;
@@ -29,11 +31,13 @@ public partial class CpuAttributionViewModel : ObservableObject
     public CpuAttributionViewModel(
         DatabaseManager database,
         ILogger<CpuAttributionViewModel> logger,
-        DispatcherQueue dispatcher)
+        DispatcherQueue dispatcher,
+        HistorySelectionState historySelection)
     {
         _database = database;
         _logger = logger;
         _dispatcher = dispatcher;
+        _historySelection = historySelection;
     }
 
     [ObservableProperty]
@@ -52,6 +56,18 @@ public partial class CpuAttributionViewModel : ObservableObject
     public partial string CpuPowerText { get; set; } = "--";
 
     [ObservableProperty]
+    public partial string CpuPlatformPowerText { get; set; } = "--";
+
+    [ObservableProperty]
+    public partial string CpuCoresPowerText { get; set; } = "--";
+
+    [ObservableProperty]
+    public partial string CpuMemoryPowerText { get; set; } = "--";
+
+    [ObservableProperty]
+    public partial string GpuPowerText { get; set; } = "--";
+
+    [ObservableProperty]
     public partial string CpuEnergyText { get; set; } = "--";
 
     [ObservableProperty]
@@ -67,7 +83,10 @@ public partial class CpuAttributionViewModel : ObservableObject
     public partial string SelectedRangeText { get; set; } = "--";
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasError))]
     public partial string ErrorText { get; set; } = "";
+
+    public bool HasError => !string.IsNullOrWhiteSpace(ErrorText);
 
     [ObservableProperty]
     public partial bool IsLoading { get; set; }
@@ -112,7 +131,18 @@ public partial class CpuAttributionViewModel : ObservableObject
     }
 
     public Task InitializeAsync()
-        => LoadLatestCycleAsync();
+    {
+        if (_hasLoadedRange && _historySelection.HasRange &&
+            _selectedFromUtc == _historySelection.FromUtc &&
+            _selectedToUtc == _historySelection.ToUtc)
+        {
+            return Task.CompletedTask;
+        }
+
+        return _historySelection.HasRange
+            ? LoadRangeAsync(_historySelection.FromUtc, _historySelection.ToUtc)
+            : LoadLatestCycleAsync();
+    }
 
     public void SetChartVisibleRangeFromUserInteraction(DateTime fromUtc, DateTime toUtc)
     {
@@ -153,8 +183,8 @@ public partial class CpuAttributionViewModel : ObservableObject
     {
         try
         {
-            await Task.Run(() => _database.RebuildBatteryCyclesAsync());
-            var cycles = await Task.Run(() => _database.GetLatestBatteryDisplayCyclesAsync(1));
+            await _database.RebuildBatteryCyclesAsync();
+            var cycles = await _database.GetLatestBatteryDisplayCyclesAsync(1);
             var cycle = cycles.FirstOrDefault();
             if (cycle is null)
             {
@@ -188,8 +218,8 @@ public partial class CpuAttributionViewModel : ObservableObject
             ErrorText = "";
             HistoryStatusText = "Loading CPU attribution...";
 
-            var powerTask = Task.Run(() => _database.GetSystemPowerSamplesAsync(fromUtc, toUtc));
-            var hardwareTask = Task.Run(() => _database.GetHardwareSensorSamplesAsync(fromUtc, toUtc));
+            var powerTask = _database.GetSystemPowerSamplesAsync(fromUtc, toUtc, token);
+            var hardwareTask = _database.GetHardwareSensorSamplesAsync(fromUtc, toUtc, token);
             await Task.WhenAll(powerTask, hardwareTask);
             token.ThrowIfCancellationRequested();
 
@@ -230,6 +260,7 @@ public partial class CpuAttributionViewModel : ObservableObject
     {
         _historyFromUtc = fromUtc;
         _historyToUtc = toUtc;
+        _hasLoadedRange = true;
         _powerSampleCount = powerSampleCount;
         _hardwareSampleCount = hardwareSampleCount;
 
@@ -248,6 +279,7 @@ public partial class CpuAttributionViewModel : ObservableObject
     {
         _selectedFromUtc = fromUtc;
         _selectedToUtc = toUtc;
+        _historySelection.SetRange(fromUtc, toUtc);
 
         ChartVisibleFromUtc = fromUtc;
         ChartVisibleToUtc = toUtc;
@@ -268,6 +300,10 @@ public partial class CpuAttributionViewModel : ObservableObject
         CpuClockText = FormatClockRange(attribution.AvgCpuClockMhz, attribution.MaxCpuClockMhz);
         CpuLoadText = FormatRangePercent(attribution.AvgCpuLoadPercent, attribution.MaxCpuLoadPercent);
         CpuPowerText = FormatRangeWatts(attribution.AvgCpuPackagePowerWatts, attribution.MaxCpuPackagePowerWatts);
+        CpuPlatformPowerText = FormatRangeWatts(attribution.AvgCpuPlatformPowerWatts, attribution.MaxCpuPlatformPowerWatts);
+        CpuCoresPowerText = FormatRangeWatts(attribution.AvgCpuCoresPowerWatts, attribution.MaxCpuCoresPowerWatts);
+        CpuMemoryPowerText = FormatRangeWatts(attribution.AvgCpuMemoryPowerWatts, attribution.MaxCpuMemoryPowerWatts);
+        GpuPowerText = FormatRangeWatts(attribution.AvgGpuPowerWatts, attribution.MaxGpuPowerWatts);
         CpuEnergyText = attribution.CpuPackageEnergyWh.HasValue ? $"{attribution.CpuPackageEnergyWh.Value:F2} Wh" : "--";
         CorrelationText = attribution.CpuPowerDischargeCorrelation.HasValue ? attribution.CpuPowerDischargeCorrelation.Value.ToString("F2") : "--";
         AttributionSummaryText = attribution.Summary;

@@ -6,9 +6,9 @@ public static class BatteryCycleBuilder
 {
     public const double FullChargePercent = 99.5;
     public const double FullChargeCapacityRatio = 0.995;
-    public const double SmallCyclePercent = 20.0;
-    public const double SmallCycleWh = 20.0;
     public static readonly TimeSpan MaxSampleGap = TimeSpan.FromMinutes(10);
+
+    private const int StableStateSampleCount = 2;
 
     public static BatteryCycleBuildResult Build(IReadOnlyList<SystemPowerSample> samples)
         => Build(samples, Array.Empty<DateTime>(), Array.Empty<PowerStateInterval>());
@@ -38,19 +38,98 @@ public static class BatteryCycleBuilder
             .OrderBy(t => t)
             .ToList();
 
-        var rawCycles = BuildRawCycles(ordered, orderedSessionStarts, sleepIntervals);
+        var classified = ClassifyAndDebounce(ordered);
+        var rawCycles = BuildRawCycles(classified, orderedSessionStarts, sleepIntervals);
         var (assignedRawCycles, displayCycles) = BuildDisplayCycles(rawCycles);
         return new BatteryCycleBuildResult(assignedRawCycles, displayCycles);
     }
 
+    private enum BatteryState
+    {
+        Unknown,
+        Ac,
+        Battery
+    }
+
+    private sealed record ClassifiedSample(SystemPowerSample Sample, BatteryState State);
+
+    /// <summary>
+    /// Normalizes the raw AC signal and suppresses a single contradictory
+    /// sample between two stable states. A transition at either end of the
+    /// retained history is accepted as-is because there is no look-ahead on
+    /// one side; such a cycle is already represented as partial/open where
+    /// appropriate.
+    /// </summary>
+    private static List<ClassifiedSample> ClassifyAndDebounce(
+        IReadOnlyList<SystemPowerSample> samples)
+    {
+        var classified = samples
+            .Select(sample => new ClassifiedSample(sample, Classify(sample)))
+            .ToList();
+
+        var runs = new List<(int Start, int End, BatteryState State)>();
+        for (var index = 0; index < classified.Count;)
+        {
+            var state = classified[index].State;
+            var end = index + 1;
+            while (end < classified.Count && classified[end].State == state)
+                end++;
+
+            runs.Add((index, end, state));
+            index = end;
+        }
+
+        for (var runIndex = 1; runIndex < runs.Count - 1; runIndex++)
+        {
+            var run = runs[runIndex];
+            if (run.End - run.Start >= StableStateSampleCount ||
+                run.State is not (BatteryState.Ac or BatteryState.Battery))
+            {
+                continue;
+            }
+
+            var previous = runs[runIndex - 1].State;
+            var next = runs[runIndex + 1].State;
+            if (previous != next || previous is not (BatteryState.Ac or BatteryState.Battery))
+                continue;
+
+            for (var index = run.Start; index < run.End; index++)
+                classified[index] = classified[index] with { State = previous };
+        }
+
+        return classified;
+    }
+
+    private static BatteryState Classify(SystemPowerSample sample)
+    {
+        // An AC flag without any battery telemetry is not enough to establish
+        // a battery cycle. This covers desktops/no-battery devices as well as
+        // transient Battery API failures without fabricating a discharge run.
+        var hasBatteryTelemetry = sample.BatteryPercent.HasValue ||
+                                  sample.ChargeRateMilliwatts.HasValue ||
+                                  sample.RemainingCapacityMWh.HasValue ||
+                                  sample.FullChargeCapacityMWh.HasValue ||
+                                  sample.EstimatedDischargeWatts.HasValue;
+        if (!hasBatteryTelemetry)
+            return BatteryState.Unknown;
+
+        return sample.IsAcOnline switch
+        {
+            true => BatteryState.Ac,
+            false => BatteryState.Battery,
+            _ => BatteryState.Unknown
+        };
+    }
+
     private static List<BatteryCycle> BuildRawCycles(
-        IReadOnlyList<SystemPowerSample> samples,
+        IReadOnlyList<ClassifiedSample> samples,
         IReadOnlyList<DateTime> sessionStarts,
         IReadOnlyList<PowerStateInterval> sleepIntervals)
     {
         var cycles = new List<BatteryCycle>();
         CycleDraft? current = null;
         SystemPowerSample? previous = null;
+        var previousState = BatteryState.Unknown;
         var acSessionReachedFull = false;
         var nextSessionStartIndex = 0;
 
@@ -60,8 +139,9 @@ public static class BatteryCycleBuilder
             .OrderBy(i => i.StartUtc)
             .ToList();
 
-        foreach (var sample in samples)
+        foreach (var observation in samples)
         {
+            var sample = observation.Sample;
             var largeGap = previous is not null &&
                 sample.TimestampUtc - previous.TimestampUtc > MaxSampleGap;
 
@@ -79,48 +159,65 @@ public static class BatteryCycleBuilder
                 previous?.TimestampUtc,
                 sample.TimestampUtc);
 
-            if (sessionBoundary && current is not null)
+            // An unexplained gap is a physical continuity boundary for this
+            // feature. Keep both sides, but do not include the unobserved
+            // interval in either cycle.
+            if (largeGap && !knownGap && current is not null)
             {
-                cycles.Add(current.Finish(previous?.TimestampUtc ?? sample.TimestampUtc, isOpen: false));
+                current.MarkLowConfidence();
+                cycles.Add(current.Finish(current.LastObservedUtc, isOpen: false));
                 current = null;
             }
 
-            // null AC == "unknown": treat the same as on-battery (false) so a
-            // desktop with no battery / unknown AC does not get skipped out of
-            // the discharge timeline. Only an explicit true pauses the cycle.
-            if (sample.IsAcOnline == true)
+            // A session marker records a monitoring restart, not a power
+            // transition. It is retained as metadata when a new segment starts
+            // but never splits an already continuous battery segment.
+            switch (observation.State)
             {
-                if (current is not null)
-                {
-                    if (largeGap && !knownGap)
-                        current.MarkLowConfidence();
+                case BatteryState.Ac:
+                    if (current is not null)
+                    {
+                        cycles.Add(current.Finish(sample.TimestampUtc, isOpen: false));
+                        current = null;
+                    }
 
-                    cycles.Add(current.Finish(sample.TimestampUtc, isOpen: false));
-                    current = null;
-                }
+                    acSessionReachedFull = acSessionReachedFull || IsFullCharge(sample);
+                    break;
 
-                acSessionReachedFull = acSessionReachedFull || IsFullCharge(sample);
-                previous = sample;
-                continue;
-            }
+                case BatteryState.Battery:
+                    if (current is null)
+                    {
+                        var partialStart = previous is null || previousState != BatteryState.Ac;
+                        var lowConfidence = partialStart || (largeGap && !knownGap);
+                        var startedAtFullCharge = IsFullCharge(sample) ||
+                            (previousState == BatteryState.Ac && previous is not null && IsFullCharge(previous)) ||
+                            acSessionReachedFull;
 
-            if (current is null)
-            {
-                var partialStart = !sessionBoundary && (previous is null || previous.IsAcOnline != true);
-                var lowConfidence = !sessionBoundary && (partialStart || (largeGap && !knownGap));
-                var startedAtFullCharge = IsFullCharge(sample) ||
-                    (previous?.IsAcOnline == true && IsFullCharge(previous)) ||
-                    acSessionReachedFull;
+                        current = CycleDraft.Start(sample, startedAtFullCharge, lowConfidence, sessionBoundary);
+                    }
+                    else
+                    {
+                        // A known sleep gap preserves the physical unplugged
+                        // segment. The post-sleep boundary sample updates the
+                        // endpoint, so capacity lost during sleep remains part
+                        // of the cycle; process-level energy integration still
+                        // skips the unobserved interval separately.
+                        current.AddOfflineSample(sample);
+                    }
 
-                current = CycleDraft.Start(sample, startedAtFullCharge, lowConfidence, sessionBoundary);
-                acSessionReachedFull = false;
-            }
-            else
-            {
-                current.AddOfflineSample(sample, largeGap && !knownGap);
+                    acSessionReachedFull = false;
+                    break;
+
+                case BatteryState.Unknown:
+                    // Unknown samples neither start nor end a cycle. If one is
+                    // observed inside a segment, lower confidence without
+                    // pretending that the device was on battery.
+                    current?.MarkLowConfidence();
+                    break;
             }
 
             previous = sample;
+            previousState = observation.State;
         }
 
         if (current is not null)
@@ -153,62 +250,17 @@ public static class BatteryCycleBuilder
     {
         var assignedRawCycles = new List<BatteryCycle>();
         var displayCycles = new List<BatteryDisplayCycle>();
-        var group = new List<BatteryCycle>();
-
+        // A display cycle is intentionally one-to-one with a continuous
+        // unplugged segment. Separate battery runs must never be merged merely
+        // because their combined discharge exceeds a presentation threshold.
         foreach (var cycle in rawCycles)
         {
-            if (ShouldStartNewDisplayCycle(group, cycle))
-                FlushGroup(group, assignedRawCycles, displayCycles);
-
-            group.Add(cycle);
-
-            if (cycle.Confidence == BatteryCycleConfidence.Low ||
-                cycle.StartedAtSessionBoundary ||
-                MeetsDisplayThreshold(group))
-            {
-                FlushGroup(group, assignedRawCycles, displayCycles);
-            }
+            var displayId = displayCycles.Count + 1L;
+            displayCycles.Add(CreateDisplayCycle(displayId, new[] { cycle }));
+            assignedRawCycles.Add(cycle with { DisplayCycleId = displayId });
         }
 
-        FlushGroup(group, assignedRawCycles, displayCycles);
         return (assignedRawCycles, displayCycles);
-    }
-
-    private static bool ShouldStartNewDisplayCycle(
-        IReadOnlyList<BatteryCycle> currentGroup,
-        BatteryCycle nextCycle)
-    {
-        if (currentGroup.Count == 0)
-            return false;
-
-        if (nextCycle.StartedAtSessionBoundary)
-            return true;
-
-        if (nextCycle.StartedAtFullCharge)
-            return true;
-
-        if (nextCycle.Confidence == BatteryCycleConfidence.Low ||
-            currentGroup.Any(c => c.Confidence == BatteryCycleConfidence.Low))
-            return true;
-
-        return MeetsDisplayThreshold(currentGroup);
-    }
-
-    private static void FlushGroup(
-        List<BatteryCycle> group,
-        List<BatteryCycle> assignedRawCycles,
-        List<BatteryDisplayCycle> displayCycles)
-    {
-        if (group.Count == 0)
-            return;
-
-        var displayId = displayCycles.Count + 1L;
-        displayCycles.Add(CreateDisplayCycle(displayId, group));
-
-        foreach (var cycle in group)
-            assignedRawCycles.Add(cycle with { DisplayCycleId = displayId });
-
-        group.Clear();
     }
 
     private static BatteryDisplayCycle CreateDisplayCycle(long id, IReadOnlyList<BatteryCycle> group)
@@ -234,25 +286,6 @@ public static class BatteryCycleBuilder
             IsOpen = last.IsOpen,
             Confidence = confidence
         };
-    }
-
-    private static bool MeetsDisplayThreshold(IReadOnlyList<BatteryCycle> group)
-    {
-        var percentValues = group
-            .Where(c => c.DischargePercent.HasValue)
-            .Select(c => c.DischargePercent!.Value)
-            .ToList();
-        var whValues = group
-            .Where(c => c.DischargeWh.HasValue)
-            .Select(c => c.DischargeWh!.Value)
-            .ToList();
-
-        if (percentValues.Count == 0 && whValues.Count == 0)
-            return false;
-
-        var percentMet = percentValues.Count == 0 || percentValues.Sum() >= SmallCyclePercent;
-        var whMet = whValues.Count == 0 || whValues.Sum() >= SmallCycleWh;
-        return percentMet && whMet;
     }
 
     private static double? SumKnown(IEnumerable<double?> values)
@@ -314,7 +347,7 @@ public static class BatteryCycleBuilder
             StartedAtFullCharge = startedAtFullCharge;
             StartedAtSessionBoundary = startedAtSessionBoundary;
             LowConfidence = lowConfidence;
-            AddOfflineSample(firstSample, largeGap: false);
+            AddOfflineSample(firstSample);
         }
 
         private DateTime StartUtc { get; }
@@ -331,6 +364,8 @@ public static class BatteryCycleBuilder
 
         private DateTime LastSampleUtc { get; set; }
 
+        public DateTime LastObservedUtc => LastSampleUtc;
+
         private double? EndBatteryPercent { get; set; }
 
         private double? EndRemainingMWh { get; set; }
@@ -344,11 +379,8 @@ public static class BatteryCycleBuilder
             bool startedAtSessionBoundary)
             => new(firstSample, startedAtFullCharge, lowConfidence, startedAtSessionBoundary);
 
-        public void AddOfflineSample(SystemPowerSample sample, bool largeGap)
+        public void AddOfflineSample(SystemPowerSample sample)
         {
-            if (largeGap)
-                LowConfidence = true;
-
             LastSampleUtc = sample.TimestampUtc;
             EndBatteryPercent = sample.BatteryPercent;
             EndRemainingMWh = sample.RemainingCapacityMWh;

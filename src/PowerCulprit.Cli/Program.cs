@@ -250,10 +250,12 @@ internal class Program
 
         // LibreHardwareMonitor — must Initialize() before GetStatus() reflects
         // real sensor availability; releases the LHM Computer on Dispose.
+        IReadOnlyList<HardwareSensorSample> hardwareSamples;
         using (var lhm = new LibreHardwareMonitorCollector(
             loggerFactory.CreateLogger<LibreHardwareMonitorCollector>()))
         {
             lhm.Initialize();
+            hardwareSamples = lhm.Collect();
             PrintStatus(lhm.GetStatus());
         }
 
@@ -261,11 +263,11 @@ internal class Program
         // GetStatus() probes LHM sensor filters and Intel tool paths.
         var cpuPower = new IntelCpuPowerCollector(
             loggerFactory.CreateLogger<IntelCpuPowerCollector>());
-        PrintStatus(cpuPower.GetStatus());
+        PrintStatus(cpuPower.GetStatus(hardwareSamples));
 
         var gpuPower = new IntelGpuPowerCollector(
             loggerFactory.CreateLogger<IntelGpuPowerCollector>());
-        PrintStatus(gpuPower.GetStatus());
+        PrintStatus(gpuPower.GetStatus(hardwareSamples));
 
         // ETW — a real (short-lived) probe session is more informative than the
         // collector's cached "not started" status, so keep the dedicated probe.

@@ -63,6 +63,7 @@ public class MonitoringService : IMonitoringService, IDisposable
     }
 
     public event Action<bool>? RunningChanged;
+    public event Action<MonitoringSnapshot>? SnapshotPublished;
 
     public MonitoringService(
         BatteryPowerCollector batteryCollector,
@@ -297,11 +298,16 @@ public class MonitoringService : IMonitoringService, IDisposable
     /// <inheritdoc/>
     public async Task<IReadOnlyList<PowerStateEvent>> GetPowerStateEventsAsync(
         DateTime fromUtc,
-        DateTime toUtc)
+        DateTime toUtc,
+        CancellationToken cancellationToken = default)
     {
         try
         {
-            return await _databaseManager.GetPowerStateEventsAsync(fromUtc, toUtc);
+            return await _databaseManager.GetPowerStateEventsAsync(fromUtc, toUtc, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -514,7 +520,8 @@ public class MonitoringService : IMonitoringService, IDisposable
                         batch.GpuSamples,
                         batch.HardwareSamples,
                         batch.SourceStatuses,
-                        batch.WmiActivitySamples);
+                        batch.WmiActivitySamples,
+                        batch.ProcessLifecycleEvents);
                 }
                 catch (Exception ex)
                 {
@@ -541,6 +548,7 @@ public class MonitoringService : IMonitoringService, IDisposable
         IReadOnlyList<HardwareSensorSample> hwSamples = Array.Empty<HardwareSensorSample>();
         IReadOnlyList<SourceStatus> sourceStatuses = Array.Empty<SourceStatus>();
         IReadOnlyList<WmiActivitySample> wmiActivitySamples = Array.Empty<WmiActivitySample>();
+        IReadOnlyList<ProcessLifecycleEvent> processLifecycleEvents = Array.Empty<ProcessLifecycleEvent>();
         var gpuSamplesAreFresh = false;
         var gpuSamplingEnabled = IsGpuSamplingEnabled;
 
@@ -573,6 +581,7 @@ public class MonitoringService : IMonitoringService, IDisposable
             foreach (var sample in processSamples)
                 _etwCollector.RecordPolledProcess(sample.Pid);
             var etwSnapshot = _etwCollector.SnapshotAndReset(now);
+            processLifecycleEvents = etwSnapshot.LifecycleEvents;
             processSamples = ProcessEtwMerger.Merge(processSamples, etwSnapshot);
         }
         catch (Exception ex) { _logger.LogError(ex, "WindowsEtwActivityCollector snapshot/merge threw"); }
@@ -621,22 +630,26 @@ public class MonitoringService : IMonitoringService, IDisposable
 
         // ── Derive CPU / iGPU power ─────────────────
         double? cpuPkgWatts = null;
-        double? igpuValue = null;
+        double? cpuPlatformWatts = null;
+        double? cpuCoresWatts = null;
+        double? cpuMemoryWatts = null;
+        double? gpuPowerWatts = null;
         double? igpuActivityPct = null;
-        bool igpuFromHw = false;
 
         try
         {
             cpuPkgWatts = _cpuPowerCollector.GetCpuPackagePowerWatts(hwSamples);
+            cpuPlatformWatts = _cpuPowerCollector.GetCpuPlatformPowerWatts(hwSamples);
+            cpuCoresWatts = _cpuPowerCollector.GetCpuCoresPowerWatts(hwSamples);
+            cpuMemoryWatts = _cpuPowerCollector.GetCpuMemoryPowerWatts(hwSamples);
         }
         catch (Exception ex) { _logger.LogError(ex, "IntelCpuPowerCollector threw"); }
 
         try
         {
-            // TryGetIgpuPowerWatts scans hwSamples once and reports whether the
-            // value came from an LHM power sensor (true) or the GPU-Engine
-            // fallback (false) — replaces a second hwSamples.Any() scan.
-            igpuValue = _gpuPowerCollector.TryGetIgpuPowerWatts(hwSamples, gpuSamples, out igpuFromHw);
+            // Power and activity stay separate: GPU Engine utilization is
+            // never published through a watt-valued field.
+            gpuPowerWatts = _gpuPowerCollector.GetIgpuPowerWatts(hwSamples);
             igpuActivityPct = _gpuPowerCollector.GetIgpuActivityPercent(gpuSamples);
         }
         catch (Exception ex) { _logger.LogError(ex, "IntelGpuPowerCollector threw"); }
@@ -670,7 +683,8 @@ public class MonitoringService : IMonitoringService, IDisposable
                     : Array.Empty<GpuProcessSample>(),
                 HardwareSamples = hwSamples,
                 SourceStatuses = sourceStatuses,
-                WmiActivitySamples = wmiActivitySamples
+                WmiActivitySamples = wmiActivitySamples,
+                ProcessLifecycleEvents = processLifecycleEvents
             });
         }
 
@@ -685,13 +699,29 @@ public class MonitoringService : IMonitoringService, IDisposable
             GpuSamplingEnabled = gpuSamplingEnabled,
             HardwareSamples = hwSamples,
             CpuPackagePowerWatts = cpuPkgWatts,
-            IgpuPowerValue = igpuValue,
+            CpuPlatformPowerWatts = cpuPlatformWatts,
+            CpuCoresPowerWatts = cpuCoresWatts,
+            CpuMemoryPowerWatts = cpuMemoryWatts,
+            GpuPowerWatts = gpuPowerWatts,
             IgpuActivityPercent = igpuActivityPct,
-            IgpuFromHardwareSensor = igpuFromHw,
             SourceStatuses = sourceStatuses
         };
 
         lock (_lock) { _latestSnapshot = snapshot; }
+
+        var snapshotHandler = SnapshotPublished;
+        if (snapshotHandler is not null)
+        {
+            try
+            {
+                snapshotHandler(snapshot);
+            }
+            catch (Exception ex)
+            {
+                // A UI subscriber must never be able to stop the monitoring loop.
+                _logger.LogError(ex, "SnapshotPublished subscriber threw");
+            }
+        }
     }
 
     private static IReadOnlyList<ProcessSample> SelectPersistedProcessSamples(IReadOnlyList<ProcessSample> samples)
@@ -821,5 +851,6 @@ public class MonitoringService : IMonitoringService, IDisposable
         public IReadOnlyList<HardwareSensorSample> HardwareSamples { get; init; } = Array.Empty<HardwareSensorSample>();
         public IReadOnlyList<SourceStatus> SourceStatuses { get; init; } = Array.Empty<SourceStatus>();
         public IReadOnlyList<WmiActivitySample> WmiActivitySamples { get; init; } = Array.Empty<WmiActivitySample>();
+        public IReadOnlyList<ProcessLifecycleEvent> ProcessLifecycleEvents { get; init; } = Array.Empty<ProcessLifecycleEvent>();
     }
 }
